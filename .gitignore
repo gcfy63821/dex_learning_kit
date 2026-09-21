@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+# runtime outputs (not part of release)
+logs/
+runs/
+wandb/
+outputs/
+dumps/
+*.log
+# large binaries kept out of git; ship via release assets
+# checkpoints/*.pth
+
+# Vendored upstream assets are kept verbatim; never ignore anything under them.
+!assets/franka_fr3/**
+!assets/sharpa_wave/**

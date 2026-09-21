@@ -1,0 +1,46 @@
+seed: 42
+algo: TeacherStudent
+device: cuda
+network:
+  # Student model network configuration (can be smaller than teacher)
+  mlp:
+    units: [256, 512, 128, 64]  # Student model architecture
+  priv_mlp:
+    units: [256, 512, 128, 40]
+
+load_path: None  # Optional: path to resume student training
+
+algorithm:
+  experiment_name: 'teacher_student_dexmanip'
+  normalize_input: True
+  normalize_value: True
+  num_actors: 4096
+  
+  # Teacher model configuration
+  teacher_path: ""   # set me: no checkpoint ships for this legacy config
+  teacher_proprio_adapt: False  # Whether teacher uses ProprioAdapt
+  teacher_network:  # Optional: teacher network config (if different from default)
+    mlp:
+      units: [256, 512, 128, 64]
+    priv_mlp:
+      units: [256, 512, 128, 40]
+  
+  # Student model configuration
+  student_proprio_adapt: False  # Whether student uses ProprioAdapt
+  
+  # Distillation loss weights
+  teacher_loss_weight: 1.0  # Weight for teacher-student distillation loss
+  reward_loss_weight: 0.1   # Weight for environment reward loss
+  temperature: 3.0           # Temperature for softmax in distillation
+  use_value_distill: False  # Whether to distill value function
+  
+  # Training settings
+  learning_rate: 3e-4
+  grad_norm: 1.0
+  save_frequency: 50000  # Save checkpoint every N steps
+  max_agent_steps: 10000000
+  
+  # Priv info settings (should match teacher)
+  priv_info: True
+  priv_info_dim: 40
+

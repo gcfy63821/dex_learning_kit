@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dexx"
+version = "0.1.0"
+description = "Dex-X: dexterous manipulation RL (Sharpa HA4 + Franka FR3) with sim2real, built on Isaac Lab."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["dexx*"]

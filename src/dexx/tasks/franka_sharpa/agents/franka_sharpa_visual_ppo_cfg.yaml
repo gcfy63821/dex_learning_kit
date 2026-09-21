@@ -1,0 +1,91 @@
+# PPO config for franka-sharpa-visual (asymmetric AC + depth CNN).
+#
+# Mirrors dexmanip_critic_horizon_ppo_cfg.yaml as closely as possible — RL
+# hyperparameters validated on franka-sharpa-force-critic-horizon (sim2real-
+# deployed ckpt 2026-05-11). The visual variant adds:
+#   - algo: PPOVisual (CNN depth encoder branch)
+#   - network.asymmetric_ac: True → ActorCriticAsymmetricVisual
+#     (actor sees obs ⊕ cnn(depth); critic adds raw priv_info — same scheme
+#      as ActorCriticAsymmetric, so deploy needs no priv_info on real robot)
+#   - network.visual.* for the CNN encoder
+#
+# Keep `algorithm.priv_info_dim` in sync with cfg.priv_info_dim
+# (FrankaSharpaVisualCriticHorizonCfg inherits 148 for K=5).
+
+seed: 42
+algo: PPOVisual
+device: cuda
+
+network:
+  mlp:
+    units: [256, 512, 128, 64]
+  priv_mlp:
+    # NOTE: not used by ActorCriticAsymmetricVisual (critic concatenates raw
+    # priv_info, no compression). Kept here so the legacy ActorCriticVisual
+    # path still parses if someone flips asymmetric_ac=False.
+    units: [256, 128, 148]
+  asymmetric_ac: True
+
+  # CNN depth-image encoder (shared between actor and critic in asymmetric mode).
+  # Image size MUST match cfg.camera_height / cfg.camera_width
+  # (FrankaSharpaVisualCriticHorizonCfg defaults to RealSense D455 depth half-res,
+  # 320 × 240, intrinsics fx/fy/cx/cy set in the cfg class).
+  use_visual: True
+  visual:
+    depth_height: 240
+    depth_width: 320
+    cnn_units: [32, 64, 128]      # smaller first layer keeps activation memory low
+    cnn_feature_dim: 32           # final feature dim concatenated to proprio obs
+
+load_path: None
+
+algorithm:
+  experiment_name: 'franka_sharpa_visual'
+  normalize_input: True
+  normalize_value: True
+  value_bootstrap: True
+  num_actors: 4096
+  normalize_advantage: True
+  gamma: 0.99
+  tau: 0.95
+  learning_rate: 5e-4
+  kl_threshold: 0.03
+
+  # PPO batch collection — matches dexmanip_critic_horizon_ppo_cfg.yaml.
+  # With 4096 envs × 32 horizon = 131072 transitions/iter,
+  # minibatch=1024 → 128 minibatches × 5 epochs = 640 grad updates/iter.
+  # The earlier 32768 minibatch (only 4 minibatches/iter) made visual learn
+  # 32× slower per data point — main reason reward curves looked abnormal.
+  horizon_length: 32
+  minibatch_size: 1024
+  # mini_epochs 5 → 3: per-iter diag shows KL drifts to 0.04-0.05 from epoch 2
+  # onwards, triggering AdaptiveScheduler's "shrink LR" zone. Epochs 3-5 then
+  # fight the scheduler. 3 epochs lets the policy learn from each rollout but
+  # stops before the drift dominates. Expected: cleaner KL, more stable LR.
+  # 5 → 3 → 2. With CNN + asymmetric AC, even epoch 3's KL hits 0.08+
+  # (well past 2×threshold=0.04), so the AdaptiveScheduler keeps cutting LR
+  # mid-iter. epoch 2's update is already "spent"; epoch 3 just overshoots.
+  # mini_epochs=2 makes each iter ~33% faster wall-clock, KL stays under
+  # 0.05, LR stops bouncing.
+  mini_epochs: 2
+
+  # PPO loss setting — matches dexmanip_critic_horizon_ppo_cfg.yaml exactly.
+  # entropy_coef=0 caused policy collapse previously; using the same small
+  # bonus as critic_horizon (1e-4) to keep exploration alive.
+  clip_value: True
+  critic_coef: 2
+  entropy_coef: 0.0001
+  e_clip: 0.2
+  bounds_loss_coef: 0.0001
+  truncate_grads: True
+  grad_norm: 1.0
+
+  save_best_after: 0
+  save_frequency: 500
+  max_agent_steps: 5500000000
+
+  # Privileged info — same layout as critic_horizon (148d for K=5).
+  # ActorCriticAsymmetricVisual feeds this RAW to the critic only.
+  priv_info: True
+  priv_info_dim: 148
+  priv_info_embed_dim: 148  # legacy; not read by ActorCriticAsymmetricVisual

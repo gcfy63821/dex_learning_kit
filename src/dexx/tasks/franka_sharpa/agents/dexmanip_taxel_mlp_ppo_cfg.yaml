@@ -1,0 +1,64 @@
+seed: 42
+algo: PPO
+device: cuda
+network:
+  mlp:
+    units: [256, 512, 128, 64]
+  priv_mlp:
+    units: [256, 128, 148]
+  bimanual_split: false
+  asymmetric_ac: true
+  # Only used by franka-sharpa-taxel-mlp-ablation.
+  # The raw env observation remains [base_obs, taxel_tail].  The policy encodes
+  # the taxel tail per finger and feeds [base_obs, taxel_latent] to actor/critic.
+  taxel_encoder:
+    enabled: true
+    # base_obs_dim is filled from the env at runtime; do not hard-code it.
+    num_fingers: 5
+    finger_units: [256, 128, 32]
+    final_units: [128]
+    share_finger_encoder: false
+
+load_path: None
+
+algorithm:
+  experiment_name: 'dexmanip_taxel_mlp'
+  normalize_input: True
+  normalize_value: True
+  value_bootstrap: True
+  num_actors: 4096
+  normalize_advantage: True
+  gamma: 0.99
+  tau: 0.95
+  learning_rate: 2e-4
+  kl_threshold: 0.008
+  horizon_length: 32
+  minibatch_size: 1024
+  mini_epochs: 5
+  clip_value: True
+  critic_coef: 2
+  entropy_coef: 0.0001
+  e_clip: 0.2
+  bounds_loss_coef: 0.0001
+  truncate_grads: True
+  grad_norm: 1.0
+  save_best_after: 0
+  save_frequency: 500
+  max_agent_steps: 5500000000
+
+  priv_info: True
+  priv_info_dim: 148
+  priv_info_embed_dim: 148
+
+  teacher_path: None
+  teacher_proprio_adapt: False
+  teacher_network:
+    mlp:
+      units: [256, 512, 128, 64]
+    priv_mlp:
+      units: [256, 128, 148]
+  student_proprio_adapt: False
+  teacher_loss_weight: 1.0
+  reward_loss_weight: 0.1
+  temperature: 3.0
+  use_value_distill: False

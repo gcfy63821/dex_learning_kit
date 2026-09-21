@@ -1,0 +1,31 @@
+# Dex-X core dependencies (curated).
+# Isaac Lab / Isaac Sim are installed separately — see docs/PIPELINE.md §Install.
+# For an exact frozen environment, use requirements-full.txt instead.
+
+# --- core ---
+numpy
+torch
+gymnasium
+termcolor
+tqdm
+pyyaml
+wandb
+
+# --- geometry / kinematics / retargeting ---
+trimesh
+pytorch_kinematics
+# pytorch3d           # install per official instructions (build matches your torch/CUDA)
+bps_torch @ git+https://github.com/KailinLi/bps_torch.git@4a2eb59dfbf8982de1af878552e561d688dced28
+chamfer_distance @ git+https://github.com/otaheri/chamfer_distance@f86f6f7cadd3aca642704573d1626c67ca2e2846
+
+# --- point cloud / visualization ---
+open3d
+imageio
+imageio-ffmpeg
+viser
+
+# --- deploy (optional; real robot only) ---
+# The deploy path is Polymetis + ZMQ (see docs/DEPLOY.md); Polymetis itself is
+# installed separately on the NUC, in its own env.
+pyzmq
+# pyrealsense2        # camera host only

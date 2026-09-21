@@ -1,0 +1,44 @@
+seed: 42
+algo: PPO
+device: cuda
+network:
+  mlp:
+    units: [64, 64]  # Minimal network for testing (input: 10, output: action_space)
+  priv_mlp:
+    units: [64, 10]  # Minimal network for testing (not used if priv_info_dim=0)
+
+load_path: None
+
+algorithm:
+  experiment_name: 'test-franka-sharpa-tracking'
+  normalize_input: True  # Enable normalization but with proper initialization
+  normalize_value: True
+  value_bootstrap: True
+  num_actors: 1  # Single environment for testing
+  normalize_advantage: True
+  gamma: 0.99
+  tau: 0.95
+  learning_rate: 1e-4
+  kl_threshold: 0.008
+  # PPO batch collection
+  horizon_length: 16
+  minibatch_size: 16
+  mini_epochs: 1
+  # PPO loss setting
+  clip_value: True
+  critic_coef: 1.0
+  entropy_coef: 0.0
+  e_clip: 0.2
+  bounds_loss_coef: 0.0001
+  # grad clipping
+  truncate_grads: True
+  grad_norm: 1.0
+  # snapshot setting
+  save_best_after: 0
+  save_frequency: 10000
+  max_agent_steps: 10000  # Small number for testing
+  # No privileged info for simple test
+  priv_info: True
+  priv_info_dim: 10
+  priv_info_embed_dim: 10
+
