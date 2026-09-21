@@ -304,6 +304,18 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         for key, value in reward_dict.items():
             self.extras[key] = value.mean() if isinstance(value, torch.Tensor) else value
         self.extras['total_reward'] = self.reward_execute.mean()
+        # Per-ENV vectors. `success_buf` is 1 only on the step an episode ends and
+        # is cleared in `_reset_idx`, so a mean over all envs at every step is a
+        # near-zero number that is NOT the episode success rate. Consumers select
+        # the envs that just terminated — see algo/ppo/ppo.py.
+        self.extras['succeeded_per_env'] = self.success_buf.float()
+        # Strict success (docs/EVAL.md strict3): survived AND landed the object
+        # near its demo endpoint AND no object drift AND not a bad init. Same
+        # quantity the evaluation reports, so the training curve is comparable.
+        if 'succ/strict' in reward_dict:
+            self.extras['succeeded_strict_per_env'] = reward_dict['succ/strict']
+        self.extras['failed_per_env'] = self.failure_buf.float()
+        # Scalars kept for the existing log keys. Do not read as episode rates.
         self.extras['succeeded'] = self.success_buf.float().mean()
         self.extras['failed_execute'] = self.failure_buf.float().mean()
 

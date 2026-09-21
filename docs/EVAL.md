@@ -32,8 +32,12 @@ python scripts/eval.py --task franka-sharpa-pointcloud \
 
 ### strict3 protocol
 
-Eval records `end_final_dist`, `fail_causes`, `demo_idx`, and `survival_len` per
-episode, then applies **post-hoc strict filters** (strict3 / strict2 / strict5).
+`eval.py` computes strict2 / strict3 / strict5 itself and writes them to
+`summary.json` under `strict`, plus a per-demo `strict3`. It used to only record
+the raw fields and leave the filtering to you — which meant the script printed
+the env-internal rate this section tells you not to report, and never printed the
+one it does.
+
 The headline metric, **strict3**, counts an episode as a success only if:
 
 - `end_final_dist < 3 cm` at episode end (object reached the demo's final pose),
@@ -41,8 +45,18 @@ The headline metric, **strict3**, counts an episode as a success only if:
 - no object-position drift (a `fail/obj_pos_drift` cause did not fire), and
 - the episode was not a bad-init (`survival_len ≤ 5` are excluded).
 
-This is stricter than the env-internal 5 cm reach-end success. Report strict3, not
-the env-internal rate.
+This is stricter than the env-internal reach-end success, and the gap is not a
+constant. On one checkpoint the two read 93.0% and 80.4% overall — but per demo:
+
+```
+cube_small_1   env 96.0%  |  strict3 86.0%
+cube_small_2   env 92.0%  |  strict3 89.8%
+squeegee_1     env 86.0%  |  strict3 84.0%
+squeegee_2     env 98.0%  |  strict3 62.0%     <-- 36 points
+```
+
+`squeegee_2` survives its trajectory almost every time and still fails to put the
+object down within 3 cm. Report strict3, and report it per demo.
 
 ### Recommended eval settings (reproducibility)
 
@@ -75,6 +89,13 @@ python scripts/play.py --task franka-sharpa-pointcloud \
 
 Key flags: `--num_envs` (default 16), `--max_episodes` (default 200),
 `--max_steps`, `--label`. (Drop `--headless` to watch the GUI.)
+
+⚠️ **`play.py`'s success rate is a different metric from `eval.py`'s.** Here a
+success means the episode reached the end of the trajectory without a failure
+termination; in `eval.py` it means the object finished within `--success_dist`
+(5 cm) of its final target. A short `--max_steps` truncates episodes and drives
+`play.py`'s number down without the policy being any worse — on one checkpoint
+they read 6.2% and 95.5% respectively. Quote `eval.py`.
 
 ## record_videos.py
 

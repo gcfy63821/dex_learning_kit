@@ -1,4 +1,6 @@
-# DAgger PointCloud distillation + PPO fine-tune
+# DAgger PointCloud distillation
+
+(plus an optional PPO fine-tune that is **not** part of the default pipeline — see §Step B)
 
 Distills the privileged poseobs PPO teacher into a **point-cloud student** that
 observes raw point clouds instead of ground-truth object pose, then optionally
@@ -44,7 +46,7 @@ Key DAgger flags:
 | `--hand_body_subset` | `None` | `minimal5` / `minimal6` / `default11` / `dense22` (see below). |
 | `--student_ckpt` | `None` | Resume from a pretrained student. |
 
-## Step B — PPO fine-tune (optional)
+## Step B — PPO fine-tune (optional, and measured to hurt)
 
 ```bash
 python scripts/train_ppo_pc.py --task franka-sharpa-pointcloud \

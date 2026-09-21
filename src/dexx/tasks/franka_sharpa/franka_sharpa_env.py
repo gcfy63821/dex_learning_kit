@@ -1574,6 +1574,20 @@ class FrankaSharpaEnv(DirectRLEnv):
         for key, value in reward_dict.items():
             self.extras[key] = value.mean() if isinstance(value, torch.Tensor) else value
         self.extras['total_reward'] =  self.reward_execute.mean()
+        # Per-ENV vectors. `success_buf` is 1 only on the step an episode ends and
+        # is cleared in `_reset_idx`, so a mean over all envs at every step is a
+        # near-zero number that is NOT the episode success rate. Consumers must
+        # select the envs that just terminated — see `AverageScalarMeter` usage
+        # in algo/ppo/ppo.py and the caveat in docs/EVAL.md.
+        self.extras['succeeded_per_env'] = self.success_buf.float()
+        # Strict success (docs/EVAL.md strict3): survived AND landed the object
+        # near its demo endpoint AND no object drift AND not a bad init. Same
+        # quantity the evaluation reports, so the training curve is comparable.
+        if 'succ/strict' in reward_dict:
+            self.extras['succeeded_strict_per_env'] = reward_dict['succ/strict']
+        self.extras['failed_per_env'] = self.failure_buf.float()
+        # Scalars kept for backward compatibility with existing log keys. Do not
+        # read these as episode rates.
         self.extras['succeeded'] = self.success_buf.float().mean()
         self.extras['failed_execute'] = self.failure_buf.float().mean()
         
@@ -3552,6 +3566,13 @@ def quat_to_angle_axis(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     axis = torch.where(mask_expand, axis, default_axis)
     return angle, axis
 
+# Strict-success threshold, in metres. Mirrors `eval.py --success_dist` used for
+# strict3, so the number you watch while training means the same thing as the one
+# you report. Changing it here without changing there makes the two incomparable.
+# Baked into the TorchScript function below at script time.
+STRICT_SUCCESS_DIST: float = 0.03
+
+
 @torch.jit.script
 def compute_imitation_reward(
     reset_buf: torch.Tensor,
@@ -3580,6 +3601,10 @@ def compute_imitation_reward(
     premature_contact_progress_threshold: int = 50,
     premature_contact_enabled: bool = True,
     eval_no_terminate: bool = False,
+    # Passed as a parameter, not read from the module: TorchScript cannot close
+    # over a global float. The default is evaluated by Python at definition
+    # time, so the scripted body still sees one number with one definition.
+    strict_success_dist: float = STRICT_SUCCESS_DIST,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
 
     # end effector pose reward
@@ -4078,6 +4103,28 @@ def compute_imitation_reward(
         torch.ones_like(reset_buf),
         reset_buf,
     )
+    # ---- Strict success: the metric the evaluation protocol reports ---------
+    # `succeeded` above only means "reached the end of the trajectory without a
+    # failure termination" — survival, not task success. strict additionally
+    # requires the object to finish near its demo endpoint, with no object-
+    # position drift, and excludes bad inits. Same three conditions as
+    # docs/EVAL.md strict3, so the training curve and the reported number are
+    # the same quantity.
+    if has_final:
+        succeeded_strict = (
+            succeeded
+            & (dist_to_final < strict_success_dist)
+            & ~fail_obj_pos
+            & (running_progress_buf > 5)
+        )
+        strict_available = torch.ones_like(succeeded.float())
+    else:
+        # No final-frame target: strict is not computable. Report zero rather
+        # than silently falling back to `succeeded` — a flat zero line is a
+        # visible anomaly, a loose number wearing a strict label is not.
+        succeeded_strict = torch.zeros_like(succeeded)
+        strict_available = torch.zeros_like(succeeded.float())
+
     reward_dict = {
         "reward_eef_pos": reward_eef_pos,
         "reward_eef_rot": reward_eef_rot,
@@ -4175,6 +4222,8 @@ def compute_imitation_reward(
         "fail/error_buf_velocity_explosion": error_buf.float(),
         "fail/progress_at_fail": (running_progress_buf.float() * failed_execute.float()),
         "succ/any": succeeded.float(),
+        "succ/strict": succeeded_strict.float(),
+        "succ/strict_available": strict_available,
     }
 
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict

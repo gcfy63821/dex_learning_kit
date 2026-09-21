@@ -8,8 +8,15 @@ Runs N episodes, accumulates `extras["succeeded"]` (set in env's `_get_rewards`
 before `_reset_idx` clears the per-env buffers), reports success / failure /
 mean episode reward.
 
+NOTE: this "success" is NOT the one `eval.py` reports, and the two numbers must
+not be compared. Here it means the episode reached the end of the trajectory
+without a failure termination; there it means the object finished within
+--success_dist (5 cm) of its final target. A short --max_steps truncates
+episodes and drives this number down without the policy being any worse. For a
+number you would quote, use eval.py.
+
 Usage:
-    python dexx/scripts/gym_style/play_dagger_pc.py \
+    python scripts/play.py \
         --task franka-sharpa-pointcloud \
         --load_path logs/.../dagger_final.pth \
         --side right --data_idx '[...]' \
@@ -25,6 +32,10 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Evaluate PointCloud student.")
 parser.add_argument("--task", type=str, default="franka-sharpa-pointcloud")
 parser.add_argument("--load_path", type=str, required=True)
+parser.add_argument("--camera_extrinsic", type=str, default=None,
+                    help="Path to a 4x4 .npy camera-in-armbase extrinsic. Must match "
+                         "what the student was TRAINED with, or its scene cloud arrives "
+                         "from a viewpoint it never saw. Omitted -> the shipped default.")
 parser.add_argument("--side", type=str, default="right")
 parser.add_argument("--data_idx", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=16)
@@ -159,6 +170,13 @@ def main():
         except json.JSONDecodeError:
             data_indices = ast.literal_eval(args_cli.data_idx)
         env_cfg.data_indices = data_indices
+
+    if args_cli.camera_extrinsic:
+        import os as _os
+        assert _os.path.exists(args_cli.camera_extrinsic), \
+            f"--camera_extrinsic not found: {args_cli.camera_extrinsic}"
+        env_cfg.camera_extrinsic_path = _os.path.abspath(args_cli.camera_extrinsic)
+        print(f"[PlayPC] sim camera extrinsic <- {env_cfg.camera_extrinsic_path}", flush=True)
 
     # Clean eval: disable DR + aug
     for fl in (

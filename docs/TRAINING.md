@@ -33,7 +33,7 @@ python scripts/train_teacher.py --task franka-sharpa-force-poseobs --side right 
 | `--data_idx` | `None` | JSON/Python list of demo indices, e.g. `'["rt/0416_grasp/cube_small_2"]'`. |
 | `--num_envs` | `16384` | Parallel environments. Lower it (e.g. 2048) to fit memory. |
 | `--seed` | `42` | Environment / training seed. |
-| `--max_agent_steps` | `None` | Training iteration budget. |
+| `--max_agent_steps` | `None` | Budget in **agent steps**, not iterations. One epoch is `num_envs x horizon_length` (e.g. 512 x 32 = 16384), so a small value stops before the first checkpoint. |
 | `--load_path` | `None` | Checkpoint to load. |
 | `--resume` | off | Resume training from `--load_path`. |
 | `--env_cfg` | `[]` | Override env_cfg fields, e.g. `--env_cfg force_reward_weight=0.0`. |
@@ -42,6 +42,67 @@ python scripts/train_teacher.py --task franka-sharpa-force-poseobs --side right 
 | `--wandb-project-name`, `--wandb-entity`, `--wandb-name` | | wandb logging. |
 
 `--data_idx` accepts JSON (double quotes) or a Python-literal list.
+
+## What to watch: `success_rate`, not just reward
+
+The progress line and TensorBoard carry **two** episode success rates:
+
+```
+Mean Rewards: 642.88 | Success: 81.9% | Strict: 73.4% | Current Best: 642.88
+```
+
+| | meaning | TensorBoard |
+|---|---|---|
+| `Success` | reached the end of the trajectory without a failure termination — **survival** | `success_rate/iter` |
+| `Strict` | survival **and** the object finished within 3 cm of its demo endpoint, with no object-position drift, excluding bad inits — **task success** | `success_rate_strict/iter` |
+
+Both are running means over the last 100 **completed** episodes.
+
+`Strict` is the same quantity `eval.py` reports as strict3, deliberately: the
+number you watch while training and the number you report should be the same
+thing. It runs 9–13 points below `Survival` on a trained teacher, which matches
+the 93.0% vs 80.4% measured on the evaluation side.
+
+The threshold lives in `STRICT_SUCCESS_DIST` (`franka_sharpa_env.py`) and is
+passed into the reward function as a parameter rather than read from the module —
+`compute_imitation_reward` is `@torch.jit.script`, and TorchScript cannot close
+over a global float.
+
+Reward and success do not move together, and neither do the two success rates.
+Three consecutive epochs resuming from the shipped teacher:
+
+```
+reward 269.79 -> 642.88 -> 753.92
+Survival 69.8% -> 81.9% -> 77.5%
+Strict   56.9% -> 73.4% -> 68.7%
+```
+
+The last epoch bought 111 points of reward while **both** success rates fell.
+Watching only the reward hides that completely.
+
+### Why it is computed the way it is
+
+`success_buf` is set to 1 on the step an episode ends and cleared in
+`_reset_idx`. A mean over all environments at every step is therefore a
+near-zero number that is **not** the episode success rate — the trap
+`docs/EVAL.md` warns about. The correct quantity is taken only from the
+environments that just terminated, on the step they terminate:
+
+```python
+# algo/ppo/ppo.py, alongside the existing episode_rewards update
+done_indices = self.dones.nonzero(as_tuple=False)
+self.episode_successes.update(infos['succeeded_per_env'][done_indices])
+```
+
+The env publishes `succeeded_per_env` / `failed_per_env` as per-environment
+vectors for this. The older scalar keys `succeeded` / `failed_execute` are means
+over all envs and are kept only for backward compatibility with existing log
+names — do not read them as rates.
+
+⚠️ **`_get_rewards` is overridden down the chain.** Both `FrankaSharpaEnv` and
+`FrankaSharpaForceEnv` define it, and the force variant is what the teacher task
+actually runs. Adding an extras key to the base class alone does nothing and
+fails silently; PPO prints a one-shot warning if the key never arrives.
 
 ## Demo-ordering gotcha (14-key ordering)
 

@@ -791,25 +791,63 @@ def main():
         json.dump({"single": [asdict(r) for r in records]}, f, indent=2)
     print(f"[EvalPC] saved {len(records)} records → {out_records}", flush=True)
 
+    # ---- strictN: the metric the protocol says to report -------------------
+    # An episode counts only if the object finished within N cm of the demo's
+    # final pose, AND object-position drift never fired, AND the episode was not
+    # a bad init. Deliberately excludes ONLY obj_pos_drift, not the other failure
+    # causes — ORing them all in would silently change what the number means.
+    # See docs/EVAL.md §strict3.
+    _BAD_INIT_SURVIVAL = 5
+
+    def _strict(recs, cm):
+        kept = [r for r in recs if r.survival_len > _BAD_INIT_SURVIVAL]
+        if not kept:
+            return 0.0, 0, 0
+        ok = sum(1 for r in kept
+                 if 0.0 <= r.end_final_dist < cm / 100.0
+                 and "fail/obj_pos_drift" not in r.fail_causes)
+        return ok / len(kept), ok, len(kept)
+
+    _strict_rates = {}
+    for _cm in (2, 3, 5):
+        rate, ok, n = _strict(records, _cm)
+        _strict_rates[f"strict{_cm}"] = {"rate": rate, "successes": ok, "episodes": n}
+    _n_bad_init = sum(1 for r in records if r.survival_len <= _BAD_INIT_SURVIVAL)
+
+    print("[EvalPC] strict success (end_final_dist < N cm, no obj_pos_drift, "
+          f"bad inits excluded: {_n_bad_init}/{len(records)}):", flush=True)
+    for _k, _v in _strict_rates.items():
+        print(f"    {_k:8s} {_v['successes']:4d}/{_v['episodes']:<4d} "
+              f"({100 * _v['rate']:5.1f}%)", flush=True)
+
     _by_demo = {}
     for d in sorted({r.demo_idx for r in records}):
         _rs = [r for r in records if r.demo_idx == d]
         _ok = sum(1 for r in _rs if r.succeeded)
+        _s3, _s3ok, _s3n = _strict(_rs, 3)
         _by_demo[d] = {"episodes": len(_rs), "succeeded": _ok,
-                       "success_rate": _ok / max(1, len(_rs))}
+                       "success_rate": _ok / max(1, len(_rs)),
+                       "strict3": _s3, "strict3_successes": _s3ok,
+                       "strict3_episodes": _s3n}
     _rates = [v["success_rate"] for v in _by_demo.values()]
     _macro = sum(_rates) / len(_rates) if _rates else 0.0
     _micro = sum(1 for r in records if r.succeeded) / max(1, len(records))
-    print("[EvalPC] per-demo success:", flush=True)
+    print("[EvalPC] per-demo (env-internal | strict3):", flush=True)
     for d, v in _by_demo.items():
-        print(f"    {d.split('/')[-1]:24s} {v['succeeded']:4d}/{v['episodes']:<4d} "
-              f"({100*v['success_rate']:5.1f}%)", flush=True)
+        print(f"    {d.split('/')[-1]:24s} "
+              f"{v['succeeded']:4d}/{v['episodes']:<4d} ({100*v['success_rate']:5.1f}%)  |  "
+              f"{v['strict3_successes']:4d}/{v['strict3_episodes']:<4d} "
+              f"({100*v['strict3']:5.1f}%)", flush=True)
     print(f"[EvalPC] success  macro (demo-averaged) = {100*_macro:.1f}%   "
           f"micro (episode-weighted) = {100*_micro:.1f}%", flush=True)
 
     summary = {
         "ckpt": args_cli.load_path, "label": args_cli.label,
         "per_demo_quota": _demo_quota,
+        # The headline number. docs/EVAL.md says to report strict3, not the
+        # env-internal reach-end rate below.
+        "strict": _strict_rates,
+        "bad_init_excluded": _n_bad_init,
         "success_rate_per_demo": _by_demo,
         "success_rate_macro": _macro,
         "success_rate_micro": _micro,

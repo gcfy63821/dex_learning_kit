@@ -188,6 +188,13 @@ class PPO(object):
 
         self.episode_rewards = AverageScalarMeter(100)
         self.episode_lengths = AverageScalarMeter(100)
+        # Episode success/failure over the last 100 COMPLETED episodes. Without
+        # this the only training-time signal is reward, which can climb while the
+        # task success rate does not move.
+        self.episode_successes = AverageScalarMeter(100)
+        self.episode_failures = AverageScalarMeter(100)
+        # Strict success — the same quantity eval.py reports as strict3.
+        self.episode_successes_strict = AverageScalarMeter(100)
         self.obs = None
         self.epoch_num = 0
         self.storage = ExperienceBuffer(
@@ -334,6 +341,21 @@ class PPO(object):
             mean_lengths = self.episode_lengths.get_mean()
             self.writer.add_scalar('episode_rewards/step', mean_rewards, self.agent_steps)
             self.writer.add_scalar('episode_lengths/step', mean_lengths, self.agent_steps)
+            # Episode success rate over completed episodes — the number to watch.
+            mean_success = (self.episode_successes.get_mean()
+                            if self.episode_successes.current_size > 0 else None)
+            mean_failure = (self.episode_failures.get_mean()
+                            if self.episode_failures.current_size > 0 else None)
+            mean_success_strict = (self.episode_successes_strict.get_mean()
+                                   if self.episode_successes_strict.current_size > 0 else None)
+            if mean_success is not None:
+                self.writer.add_scalar('success_rate/step', mean_success, self.agent_steps)
+                self.writer.add_scalar('success_rate/iter', mean_success, self.epoch_num)
+            if mean_success_strict is not None:
+                self.writer.add_scalar('success_rate_strict/step', mean_success_strict, self.agent_steps)
+                self.writer.add_scalar('success_rate_strict/iter', mean_success_strict, self.epoch_num)
+            if mean_failure is not None:
+                self.writer.add_scalar('failure_rate/step', mean_failure, self.agent_steps)
             checkpoint_name = f'ep_{self.epoch_num}_step_{int(self.agent_steps // 1e6):04}M_reward_{mean_rewards:.2f}'
 
             if self.save_freq > 0:
@@ -355,7 +377,9 @@ class PPO(object):
                           f'Collect Time: {self.data_collect_time / 60:.1f} min | ' \
                           f'Train RL Time: {self.rl_train_time / 60:.1f} min | ' \
                           f'Mean Rewards: {mean_rewards:.2f} | ' \
-                          f'Current Best: {self.best_rewards:.2f}'
+                          + (f'Success: {mean_success * 100:.1f}% | ' if mean_success is not None else '') \
+                          + (f'Strict: {mean_success_strict * 100:.1f}% | ' if mean_success_strict is not None else '') \
+                          + f'Current Best: {self.best_rewards:.2f}'
             print(info_string, flush=True)
 
         print('max steps achieved', flush=True)
@@ -582,6 +606,25 @@ class PPO(object):
             done_indices = self.dones.nonzero(as_tuple=False)
             self.episode_rewards.update(self.current_rewards[done_indices])
             self.episode_lengths.update(self.current_lengths[done_indices])
+            # Success is an EPISODE quantity: take it only from the envs that
+            # just terminated, on the step they terminated. `succeeded_per_env`
+            # is the pre-reset per-env flag from the env's `_get_rewards`.
+            if done_indices.numel() > 0:
+                _succ = infos.get('succeeded_per_env')
+                if _succ is None and not getattr(self, '_warned_no_succ', False):
+                    self._warned_no_succ = True
+                    print("[PPO] WARNING: env does not publish 'succeeded_per_env'; "
+                          "no success rate will be logged. The env's _get_rewards "
+                          "must set it — note that subclasses override that method.",
+                          flush=True)
+                if _succ is not None:
+                    self.episode_successes.update(_succ[done_indices])
+                _fail = infos.get('failed_per_env')
+                if _fail is not None:
+                    self.episode_failures.update(_fail[done_indices])
+                _strict = infos.get('succeeded_strict_per_env')
+                if _strict is not None:
+                    self.episode_successes_strict.update(_strict[done_indices])
 
             assert isinstance(infos, dict), 'Info Should be a Dict'
             for k, v in infos.items():

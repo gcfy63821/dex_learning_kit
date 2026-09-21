@@ -167,6 +167,26 @@ The replay pkls themselves record `sim_config.arm_K` / `arm_D` read back off the
 live actuator, so a saved run says which gains produced it. You can re-analyse an
 old pair months later and know what it was measuring.
 
+### The simulation replay needs a high physics rate
+
+`replay_motion_sim.py` zeroes the implicit actuator so it can add gravity and
+Coriolis compensation, then closes the PD loop itself with explicit torques. That
+loop is only conditionally stable, and it is **not** stable at the 120 Hz this
+tool was originally written for:
+
+| physics rate | max tracking error on `chirp_sweep` |
+|---|---|
+| 120 Hz | **659 rad** against a 0.12 rad target — diverged |
+| 480 Hz | **0.095 rad** — stable |
+
+The failure is quiet in the worst way: the chirp tracks cleanly below about 1 Hz
+and only lets go as the sweep climbs, so the first seconds of the overlay plot
+look perfect. Downstream it produces a confident `metrics.csv` full of
+meaningless numbers.
+
+The default is now 480 Hz, and the replay refuses to save a run whose tracking
+error exceeds 1 rad. Lower `--physics_freq` only if you check the result.
+
 ### Reading `metrics.csv`
 
 | column | meaning |
@@ -192,6 +212,21 @@ python tools/sysid/replay_motion_sim.py \
 
 Re-analyse against the same real recording. The real arm does not need to move
 again — that is the point of recording it.
+
+You can also compare two *simulated* gain sets against each other, with no robot
+at all. Replaying the training gains against `ARM_KD_POLYMETIS_IT2` reproduces the
+relationship the real measurement found — the training set lags by 20 ms on j1 and
+30 ms on j4, i.e. it is the more damped of the two:
+
+```
+  joint       rmse_deg    corr   max_lag_ms
+  fr3_joint1    0.2042  0.9939       -20.0
+  fr3_joint4    0.3435  0.9777       -30.0
+  (others)     <0.11    >0.998         0.0
+```
+
+That is a cheap way to sanity-check the toolchain before you book time on the
+hardware.
 
 ### What the recorded runs say
 

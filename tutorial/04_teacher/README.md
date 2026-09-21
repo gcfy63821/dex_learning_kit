@@ -58,6 +58,37 @@ current object-to-fingertip distances.
 Hand **joint velocity** is the largest single block and is genuinely privileged —
 the actor gets positions only.
 
+## Watch the success rate, not the reward
+
+```
+Mean Rewards: 642.88 | Success: 81.9% | Strict: 73.4% | Current Best: 642.88
+```
+
+Two rates, both running means over the last 100 completed episodes:
+
+* **Success** — reached the trajectory's end without a failure termination. That
+  is *survival*.
+* **Strict** — survival, plus the object finished within 3 cm of its demo
+  endpoint, no object-position drift, bad inits excluded. That is *task success*,
+  and it is the same quantity `eval.py` reports as strict3.
+
+Three consecutive epochs resuming from the shipped teacher:
+
+```
+reward 269.79 -> 642.88 -> 753.92
+Survival 69.8% -> 81.9% -> 77.5%
+Strict   56.9% -> 73.4% -> 68.7%
+```
+
+The last epoch bought 111 points of reward while both success rates fell.
+
+Getting this number right is subtler than it looks. `success_buf` is 1 only on
+the step an episode ends and is cleared at reset, so averaging it over all
+environments every step gives a near-zero number that is not a success rate at
+all. It has to be sampled from the environments that just terminated — which is
+what `algo/ppo/ppo.py` now does, alongside the identical treatment reward already
+got. `docs/TRAINING.md` has the details.
+
 ## The reward is not five weights
 
 It is a flat sum of about 25 exponential-kernel terms with individually tuned

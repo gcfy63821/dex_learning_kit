@@ -59,19 +59,40 @@ Measured on the same checkpoint, 200 balanced episodes:
 Neither number is wrong. They answer different questions, and a paper that reports
 only the first is answering the easier one.
 
+## The number to report is strict3, and the script now computes it
+
+The env's own success flag means "reached the end of the trajectory without a
+failure termination". That is survival, not task success. The protocol metric,
+**strict3**, additionally demands the object finished within 3 cm of the demo's
+final pose, with no object-position drift, excluding bad inits
+(`survival_len <= 5`).
+
+```
+[EvalPC] strict success (end_final_dist < N cm, no obj_pos_drift, bad inits excluded: 1/200):
+    strict2   134/199  ( 67.3%)
+    strict3   160/199  ( 80.4%)
+    strict5   179/199  ( 89.9%)
+```
+
+Note that strict3 deliberately excludes **only** object-position drift, not the
+other failure causes. ORing them all in would change what the number means
+without a reader being able to see it.
+
 ## Read the per-demo breakdown
 
 The aggregate hides the interesting part. From the same run:
 
 ```
-cube_small_1   clean 100.0%   DR 76.0%
-cube_small_2   clean  90.0%   DR 82.0%
-squeegee_1     clean  92.0%   DR 84.0%
-squeegee_2     clean 100.0%   DR 86.0%
+               env-internal   strict3
+cube_small_1      96.0%        86.0%
+cube_small_2      92.0%        89.8%
+squeegee_1        86.0%        84.0%
+squeegee_2        98.0%        62.0%     <-- 36 points
 ```
 
-The demo that is perfect when clean is the one that degrades most under
-randomization. An aggregate would have hidden that entirely.
+`squeegee_2` is the near-perfect one on the env metric and the worst under
+strict3: it survives the trajectory and still does not land the object. An
+aggregate, on either metric alone, hides that completely.
 
 ## Check
 

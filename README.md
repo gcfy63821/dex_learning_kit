@@ -10,9 +10,13 @@ The release pipeline distills a privileged **PPO teacher** into a deployable
 ## Pipeline
 
 ```
-  retarget            PPO teacher              DAgger (PointCloud)          PPO fine-tune            deploy (optional)
-  MANO → Sharpa   →   force-poseobs (557d)  →  proprio + PointNet student  →  asymmetric PPO      →  Polymetis + ZMQ
-  scripts/retarget    scripts/train_teacher    scripts/train_dagger_pc        scripts/train_ppo_pc    deploy/
+  retarget            PPO teacher              DAgger (PointCloud)          deploy
+  MANO → Sharpa   →   force-poseobs (557d)  →  proprio + PointNet student  →  Polymetis + ZMQ
+  scripts/retarget    scripts/train_teacher    scripts/train_dagger_pc        deploy/
+                                                        │
+                                                        └── optional: PPO fine-tune (scripts/train_ppo_pc.py)
+                                                            measured to REGRESS ~5.8pp here; the DAgger
+                                                            checkpoint is the deliverable
 ```
 
 ## Start here
@@ -35,13 +39,19 @@ See **[docs/PIPELINE.md](docs/PIPELINE.md)** for a condensed end-to-end walkthro
 ## Install
 
 ```bash
-bash tutorial/00_setup/setup_env.sh --isaaclab /path/to/IsaacLab
+bash tutorial/00_setup/setup_env.sh \
+    --isaacsim /path/to/isaac-sim --isaaclab /path/to/IsaacLab
 ```
 
-Creates the conda environment, installs everything except Isaac Sim, and runs the
-verification checks. See [tutorial/00](tutorial/00_setup/) for Isaac Sim itself,
-the known-good versions, and `--verify-only` for checking a machine you already
-set up.
+Creates the conda environment, installs Isaac Lab and this repository, matches
+pytorch3d to the torch Isaac Lab chose, and runs the verification checks.
+[tutorial/00](tutorial/00_setup/) covers Isaac Sim itself and `--verify-only`;
+[MANUAL_SETUP.md](tutorial/00_setup/MANUAL_SETUP.md) is the same procedure by
+hand.
+
+**The one version rule:** torch, Isaac Lab and pytorch3d must agree. Isaac Lab
+installs torch; pytorch3d has to be the build compiled against it. Do not pin
+torch to a number from a document.
 
 ## Quickstart
 

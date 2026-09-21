@@ -241,6 +241,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     print(f"[INFO] Saved runtime config to {os.path.join(log_dir, 'runtime_config.yaml')}")
 
     # load the checkpoint
+    if args_cli.load_path is not None and not args_cli.resume \
+            and agent_cfg["algo"] != "ProprioAdapt":
+        print("[WARN] --load_path was given without --resume, so the checkpoint "
+              "is NOT loaded and training starts from scratch. Add --resume to "
+              "actually restore it.", flush=True)
+
     if args_cli.resume or agent_cfg["algo"] == "ProprioAdapt":
         resume_path = agent_cfg["load_path"]
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")

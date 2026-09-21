@@ -1,10 +1,14 @@
 # Dex-X core dependencies (curated).
-# Isaac Lab / Isaac Sim are installed separately — see docs/PIPELINE.md §Install.
+#
+# Isaac Lab, Isaac Sim, torch and pytorch3d are NOT here. Isaac Lab installs
+# torch, and pytorch3d must be built against exactly that torch — so both are
+# resolved at setup time rather than pinned in this file. See
+# tutorial/00_setup/MANUAL_SETUP.md, or run tutorial/00_setup/setup_env.sh.
+#
 # For an exact frozen environment, use requirements-full.txt instead.
 
 # --- core ---
 numpy
-torch
 gymnasium
 termcolor
 tqdm
@@ -13,13 +17,31 @@ wandb
 
 # --- geometry / kinematics / retargeting ---
 trimesh
+yourdfpy                # URDF FK for the calibration tools
 pytorch_kinematics
-# pytorch3d           # install per official instructions (build matches your torch/CUDA)
+# pytorch3d is REQUIRED, not optional: the demonstration loader imports
+# pytorch3d.ops / pytorch3d.transforms at module load, so training cannot start
+# without it. It is installed separately because the wheel must match the torch
+# Isaac Lab chose -- see MANUAL_SETUP.md step 3.
+#
+# bps_torch and chamfer_distance must be installed with --no-deps; both declare
+# their own torch and would otherwise break that match. setup_env.sh does this.
 bps_torch @ git+https://github.com/KailinLi/bps_torch.git@4a2eb59dfbf8982de1af878552e561d688dced28
 chamfer_distance @ git+https://github.com/otaheri/chamfer_distance@f86f6f7cadd3aca642704573d1626c67ca2e2846
 
+# --- depth rendering (REQUIRED for the point-cloud env, i.e. the whole
+#     student pipeline: franka_sharpa_pointcloud_env instantiates it at init) ---
+# simple-raycaster declares its own `torch`, so install it --no-deps and bring
+# its real runtime deps yourself — otherwise pip may move torch and break the
+# Isaac Lab / pytorch3d agreement. setup_env.sh does this.
+#   pip install --no-deps git+https://github.com/Agent-3154/simple-raycaster.git
+warp-lang               # the raycasting kernels
+mujoco                  # imported at module load by simple_raycaster.raycaster
+jaxtyping
+fast_simplification
+scipy
+
 # --- point cloud / visualization ---
-open3d
 imageio
 imageio-ffmpeg
 viser

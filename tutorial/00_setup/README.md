@@ -5,52 +5,57 @@ reading a version number.
 
 ## Install
 
-One script does everything except Isaac Sim:
-
 ```bash
-bash tutorial/00_setup/setup_env.sh --isaaclab /path/to/IsaacLab
+bash tutorial/00_setup/setup_env.sh \
+    --isaacsim /path/to/isaac-sim \
+    --isaaclab /path/to/IsaacLab
 ```
 
-It checks your GPU and driver, creates a conda environment, installs PyTorch and
-this package, and then **runs the verification checks** — so it tells you whether
-the machine is ready rather than whether the commands exited zero.
+It checks your GPU, creates a conda environment, links Isaac Sim into Isaac Lab,
+installs Isaac Lab **without** the extra RL libraries, then matches pytorch3d to
+whatever torch that produced, installs the two `--no-deps` packages and this
+repository — and finally **runs the verification checks**.
 
-Useful variants:
+Variants:
 
 ```bash
-bash tutorial/00_setup/setup_env.sh --name myenv          # different env name
-bash tutorial/00_setup/setup_env.sh --name myenv --verify-only   # check, install nothing
+--name myenv                    # a different environment name
+--verify-only                   # check an existing env, install nothing
+PYTORCH3D_BASE=0.7.8+5043d15    # override the pytorch3d base version
 ```
 
-`--verify-only` is for confirming an existing machine is ready without touching
-what is installed on it.
+**[MANUAL_SETUP.md](MANUAL_SETUP.md)** is the same procedure done by hand. Read
+it when the script fails, or before trusting it.
 
 ### Isaac Sim is the one part you install yourself
 
-It ships through NVIDIA's own installer and its version has to match your driver.
+It ships through NVIDIA's own installer and the build has to match your driver.
+Download [Isaac Sim 4.5.0](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html),
+unzip it, and pass the path as `--isaacsim`.
 
-```bash
-git clone https://github.com/isaac-sim/IsaacLab.git
-cd IsaacLab && ./isaaclab.sh --install
+### The version rule
+
+> **torch, Isaac Lab and pytorch3d must agree.** Nothing else about the torch
+> version matters.
+
+Do not pin torch to a number from any document — Isaac Lab installs it, and
+pytorch3d then has to be the build compiled against *that* torch. The coupling is
+visible in the package name:
+
+```
+torch      2.5.1+cu118
+pytorch3d  0.7.8+5043d15pt2.5.1cu118
+                      ^^^^^^^^^^^^^
 ```
 
-Then re-run `setup_env.sh` with `--isaaclab` pointing at that checkout.
+The script derives the right string automatically; MANUAL_SETUP.md step 3 shows
+how to do it by hand.
 
-### Known-good versions
+### Known-good combination
 
-These are read off a machine where the whole pipeline runs, not off a changelog.
-
-| | version |
-|---|---|
-| python | 3.10 |
-| torch | 2.5.1+cu118 |
-| isaaclab | 0.46.3 (Isaac Sim 4.5) |
-| numpy | 1.26.4 |
-| gymnasium | 0.29.1 |
-| GPU used for the numbers in these lessons | RTX 4090, 24 GB |
-
-`requirements-full.txt` is a frozen snapshot of that environment if you need to
-reproduce it exactly; `requirements.txt` is the curated set.
+A reference point, not a target: python 3.10, Isaac Sim 4.5.0, isaaclab 0.46.3,
+torch 2.5.1+cu118, pytorch3d 0.7.8+5043d15pt2.5.1cu118, numpy 1.26.4, gymnasium
+0.29.1, on an RTX 4090. `requirements-full.txt` is the frozen snapshot.
 
 ## Check it
 
@@ -62,6 +67,19 @@ This imports the package, resolves the task registry, and confirms the assets,
 demonstrations, camera calibrations and pretrained teacher are all present and
 consistent with each other. It does **not** start Isaac Sim, so it takes a second
 and tells you about missing files before a twenty-minute run does.
+
+## Check the code's dependencies
+
+```bash
+python tutorial/00_setup/check_imports.py
+```
+
+Walks the source, collects every third-party import, and tries each one —
+derived from the code, not from `requirements.txt`. A package can be missing
+from requirements and still imported at module load; you then find out twenty
+minutes into a run. `simple_raycaster` was exactly that: a hard requirement of
+the point-cloud env, in no requirements file, working only because it happened
+to be installed locally.
 
 ## Check it can move
 

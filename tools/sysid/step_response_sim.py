@@ -51,7 +51,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 def main():
     # Setup sim
     sim_cfg = SimulationCfg(
-        dt=1.0 / 120.0,
+        # 480, not 120: the arm PD here is an explicit torque loop (the implicit
+        # actuator is zeroed so gravity compensation can be added) and it is
+        # unstable at 120 Hz on this robot — see replay_motion_sim.py.
+        dt=1.0 / 480.0,
         device="cuda:0",
         physx=PhysxCfg(solver_type=1, max_position_iteration_count=8, max_velocity_iteration_count=0),
     )

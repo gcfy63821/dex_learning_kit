@@ -44,7 +44,9 @@ python tutorial/00_setup/check_install.py            > "$OUT/check_install.log" 
 python tutorial/01_frames_and_constants/check_frames.py > "$OUT/check_frames.log" 2>&1 || fail=1
 python tutorial/06_camera_calibration/inspect_extrinsic.py > "$OUT/inspect_extrinsic.log" 2>&1 || fail=1
 python tutorial/00_setup/check_portable.py       > "$OUT/check_portable.log" 2>&1 || fail=1
-tail -1 "$OUT/check_install.log"; tail -1 "$OUT/check_frames.log"; tail -1 "$OUT/check_portable.log"
+python tutorial/00_setup/check_imports.py        > "$OUT/check_imports.log" 2>&1 || fail=1
+tail -1 "$OUT/check_install.log"; tail -1 "$OUT/check_frames.log"
+tail -1 "$OUT/check_portable.log"; tail -1 "$OUT/check_imports.log"
 
 say "2/4  train a lean student (3 DAgger iterations)"
 watch_for "$OUT/student/dagger_final.pth" "$OUT/train.log" 90 -- \
@@ -92,6 +94,12 @@ w = [v for k, v in ck["model"].items() if k.endswith("mlp.0.weight") and v.shape
 chk("student MLP in_features", int(w.shape[1]), 481)
 
 summ = json.load(open(os.path.join(out, "eval", "summary.json")))
+# strict3 is the metric the protocol says to report; assert it is computed.
+_strict = summ.get("strict") or {}
+_has = all(k in _strict for k in ("strict2", "strict3", "strict5"))
+ok &= _has
+print(f"  [{'ok' if _has else 'FAIL'}] strict2/3/5 present in summary"
+      + (f": strict3 = {100*_strict['strict3']['rate']:.1f}%" if _has else ""))
 per = summ.get("success_rate_per_demo") or {}
 counts = sorted({v["episodes"] for v in per.values()})
 print(f"  [{'ok' if len(counts) == 1 else 'FAIL'}] episodes balanced across "

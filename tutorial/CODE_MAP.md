@@ -83,6 +83,7 @@ world.
 |---|---|---|
 | `algo/models/models.py` | 1060 | `ActorCriticAsymmetric` and friends. The critic takes `cat([obs, priv_info])` |
 | `algo/ppo/ppo.py` | 662 | PPO for the state expert |
+| `algo/ppo/ppo_pointcloud.py`, `actor_critic_pointcloud.py` | — | the optional PPO fine-tune (lesson 05); not in the default pipeline |
 | `algo/dagger/dagger_pointcloud.py` | 436 | the DAgger loop, the convex blend, the lean-student slicing |
 | `algo/dagger/pointcloud_student.py` | 89 | proprio ⊕ PointNet feature → action |
 | `tasks/franka_sharpa/pointcloud/pointcloud_encoder.py` | 227 | the shared PointNet |

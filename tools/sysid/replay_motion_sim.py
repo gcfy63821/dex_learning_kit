@@ -34,7 +34,12 @@ parser.add_argument("--motion", required=True, type=str)
 parser.add_argument("--output", required=True, type=str)
 parser.add_argument("--control_freq_override", type=float, default=None)
 parser.add_argument("--record_freq", type=float, default=100.0)
-parser.add_argument("--physics_freq", type=float, default=120.0)
+# 480, not the 120 this was inherited with. The arm PD here is an EXPLICIT
+# torque loop (the implicit actuator is zeroed so gravity comp can be added), and
+# at 120 Hz it is unstable for this robot: the chirp tracks cleanly below ~1 Hz
+# and then diverges, reaching 659 rad of error against a 0.12 rad target. At 480
+# Hz the same run holds 0.095 rad max. Lower this only if you check the result.
+parser.add_argument("--physics_freq", type=float, default=480.0)
 parser.add_argument("--approach_s", type=float, default=2.0)
 parser.add_argument("--arm_kp", type=str, default=None,
                     help="Comma-separated 7 stiffness values overriding the training "
@@ -328,6 +333,18 @@ def main():
             "gravity_comp": True,
         },
     }
+    # A diverged replay produces confident, meaningless metrics downstream.
+    # Refuse to save one rather than let it reach analyze_motion.py.
+    _err = np.abs(np.asarray(rec_actuals) - np.asarray(rec_targets))
+    _max_err = float(_err.max()) if _err.size else 0.0
+    if _max_err > 1.0:
+        raise RuntimeError(
+            f"replay diverged: max |actual - target| = {_max_err:.1f} rad against a "
+            f"target range of ~0.12 rad. The PD torque loop went unstable — raise "
+            f"--physics_freq (480 is the default for this reason) or lower the "
+            f"stiffness. Not saving, because the metrics would look plausible.")
+    print(f"[replay_sim] max tracking error {_max_err:.4f} rad — stable")
+
     with open(out_path, "wb") as f:
         pickle.dump(data, f)
     print(f"[OK] Saved to {out_path}")

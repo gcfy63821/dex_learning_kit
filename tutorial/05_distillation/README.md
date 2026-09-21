@@ -83,6 +83,18 @@ print(c["cfg"].proprio_dim, c["student_drop_slots"], c["student_obs_slots"])
 Evaluation re-applies that layout automatically and refuses to run if the live
 slot map disagrees with the saved one.
 
+## What about `scripts/train_ppo_pc.py`?
+
+It fine-tunes the distilled student with asymmetric PPO, warm-started from the
+DAgger checkpoint. **It is not part of the default pipeline.** On the 20-demo
+strict3 evaluation the best PPO configuration *regressed* about 5.8 pp against
+the DAgger student it started from, so the DAgger checkpoint is the deliverable.
+
+It ships because the capability is occasionally useful and the evaluation and
+deploy scripts already auto-detect either architecture from the checkpoint. If
+you reach for it, `docs/DISTILLATION.md` §Step B has the flags — `--init_logstd
+-4` is the one that matters.
+
 ## Porting
 
 Changing the observation layout changes the slot map, which invalidates saved

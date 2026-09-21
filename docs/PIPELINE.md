@@ -9,9 +9,13 @@ Simulation runs at `dt = 1/120` with `decimation = 4`, giving an effective
 **~30 Hz** control rate that matches 30 fps demos and the real robot loop.
 
 ```
-retarget           PPO teacher             DAgger (PointCloud)          PPO fine-tune          deploy (optional)
-MANO → Sharpa   →  force-poseobs (557d) →  proprio + PointNet student → asymmetric PPO      →  ROS2 + Sharpa SDK
-RETARGET.md        TRAINING.md             DISTILLATION.md              DISTILLATION.md        DEPLOY.md
+retarget           PPO teacher             DAgger (PointCloud)          deploy
+MANO → Sharpa   →  force-poseobs (557d) →  proprio + PointNet student → Polymetis + ZMQ
+RETARGET.md        TRAINING.md             DISTILLATION.md              DEPLOY.md
+                                                    │
+                                                    └── optional: PPO fine-tune — DISTILLATION.md §Step B.
+                                                        Not part of the default pipeline: it was measured
+                                                        to regress ~5.8pp from the DAgger student.
 ```
 
 All commands run from the `dexx_release/` root. Python is Isaac Lab's Python
