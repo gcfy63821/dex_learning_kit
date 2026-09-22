@@ -54,19 +54,23 @@ Mean Rewards: 642.88 | Success: 81.9% | Strict: 73.4% | Current Best: 642.88
 | | meaning | TensorBoard |
 |---|---|---|
 | `Success` | reached the end of the trajectory without a failure termination — **survival** | `success_rate/iter` |
-| `Strict` | survival **and** the object finished within 3 cm of its demo endpoint, with no object-position drift, excluding bad inits — **task success** | `success_rate_strict/iter` |
+| `Strict` | survival **and** the object finished within 3 cm of its demo endpoint, with no object-position drift; episodes of at most 5 steps score zero — **training proxy** | `success_rate_strict/iter` |
 
 Both are running means over the last 100 **completed** episodes.
 
-`Strict` is the same quantity `eval.py` reports as strict3, deliberately: the
-number you watch while training and the number you report should be the same
-thing. It runs 9–13 points below `Survival` on a trained teacher, which matches
-the 93.0% vs 80.4% measured on the evaluation side.
+`Strict` is a conservative training diagnostic, **not** the `strict3` evaluation
+protocol. It requires trajectory completion without any failure termination and
+counts bad inits as failures in the denominator. Evaluation excludes bad inits
+from the denominator and rejects only object-position drift; it does not require
+the env's success flag. For example, one successful episode plus one bad init
+gives training `Strict = 50%`, but evaluation `strict3 = 100%`. Use `eval.py` for
+the reported protocol metric; the training log keys retain their existing names.
 
 The threshold lives in `STRICT_SUCCESS_DIST` (`franka_sharpa_env.py`) and is
 passed into the reward function as a parameter rather than read from the module —
 `compute_imitation_reward` is `@torch.jit.script`, and TorchScript cannot close
-over a global float.
+over a global float. Evaluation's strict3 always uses 3 cm; `--success_dist`
+changes only the evaluation's closest-approach threshold.
 
 Reward and success do not move together, and neither do the two success rates.
 Three consecutive epochs resuming from the shipped teacher:

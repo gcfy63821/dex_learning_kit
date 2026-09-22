@@ -1,191 +1,203 @@
 # Manual environment setup
 
-`setup_env.sh` automates most of this. Follow this page when the script fails,
-when you want to understand what it is doing, or when your CUDA / driver
-combination needs a different torch than the one Isaac Lab picks.
+The installer targets Linux x86_64, Isaac Sim 4.5 and Isaac Lab v2.2.1.
+Paths below are placeholders chosen by you; no shared filesystem, cluster,
+proxy or particular GPU model is required. An NVIDIA GPU supported by Isaac Sim
+and the selected CUDA build is required.
 
-## The one rule that matters
+## Compatibility baseline
 
-> **torch, Isaac Lab and pytorch3d must agree.**
+| Component | Baseline |
+|---|---|
+| Python | 3.10 |
+| Isaac Sim | 4.5.0 binary distribution |
+| Isaac Lab | v2.2.1, commit `0f00ca2b4b2d54d5f90006a92abb1b00a72b2f20` (package 0.45.9) |
+| Torch / torchvision | 2.7.0 / 0.22.0; the official Lab installer selects cu128 |
+| Gymnasium / NumPy | 1.2.0 / 1.26.4 |
+| PyTorch3D | 0.7.8+5043d15 built for the exact Torch/CUDA pair |
+| simple-raycaster | commit `7bab59c56e9a340f20b7af29e4b769108cb697fd` |
 
-Nothing else about the torch version is important. Do not pin it to a number
-from this document — pin it to *whatever Isaac Lab installs on your machine*,
-then make pytorch3d match that.
+This is a constrained installation baseline, **not a claim that every target
+machine has passed training**. Run the headless acceptance test below.
+`requirements-full.txt` is a compatibility alias to the curated requirements,
+not a lock file. The former development snapshot was inconsistent and cannot
+be used to reconstruct a working environment.
 
-You can see the coupling in the package name itself:
+The [official Lab compatibility table](https://github.com/isaac-sim/IsaacLab/tree/v2.2.1)
+supports Sim 4.5. This Lab version supplies the contact-point and articulation
+APIs the tasks need. Older Lab versions cannot be substituted merely because
+`import isaaclab` succeeds.
 
-```
-torch      2.5.1+cu118
-pytorch3d  0.7.8+5043d15pt2.5.1cu118
-                      ^^^^^^^^^^^^^  torch 2.5.1, CUDA 11.8
-```
+## 1. System prerequisites
 
-If those two halves disagree, pytorch3d imports and then segfaults or silently
-produces wrong results — it is compiled against torch's ABI.
+Install Git, Conda, a compiler toolchain and CMake. Use the
+[Isaac Sim 4.5 system requirements](https://docs.isaacsim.omniverse.nvidia.com/4.5.0/installation/requirements.html)
+and compatibility checker to select a supported driver/GPU. The driver must
+also support the CUDA build chosen for Torch; see
+[NVIDIA CUDA compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/).
 
-## Workspace layout
-
-Isaac Lab expects Isaac Sim to sit inside it as `_isaac_sim`. Lay the workspace
-out like this and open the outer folder in your editor:
-
-```
-<workspace>/
-  IsaacLab/
-    _isaac_sim/      -> symlink to your Isaac Sim install
-  dexx_release/      <- this repository
-```
-
-## 1. Isaac Sim
-
-Download [Isaac Sim 4.5.0](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html)
-and unzip it somewhere. Call that path `$ISAACSIM_PATH`.
-
-This is the one piece nothing can automate: the build has to match your NVIDIA
-driver.
-
-## 2. Conda environment and Isaac Lab
+On Ubuntu 22.04, typical system prerequisites include:
 
 ```bash
-conda create -n dexx python=3.10
-conda activate dexx
-
-git clone git@github.com:isaac-sim/IsaacLab.git     # SSH recommended
-cd IsaacLab
-ln -s $ISAACSIM_PATH _isaac_sim
-
-./isaaclab.sh -c dexx        # point Isaac Lab at this conda env
-./isaaclab.sh -i none        # install WITHOUT the extra RL libraries
-
-conda activate dexx          # reactivate so PYTHONPATH is picked up
-echo $PYTHONPATH
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git libsm6 libxt6 libxrender1 libxi6 libgl1 libvulkan1 vulkan-tools
 ```
 
-`-i none` matters. The other options pull in RL frameworks this repository does
-not use and that can drag in a conflicting torch.
+These packages do not install the NVIDIA graphics driver. In a container,
+configure NVIDIA Container Toolkit to expose compute **and graphics** libraries
+and the Vulkan ICD. `nvidia-smi` or a successful Torch CUDA operation alone does
+not establish that Vulkan works; check `vulkaninfo --summary` and the simulator
+logs as well. `--headless` removes the window, not these dependencies.
 
-**Isaac Lab installs torch.** Whatever it chose is now the version everything
-else has to match:
+Download the Isaac Sim 4.5 binary distribution and unpack it. Set
+`ISAACSIM_PATH` to that directory. The automatic installer uses this binary
+route. A pip-based Sim install additionally requires its supported glibc
+version (at least 2.34 for the 4.5 wheels); changing Python alone does not fix
+an incompatible glibc.
+
+## 2. Pin Isaac Lab and create the environment
+
+From your chosen workspace:
+
+```bash
+git clone --branch v2.2.1 --depth 1 https://github.com/isaac-sim/IsaacLab.git
+cd IsaacLab
+git rev-parse HEAD  # must equal the commit in the table
+ln -s "$ISAACSIM_PATH" _isaac_sim
+cd ../dexx_release  # this repository
+```
+
+For the automatic path:
+
+```bash
+bash tutorial/00_setup/setup_env.sh --isaaclab ../IsaacLab --isaacsim "$ISAACSIM_PATH" --name dexx
+```
+
+Or run the equivalent installation manually, starting in this repository:
+
+```bash
+export DEXX_REPO="$PWD"
+export ISAACLAB_PATH="$(cd ../IsaacLab && pwd)"
+export PIP_CONSTRAINT="$DEXX_REPO/constraints-sim45.txt"
+export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
+conda create -y -n dexx python=3.10
+conda activate dexx
+python -m pip install 'setuptools<81' toml
+cd "$ISAACLAB_PATH"
+# The upstream installer calls `tabs`; noninteractive shells may use TERM=dumb.
+if [ -z "${TERM:-}" ] || [ "$TERM" = dumb ]; then export TERM=xterm; fi
+./isaaclab.sh -c dexx
+./isaaclab.sh -i none
+conda activate dexx
+cd "$DEXX_REPO"
+```
+
+`-i none` omits optional RL frameworks. The official Lab installer can replace
+an existing Torch build with 2.7/cu128, so use a dedicated environment. The
+constraints apply during Lab installation as well as project installation;
+`pin==2.7.0` avoids newer Pinocchio wheels pulling NumPy 2. The setuptools cap
+keeps the `pkg_resources` build interface required by Lab's flatdict dependency;
+`PIP_BUILD_CONSTRAINT` applies it to isolated builds on newer pip releases.
+
+The automatic path checks the Lab checkout, imported source path and versions
+before reusing an existing environment. It refuses conflicting Sim links.
+For a preconfigured CUDA variant, keep Torch/torchvision paired and rebuild or
+select matching PyTorch3D; that variant needs its own runtime acceptance. Do
+not run Lab's installer expecting it to preserve a different CUDA build.
+
+## 3. Install matching PyTorch3D and the project
+
+For the default 2.7/cu128 build:
 
 ```bash
 python -c "import torch; print(torch.__version__)"
-# e.g. 2.5.1+cu118
+python -m pip install --extra-index-url https://miropsota.github.io/torch_packages_builder \
+    pytorch3d==0.7.8+5043d15pt2.7.0cu128
+python -m pip install -e . -r requirements.txt
+# Same package version can hide a different Git revision; replace its code.
+python -m pip install --force-reinstall --no-deps \
+    "$(sed -n '/^simple-raycaster @ /p' requirements.txt)"
+python -m pip check
 ```
 
-## 3. pytorch3d, matched to that torch
+The PyTorch3D index is a third-party build service. If its matching wheel is
+unavailable for your Python/platform, build the pinned source using a matching
+Torch/CUDA toolkit; do not substitute an incompatible binary. PyTorch3D is
+required by the dataset loader, including its compiled operators.
 
-pytorch3d has no matching wheel on PyPI for most torch builds. Use the
-prebuilt index, and construct the version string from what you just printed:
+The automatic installer additionally constrains the exact installed Torch
+CUDA build during later pip operations. The Git dependencies are pinned
+in `requirements.txt` and their dependencies are resolved with ordinary pip.
+The raycaster code is then explicitly reinstalled: pip otherwise may retain a
+different Git commit with the same package version, even with `--upgrade`.
+This one targeted `--no-deps` reinstall follows dependency resolution and is
+checked by `pip check` and Git provenance verification. It is not a way to
+hide dependency conflicts.
+
+The pinned raycaster supports dynamic per-environment mesh subsets used by
+multi-object training. Do not replace it with an arbitrary 0.2.0/HEAD: the same
+version label can have different fused-call shape and return contracts.
+
+Real-robot/camera transport dependencies are separate:
 
 ```bash
-# torch 2.5.1+cu118  ->  ...pt2.5.1cu118
-pip install --extra-index-url https://miropsota.github.io/torch_packages_builder \
-    pytorch3d==0.7.8+5043d15pt2.5.1cu118
+python -m pip install -r requirements-deploy.txt
+python tutorial/00_setup/check_imports.py --include-deploy
 ```
 
-The pattern is `pytorch3d==0.7.8+5043d15pt<TORCH_VERSION><CUDA>`, where
-`<CUDA>` is `cu118`, `cu121`, … with no dot. Browse
-<https://miropsota.github.io/torch_packages_builder> to find the build for your
-torch if the one above does not exist.
+Polymetis, ROS and camera/hand SDKs remain specific to their respective hosts.
+Optional RSL-RL example configurations are excluded from the default scan; use
+`check_imports.py --include-rsl-rl` after separately installing that backend.
+The shipped training scripts use the project's own PPO/DAgger implementations.
 
-pytorch3d is not optional here: the demonstration loader uses
-`pytorch3d.ops.sample_points_from_meshes` and `pytorch3d.transforms`, so
-training cannot start without it.
-
-## 4. The two `--no-deps` packages
-
-Both would otherwise pull their own torch and break the agreement from step 2:
+## 4. Verify in stages
 
 ```bash
-pip install git+https://github.com/otaheri/chamfer_distance --no-deps
-pip install git+https://github.com/KailinLi/bps_torch.git --no-deps
-```
-
-`bps_torch` produces the 128-d object shape encoding in the teacher's
-observation; `chamfer_distance` is used by the retargeting loss.
-
-## 4b. simple-raycaster — required, and easy to miss
-
-The point-cloud environment renders depth with
-`simple_raycaster.MultiMeshRaycaster`, constructed unconditionally in
-`FrankaSharpaPointCloudEnv.__init__`. Without it the entire student pipeline
-fails at env creation.
-
-```bash
-pip install --no-deps git+https://github.com/Agent-3154/simple-raycaster.git
-```
-
-`--no-deps` again: it declares `torch` and would undo step 2. Its real runtime
-imports are `warp`, `mujoco`, `jaxtyping` and `trimesh`, which
-`requirements.txt` carries — so install it before step 5, not after.
-
-This one went undeclared for a while and worked anyway, because it happened to
-be pip-installed from a local checkout. `check_imports.py` (step 6) exists
-because of it.
-
-## 5. This repository
-
-```bash
-cd <workspace>/dexx_release
-pip install -e .
-pip install -r requirements.txt
-```
-
-## 6. Verify
-
-Three checks, none of which starts the simulator:
-
-```bash
-python tutorial/00_setup/check_install.py         # files, constants, calibrations
-python tutorial/00_setup/check_portable.py        # no paths pointing off this machine
-python tutorial/00_setup/check_imports.py         # every package the CODE imports
+python tutorial/00_setup/check_versions.py
+python -m pip check
+python tutorial/00_setup/check_install.py
+python tutorial/00_setup/check_portable.py
+python tutorial/00_setup/check_imports.py
 python tutorial/01_frames_and_constants/check_frames.py
 ```
 
-`check_imports.py` walks the source, collects every third-party import, and tries
-each one. It reports three categories: importable, hardware-only (ROS, Polymetis,
-the Sharpa SDK — absent on a workstation by design), and installed-but-needs-the-
-Isaac-app (`isaaclab_tasks` raises `ModuleNotFoundError: omni.physics` until
-`AppLauncher` has run, which is why the scripts import it after that line). Only
-genuinely absent packages are failures.
+These check versions, files and imports. The import checker reports explicit
+Isaac runtime deferrals as **unverified**, and fails real dependency/ABI errors.
+It does not prove simulator API or GPU readiness.
 
-Then one that does:
+For an isolated headless API/CUDA check, choose a new result filename:
 
 ```bash
-bash tutorial/run_acceptance.sh                   # ~6 min, trains and evaluates
+python -u tutorial/00_setup/check_runtime.py --headless --result logs/runtime-check.json
 ```
 
-If the acceptance test passes, the environment is correct. Nothing short of it
-proves that — `import torch` succeeding says very little.
+Require the result JSON to contain `"ok": true`; simulator startup failures may
+return exit code zero without completing Python code. This checks task config,
+contact APIs, PyTorch3D CUDA KNN and moving per-environment raycaster subsets.
+It does not validate a full robot physics rollout or RTX camera.
 
-## Known-good combination
+Then run the complete acceptance test (it includes runtime preflight):
 
-Read off a machine where the full pipeline runs. Use it as a reference point,
-not as a target:
+```bash
+bash tutorial/run_acceptance.sh
+```
 
-| | version |
-|---|---|
-| python | 3.10 |
-| Isaac Sim | 4.5.0 |
-| isaaclab | 0.46.3 |
-| torch | 2.5.1+cu118 |
-| pytorch3d | 0.7.8+5043d15pt2.5.1cu118 |
-| numpy | 1.26.4 |
-| gymnasium | 0.29.1 |
-| GPU | RTX 4090, driver 580.x |
+It uses a fresh output directory, trains a student, waits for the final summary
+and requires exactly four demonstration IDs with ten episodes each. Each stage
+must also exit successfully: a shutdown timeout fails acceptance even if an
+artifact exists. A failed preflight stops the run. Keep the output logs and
+installed versions when reporting results. Runtime depends on the target hardware and first-run caches.
+For videos/RTX cameras, additionally validate `--enable_cameras` on that target.
 
 ## Troubleshooting
 
-**`./isaaclab.sh -c` does nothing useful.** It has to run from the IsaacLab
-checkout, with the conda env already active.
-
-**`import pytorch3d` segfaults, or works but gives nonsense.** The build does not
-match your torch. Re-read step 3 and compare the two halves of the version
-string.
-
-**`set -u` kills the shell on `conda activate`.** Isaac Sim ships an activation
-hook that reads `$ZSH_VERSION` unguarded. Relax `set -u` around the activate
-call — `setup_env.sh` does this.
-
-**Training starts and immediately errors in the dataset loader.** Usually
-pytorch3d missing or mismatched; it is imported at module load in
-`tasks/hand_imitation/dataset/`.
+- **Dependency conflict:** use the pinned Lab checkout and constraints from the
+  start. Do not mix the old development snapshot into this environment.
+- **Missing contact-point API:** check the imported Lab source and commit;
+  removing contact fields changes the observations and is not a compatibility fix.
+- **PyTorch3D import/CUDA error:** match Torch, CUDA, Python and the compiled wheel.
+- **Vulkan/graphics failure with headless:** inspect the driver, loader and ICD
+  inside the actual runtime/container; CUDA visibility is insufficient.
+- **Conda activation fails under `set -u`:** Isaac Sim activation hooks may read
+  unset shell variables. The installer temporarily relaxes strict shell flags
+  and checks activation status explicitly.

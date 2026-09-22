@@ -32,7 +32,7 @@ predictable: under randomization the biased estimate came out **2.5 points low**
 because the over-represented demo happened to be the weakest one.
 
 `--per_demo_quota` now defaults to `ceil(max_episodes / n_demos)`. The summary
-reports `success_rate_per_demo`, a demo-averaged **macro** rate and an
+reports closest-approach `success_rate_per_demo`, a demo-averaged **macro** rate and an
 episode-weighted **micro** rate; with the quota they coincide, which is the point.
 
 Pass `--per_demo_quota 0` for the old behaviour if you need to reproduce an old
@@ -63,9 +63,13 @@ only the first is answering the easier one.
 
 The env's own success flag means "reached the end of the trajectory without a
 failure termination". That is survival, not task success. The protocol metric,
-**strict3**, additionally demands the object finished within 3 cm of the demo's
+**strict3**, checks whether the object finished within 3 cm of the demo's
 final pose, with no object-position drift, excluding bad inits
 (`survival_len <= 5`).
+
+The separate `success_rate_*` fields in this evaluator check whether the object
+came within `--success_dist` at any point in the episode. They are closest-approach
+rates, not the env's trajectory-completion flags.
 
 ```
 [EvalPC] strict success (end_final_dist < N cm, no obj_pos_drift, bad inits excluded: 1/200):
@@ -76,23 +80,27 @@ final pose, with no object-position drift, excluding bad inits
 
 Note that strict3 deliberately excludes **only** object-position drift, not the
 other failure causes. ORing them all in would change what the number means
-without a reader being able to see it.
+without a reader being able to see it. It does not require the env's success
+flag. Training's `Strict` is a separate conservative proxy: it requires successful
+trajectory completion and counts bad inits as zeros rather than removing them
+from the denominator. See [TRAINING.md](../../docs/TRAINING.md).
 
 ## Read the per-demo breakdown
 
 The aggregate hides the interesting part. From the same run:
 
 ```
-               env-internal   strict3
+               closest       strict3
 cube_small_1      96.0%        86.0%
 cube_small_2      92.0%        89.8%
 squeegee_1        86.0%        84.0%
 squeegee_2        98.0%        62.0%     <-- 36 points
 ```
 
-`squeegee_2` is the near-perfect one on the env metric and the worst under
-strict3: it survives the trajectory and still does not land the object. An
-aggregate, on either metric alone, hides that completely.
+`squeegee_2` frequently approaches the target but has lower endpoint accuracy.
+An aggregate, on either metric alone, hides that distinction. These historical
+numbers illustrate the breakdown; rerun evaluation after metric fixes for
+release results.
 
 ## Check
 

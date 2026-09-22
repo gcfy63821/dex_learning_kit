@@ -43,15 +43,12 @@ bash tutorial/00_setup/setup_env.sh \
     --isaacsim /path/to/isaac-sim --isaaclab /path/to/IsaacLab
 ```
 
-Creates the conda environment, installs Isaac Lab and this repository, matches
-pytorch3d to the torch Isaac Lab chose, and runs the verification checks.
-[tutorial/00](tutorial/00_setup/) covers Isaac Sim itself and `--verify-only`;
-[MANUAL_SETUP.md](tutorial/00_setup/MANUAL_SETUP.md) is the same procedure by
-hand.
-
-**The one version rule:** torch, Isaac Lab and pytorch3d must agree. Isaac Lab
-installs torch; pytorch3d has to be the build compiled against it. Do not pin
-torch to a number from a document.
+First prepare the pinned **Isaac Lab v2.2.1 / Isaac Sim 4.5 / Python 3.10**
+installation described in [MANUAL_SETUP.md](tutorial/00_setup/MANUAL_SETUP.md).
+The script installs project dependencies under compatibility constraints and
+matches PyTorch3D to Torch. [Tutorial 00](tutorial/00_setup/) covers the system
+requirements and headless acceptance test. Static checks alone do not certify
+GPU training; no particular cluster, shared path or GPU model is assumed.
 
 ## Quickstart
 

@@ -1,24 +1,20 @@
-"""Verify every third-party package the code imports is actually installed.
-
-Derived from the source, not from requirements.txt — which is the point. A
-dependency can be missing from requirements and still be imported at module
-load; you then find out twenty minutes into a training run, or not until the
-point-cloud env is constructed.
-
-`simple_raycaster` is the case this exists for: a hard requirement of the
-point-cloud env that appeared in no requirements file and only worked because it
-happened to be installed from a local checkout on one machine. It passed every
-other check in this directory, because those look at files and constants rather
-than at what the code imports. On a fresh machine this check fails loudly
-instead.
+"""Check imports used by simulation, without starting Isaac Sim.
 
     python tutorial/00_setup/check_imports.py
+    python tutorial/00_setup/check_imports.py --include-deploy
+    python tutorial/00_setup/check_imports.py --include-rsl-rl
+
+Hardware SDKs and Isaac Sim runtime imports are reported separately. A passing
+static check does not verify the simulator, CUDA operators, or training; run
+check_runtime.py --headless --result runtime.json and tutorial/run_acceptance.sh
+for those checks.
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import importlib
-import importlib.metadata as md
+import importlib.machinery
 import importlib.util
 import os
 import sys
@@ -26,131 +22,147 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCAN = ("src/dexx", "scripts", "tools", "deploy")
 SKIP_DIRS = {"__pycache__", ".git"}
-
 FIRST_PARTY = {"dexx"}
-
-# Expected to be absent on a workstation: they live on the robot, the camera
-# host, or inside Isaac Sim's own interpreter. Missing here is not an error.
+# These tools acquire data from live hardware, rather than process saved data.
+DEPLOY_TOOLS = {"tools/calib/capture_multiframe_zmq.py", "tools/calib/live_calibrate_extrinsic.py"}
 HARDWARE_ONLY = {
     "polymetis", "rclpy", "sensor_msgs", "geometry_msgs", "std_msgs",
     "visualization_msgs", "cv_bridge", "rosgraph_msgs", "builtin_interfaces",
     "tf2_ros", "tf2_geometry_msgs", "tf2_py", "ament_index_python",
     "rclpy_message_converter", "nav_msgs", "trajectory_msgs",
-    "pyrealsense2", "sharpa", "sharpa_sdk", "omni", "pxr", "isaacsim", "carb",
-    "usdrt",
+    "pyrealsense2", "sharpa", "sharpa_sdk",
 }
-
-# import name -> what to install, when the two differ
+SIM_RUNTIME = {"omni", "pxr", "isaacsim", "carb", "usdrt"}
+LAB_PACKAGES = {"isaaclab", "isaaclab_tasks", "isaaclab_rl"}
+LAB_RUNTIME = {"isaaclab.app", "isaaclab.assets", "isaaclab.actuators", "isaaclab.controllers",
+               "isaaclab.envs", "isaaclab.managers", "isaaclab.scene", "isaaclab.sensors",
+               "isaaclab.sim", "isaaclab_tasks"}
+OPTIONAL_RSL_CONFIGS = {
+    "src/dexx/tasks/franka_sharpa/agents/rsl_rl_ppo_cfg.py",
+    "src/dexx/tasks/hand_imitation/agents/rsl_rl_ppo_cfg.py",
+}
 PIP_NAME = {
     "warp": "warp-lang",
-    "simple_raycaster": "git+https://github.com/Agent-3154/simple-raycaster.git (--no-deps)",
-    "bps_torch": "git+https://github.com/KailinLi/bps_torch.git (--no-deps)",
-    "chamfer_distance": "git+https://github.com/otaheri/chamfer_distance (--no-deps)",
-    "pytorch3d": "see MANUAL_SETUP.md step 3 — must match your torch",
-    "cv2": "opencv-python",
-    "yaml": "pyyaml",
-    "PIL": "pillow",
-    "sklearn": "scikit-learn",
+    "simple_raycaster": "the pinned simple-raycaster in requirements.txt",
+    "bps_torch": "the pinned bps_torch in requirements.txt",
+    "chamfer_distance": "the pinned chamfer_distance in requirements.txt",
+    "pytorch3d": "see MANUAL_SETUP.md (must match Torch and CUDA)",
+    "cv2": "opencv-python", "yaml": "pyyaml", "PIL": "pillow",
+    "sklearn": "scikit-learn", "zmq": "pyzmq", "msgpack_numpy": "msgpack-numpy",
 }
 
 
-def top_level_imports() -> dict[str, set[str]]:
-    """module name -> set of files that import it."""
+def source_imports(include_deploy: bool = False, include_rsl_rl: bool = False) -> dict[str, set[str]]:
+    """Actual module names, including submodules, mapped to their callers."""
     found: dict[str, set[str]] = {}
     for rel in SCAN:
-        base = os.path.join(ROOT, rel)
-        if not os.path.isdir(base):
+        if rel == "deploy" and not include_deploy:
             continue
+        base = os.path.join(ROOT, rel)
         for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-            for f in filenames:
-                if not f.endswith(".py"):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS
+                           and (include_deploy or d != "deploy")]
+            for filename in filenames:
+                if not filename.endswith(".py"):
                     continue
-                p = os.path.join(dirpath, f)
-                try:
-                    tree = ast.parse(open(p, encoding="utf-8", errors="ignore").read())
-                except SyntaxError:
+                path = os.path.join(dirpath, filename)
+                caller = os.path.relpath(path, ROOT)
+                if not include_rsl_rl and caller in OPTIONAL_RSL_CONFIGS:
                     continue
+                if not include_deploy and ("deploy" in filename or caller in DEPLOY_TOOLS):
+                    continue
+                with open(path, encoding="utf-8") as source:
+                    tree = ast.parse(source.read(), filename=caller)
                 for node in ast.walk(tree):
+                    names = []
                     if isinstance(node, ast.Import):
-                        for a in node.names:
-                            found.setdefault(a.name.split(".")[0], set()).add(
-                                os.path.relpath(p, ROOT))
-                    elif isinstance(node, ast.ImportFrom):
-                        if node.level:            # relative import, first-party
-                            continue
-                        if node.module:
-                            found.setdefault(node.module.split(".")[0], set()).add(
-                                os.path.relpath(p, ROOT))
+                        names = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                        names = [node.module]
+                    for name in names:
+                        found.setdefault(name, set()).add(caller)
     return found
 
 
-def main() -> int:
+def module_spec_without_import(name: str):
+    """Resolve package files without executing parent package initializers."""
+    parts = name.split(".")
+    spec = importlib.util.find_spec(parts[0])
+    for index in range(1, len(parts)):
+        if spec is None or spec.submodule_search_locations is None:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(
+            ".".join(parts[:index + 1]), spec.submodule_search_locations)
+    return spec
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--include-deploy", action="store_true",
+                        help="also check deployment and live-camera Python dependencies")
+    parser.add_argument("--include-rsl-rl", action="store_true",
+                        help="also check optional RSL-RL example configurations")
+    args = parser.parse_args(argv)
     stdlib = getattr(sys, "stdlib_module_names", set())
-    found = top_level_imports()
-
     third_party = {
-        m: files for m, files in found.items()
-        if m not in stdlib and m not in FIRST_PARTY and not m.startswith("_")
+        name: files for name, files in source_imports(args.include_deploy, args.include_rsl_rl).items()
+        if name.split(".")[0] not in stdlib | FIRST_PARTY and not name.startswith("_")
     }
+    if any(name.split(".")[0] == "pytorch3d" for name in third_party):
+        third_party["pytorch3d._C"] = {"PyTorch3D compiled extension"}
 
-    missing, hardware, isaac_runtime, ok = [], [], [], []
-    for m in sorted(third_party):
-        if m in HARDWARE_ONLY:
-            hardware.append(m)
+    failed, hardware, runtime, ok = [], [], [], []
+    for name in sorted(third_party):
+        root = name.split(".")[0]
+        if root in HARDWARE_ONLY:
+            hardware.append(name)
+            continue
+        if root in SIM_RUNTIME:
+            runtime.append(name)
             continue
         try:
-            importlib.import_module(m)
-            ok.append(m)
-            continue
-        except Exception as e:  # noqa: BLE001
-            err = type(e).__name__
-        # An import can fail because the package is absent, or because it is
-        # present but only usable once Isaac Sim's app is running (the `omni.*`
-        # modules appear then). Those are different problems and only the first
-        # is an installation error: `isaaclab_tasks` is pip-installed and still
-        # raises ModuleNotFoundError('omni.physics') until AppLauncher has run.
-        installed = False
-        try:
-            installed = importlib.util.find_spec(m) is not None
-        except Exception:  # noqa: BLE001
-            installed = False
-        if not installed:
-            for dist in md.distributions():
-                names = (dist.read_text("top_level.txt") or "").split()
-                if m in names:
-                    installed = True
-                    break
-        if installed:
-            isaac_runtime.append((m, err))
-        else:
-            missing.append((m, err, sorted(third_party[m])[:2]))
+            if any(name == prefix or name.startswith(prefix + ".") for prefix in LAB_RUNTIME):
+                # These packages can load Isaac Sim and prompt for its EULA.
+                # Check files without executing them; check_runtime tests the API.
+                if module_spec_without_import(name) is None:
+                    raise ModuleNotFoundError(f"{name} is not installed", name=name)
+                runtime.append(name)
+                continue
+            module = importlib.import_module(name)
+            if name == "simple_raycaster.raycaster":
+                cls = getattr(module, "MultiMeshRaycaster")
+                for method in ("raycast", "raycast_fused"):
+                    if not callable(getattr(cls, method, None)):
+                        raise ImportError(f"MultiMeshRaycaster.{method} is unavailable")
+            ok.append(name)
+        except Exception as error:  # noqa: BLE001
+            # Only known simulator bootstrap dependencies can be deferred.
+            # Missing gym/numpy, ABI errors, and missing Lab submodules must fail.
+            deferred = (root in LAB_PACKAGES and isinstance(error, ModuleNotFoundError)
+                        and (error.name or "").split(".")[0] in SIM_RUNTIME
+                        and importlib.util.find_spec(root) is not None)
+            if deferred:
+                runtime.append(name)
+            else:
+                failed.append((name, f"{type(error).__name__}: {error}", sorted(third_party[name])[:2]))
 
-    print(f"=== {len(third_party)} third-party modules imported by the code")
-    print(f"  {len(ok)} importable, {len(hardware)} hardware-only, "
-          f"{len(isaac_runtime)} need the Isaac app, {len(missing)} missing")
-
+    print(f"=== {len(third_party)} third-party module imports")
+    print(f"  {len(ok)} importable, {len(hardware)} hardware SDK imports skipped, "
+          f"{len(runtime)} require runtime verification, {len(failed)} failed")
+    if not args.include_rsl_rl:
+        print("  Optional RSL-RL example configurations excluded (use --include-rsl-rl).")
     if hardware:
-        print("\n  hardware-only, not expected on a workstation:")
-        print("    " + ", ".join(hardware))
-
-    if isaac_runtime:
-        print("\n  installed, but only importable once Isaac Sim's app is running")
-        print("  (the scripts import these after AppLauncher, so this is fine):")
-        for m, err in isaac_runtime:
-            print(f"    {m}  ({err})")
-
-    if missing:
-        print("\n=== MISSING")
-        for m, err, files in missing:
-            how = PIP_NAME.get(m, f"pip install {m}")
-            print(f"  {m}  ({err})")
-            print(f"     install: {how}")
+        print("\nHardware SDK imports not checked: " + ", ".join(hardware))
+    if runtime:
+        print("\nIsaac App imports NOT VERIFIED: " + ", ".join(runtime))
+    if failed:
+        print("\n=== FAILED IMPORTS")
+        for name, error, files in failed:
+            print(f"  {name}: {error}")
+            print(f"     dependency: {PIP_NAME.get(name.split('.')[0], name.split('.')[0])}")
             print(f"     used by: {', '.join(files)}")
-        print("\nNOT READY — the code imports packages this environment does not have.")
         return 1
-
-    print("\nALL IMPORTS RESOLVE")
+    print("\nSTATIC IMPORT CHECK PASSED — runtime and hardware checks remain separate.")
     return 0
 
 

@@ -309,9 +309,8 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         # near-zero number that is NOT the episode success rate. Consumers select
         # the envs that just terminated — see algo/ppo/ppo.py.
         self.extras['succeeded_per_env'] = self.success_buf.float()
-        # Strict success (docs/EVAL.md strict3): survived AND landed the object
-        # near its demo endpoint AND no object drift AND not a bad init. Same
-        # quantity the evaluation reports, so the training curve is comparable.
+        # Conservative training proxy: also requires survival, and PPO counts
+        # bad inits as zero. This is not eval.py's strict3; see docs/TRAINING.md.
         if 'succ/strict' in reward_dict:
             self.extras['succeeded_strict_per_env'] = reward_dict['succ/strict']
         self.extras['failed_per_env'] = self.failure_buf.float()

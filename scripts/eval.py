@@ -31,7 +31,7 @@ parser.add_argument("--max_episodes", type=int, default=5000)
 parser.add_argument("--max_steps", type=int, default=12000)
 parser.add_argument("--out_dir", type=str, required=True)
 parser.add_argument("--success_dist", type=float, default=0.05,
-                    help="Env-internal success threshold (min_final_dist<this). "
+                    help="Closest-approach success threshold (min_final_dist<this). "
                          "Post-hoc strict thresholds use end_final_dist, not this.")
 parser.add_argument("--label", type=str, default=None)
 parser.add_argument("--save_traj", action="store_true", default=False,
@@ -625,8 +625,6 @@ def main():
     per_env_fail_causes = [set() for _ in range(args_cli.num_envs)]
     per_env_obj_start = _obj_pos_now()
     per_env_last_final_dist = torch.full((args_cli.num_envs,), -1.0, device=device)
-    prev_final_dist = torch.full((args_cli.num_envs,), -1.0, device=device)
-    prev_final_rot = torch.full((args_cli.num_envs,), -1.0, device=device)
     per_env_last_final_rot = torch.full((args_cli.num_envs,), -1.0, device=device)
     per_env_traj_pos = [[] for _ in range(args_cli.num_envs)]
     per_env_traj_rot = [[] for _ in range(args_cli.num_envs)]
@@ -717,10 +715,12 @@ def main():
                 min_dist = float(per_env_min_final[env_id].item())
                 success = (min_dist < args_cli.success_dist) and \
                           (not torch.isinf(per_env_min_final[env_id]).item())
-                end_dist = float(prev_final_dist[env_id].item())
+                # Reward diagnostics retain this terminal step's pre-reset
+                # measurements; the previous loop's values are one step old.
+                end_dist = float(per_env_last_final_dist[env_id].item())
                 import math
                 min_rot = float(per_env_min_final_rot[env_id].item())
-                end_rot = float(prev_final_rot[env_id].item())
+                end_rot = float(per_env_last_final_rot[env_id].item())
                 _tp = per_env_traj_pos[env_id]
                 _tr = per_env_traj_rot[env_id]
                 _max_p = max(_tp) if _tp else -1.0
@@ -777,12 +777,10 @@ def main():
                 _lag = (f" slowest={_d.split('/')[-1]}"
                         f" {_per_demo_counts[_d]}/{_demo_quota}")
             print(f"  step={step_counter:5d} eps={len(records):5d} "
-                  f"env_succ(5cm)={ok}/{len(records)} ({pct:.1f}%){_lag} "
+                  f"closest_succ({100 * args_cli.success_dist:g}cm)={ok}/{len(records)} ({pct:.1f}%){_lag} "
                   f"elapsed={time.time()-t_start:.0f}s", flush=True)
 
         prev_obj_pos = cur_obj_pos
-        prev_final_dist = per_env_last_final_dist.clone()
-        prev_final_rot = per_env_last_final_rot.clone()
 
     elapsed = time.time() - t_start
 
@@ -805,7 +803,7 @@ def main():
             return 0.0, 0, 0
         ok = sum(1 for r in kept
                  if 0.0 <= r.end_final_dist < cm / 100.0
-                 and "fail/obj_pos_drift" not in r.fail_causes)
+                 and "obj_pos_drift" not in r.fail_causes)
         return ok / len(kept), ok, len(kept)
 
     _strict_rates = {}
@@ -832,7 +830,7 @@ def main():
     _rates = [v["success_rate"] for v in _by_demo.values()]
     _macro = sum(_rates) / len(_rates) if _rates else 0.0
     _micro = sum(1 for r in records if r.succeeded) / max(1, len(records))
-    print("[EvalPC] per-demo (env-internal | strict3):", flush=True)
+    print("[EvalPC] per-demo (closest-approach | strict3):", flush=True)
     for d, v in _by_demo.items():
         print(f"    {d.split('/')[-1]:24s} "
               f"{v['succeeded']:4d}/{v['episodes']:<4d} ({100*v['success_rate']:5.1f}%)  |  "
@@ -845,7 +843,7 @@ def main():
         "ckpt": args_cli.load_path, "label": args_cli.label,
         "per_demo_quota": _demo_quota,
         # The headline number. docs/EVAL.md says to report strict3, not the
-        # env-internal reach-end rate below.
+        # closest-approach rate below.
         "strict": _strict_rates,
         "bad_init_excluded": _n_bad_init,
         "success_rate_per_demo": _by_demo,

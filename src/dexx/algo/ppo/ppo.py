@@ -193,7 +193,8 @@ class PPO(object):
         # task success rate does not move.
         self.episode_successes = AverageScalarMeter(100)
         self.episode_failures = AverageScalarMeter(100)
-        # Strict success — the same quantity eval.py reports as strict3.
+        # Conservative training proxy; unlike eval strict3, bad inits remain
+        # in the denominator and success requires trajectory completion.
         self.episode_successes_strict = AverageScalarMeter(100)
         self.obs = None
         self.epoch_num = 0

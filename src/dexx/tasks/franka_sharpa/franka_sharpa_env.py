@@ -1580,9 +1580,8 @@ class FrankaSharpaEnv(DirectRLEnv):
         # select the envs that just terminated — see `AverageScalarMeter` usage
         # in algo/ppo/ppo.py and the caveat in docs/EVAL.md.
         self.extras['succeeded_per_env'] = self.success_buf.float()
-        # Strict success (docs/EVAL.md strict3): survived AND landed the object
-        # near its demo endpoint AND no object drift AND not a bad init. Same
-        # quantity the evaluation reports, so the training curve is comparable.
+        # Conservative training proxy: also requires survival, and PPO counts
+        # bad inits as zero. This is not eval.py's strict3; see docs/TRAINING.md.
         if 'succ/strict' in reward_dict:
             self.extras['succeeded_strict_per_env'] = reward_dict['succ/strict']
         self.extras['failed_per_env'] = self.failure_buf.float()
@@ -3551,11 +3550,11 @@ def quat_to_angle_axis(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     min_theta = 1e-5
     qx, qy, qz, qw = 1, 2, 3, 0  # IsaacLab uses (w, x, y, z)
     
-    sin_theta = torch.sqrt(1 - q[..., qw] * q[..., qw] + 1e-8)
+    sin_theta = torch.sqrt(torch.clamp(1 - q[..., qw] * q[..., qw], min=0.0))
     angle = 2 * torch.acos(torch.clamp(q[..., qw], -1.0, 1.0))
     angle = wrap_to_pi(angle)  # Normalize angle to [-pi, pi]
-    sin_theta_expand = sin_theta.unsqueeze(-1)
-    axis = q[..., qx:qw+1] / sin_theta_expand
+    sin_theta_expand = sin_theta.clamp(min=min_theta).unsqueeze(-1)
+    axis = q[..., qx:qz+1] / sin_theta_expand
     
     mask = torch.abs(sin_theta) > min_theta
     default_axis = torch.zeros_like(axis)
@@ -3566,9 +3565,9 @@ def quat_to_angle_axis(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     axis = torch.where(mask_expand, axis, default_axis)
     return angle, axis
 
-# Strict-success threshold, in metres. Mirrors `eval.py --success_dist` used for
-# strict3, so the number you watch while training means the same thing as the one
-# you report. Changing it here without changing there makes the two incomparable.
+# Training strict-proxy threshold, in metres. The 3 cm distance matches eval
+# strict3, but episode filtering differs (see docs/TRAINING.md). The eval CLI's
+# --success_dist controls closest-approach success, not post-hoc strict3.
 # Baked into the TorchScript function below at script time.
 STRICT_SUCCESS_DIST: float = 0.03
 
@@ -4103,13 +4102,13 @@ def compute_imitation_reward(
         torch.ones_like(reset_buf),
         reset_buf,
     )
-    # ---- Strict success: the metric the evaluation protocol reports ---------
+    # ---- Conservative training strict proxy --------------------------------
     # `succeeded` above only means "reached the end of the trajectory without a
     # failure termination" — survival, not task success. strict additionally
     # requires the object to finish near its demo endpoint, with no object-
-    # position drift, and excludes bad inits. Same three conditions as
-    # docs/EVAL.md strict3, so the training curve and the reported number are
-    # the same quantity.
+    # position drift. Bad inits score zero and remain in PPO's denominator.
+    # Eval strict3 excludes bad inits and does not require `succeeded`, so this
+    # training diagnostic must not be reported as the evaluation protocol.
     if has_final:
         succeeded_strict = (
             succeeded

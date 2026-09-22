@@ -25,7 +25,7 @@ python scripts/eval.py --task franka-sharpa-pointcloud \
 | `--num_envs` | `128` | Parallel envs. |
 | `--max_episodes` | `5000` | Stop after this many episode terminations. |
 | `--max_steps` | `12000` | Hard step ceiling (safety). |
-| `--success_dist` | `0.05` | Env-internal success threshold (`min_final_dist < this`). Post-hoc strict thresholds use `end_final_dist`, not this. |
+| `--success_dist` | `0.05` | Closest-approach success threshold (`min_final_dist < this`). Post-hoc strict thresholds use `end_final_dist`, not this. |
 | `--save_traj` | off | Save per-frame tracking arrays in `records.json`. |
 | `--perturb_obj_xy` | `0.0` | Eval-time random XY perturbation of object init pos (m). |
 | `--inject_jitter` / `--inject_dropout` / `--inject_hand_noise` | `None` | Override PC noise at eval time (sim2real preview); by default eval zeros all PC noise for a clean run. |
@@ -33,30 +33,39 @@ python scripts/eval.py --task franka-sharpa-pointcloud \
 ### strict3 protocol
 
 `eval.py` computes strict2 / strict3 / strict5 itself and writes them to
-`summary.json` under `strict`, plus a per-demo `strict3`. It used to only record
-the raw fields and leave the filtering to you — which meant the script printed
-the env-internal rate this section tells you not to report, and never printed the
-one it does.
+`summary.json` under `strict`, plus a per-demo `strict3`. The separate
+`success_rate_*` fields and `EpisodeRecord.succeeded` measure closest approach:
+the object came within `--success_dist` of its target at some point during the
+episode. They do not use the env's trajectory-completion success flag.
+Endpoint distance and rotation come from the terminal step's reward diagnostics,
+captured before the environment resets.
 
 The headline metric, **strict3**, counts an episode as a success only if:
 
 - `end_final_dist < 3 cm` at episode end (object reached the demo's final pose),
   **and**
-- no object-position drift (a `fail/obj_pos_drift` cause did not fire), and
+- no object-position drift (stored as `obj_pos_drift` in `fail_causes`), and
 - the episode was not a bad-init (`survival_len ≤ 5` are excluded).
 
-This is stricter than the env-internal reach-end success, and the gap is not a
-constant. On one checkpoint the two read 93.0% and 80.4% overall — but per demo:
+This protocol does not require the env's success flag and deliberately does not
+reject other failure causes. It is therefore not a subset of env-internal
+reach-end success. Training's `Strict` is a separate conservative proxy: it
+requires trajectory completion without failures and keeps bad inits in its
+denominator as zeros (see [TRAINING.md](TRAINING.md)).
+
+The gap between endpoint accuracy and closest-approach success is not constant.
+For example, the previous evaluation breakdown was:
 
 ```
-cube_small_1   env 96.0%  |  strict3 86.0%
-cube_small_2   env 92.0%  |  strict3 89.8%
-squeegee_1     env 86.0%  |  strict3 84.0%
-squeegee_2     env 98.0%  |  strict3 62.0%     <-- 36 points
+cube_small_1   closest 96.0%  |  strict3 86.0%
+cube_small_2   closest 92.0%  |  strict3 89.8%
+squeegee_1     closest 86.0%  |  strict3 84.0%
+squeegee_2     closest 98.0%  |  strict3 62.0%     <-- 36 points
 ```
 
-`squeegee_2` survives its trajectory almost every time and still fails to put the
-object down within 3 cm. Report strict3, and report it per demo.
+Reaching within 5 cm at some point does not guarantee finishing within 3 cm
+without drift. Report strict3, and report it per demo. These historical numbers
+illustrate the distinction; rerun evaluation after metric fixes for release results.
 
 ### Recommended eval settings (reproducibility)
 
@@ -71,11 +80,11 @@ half of the demo, inflating success — see the gotcha in
 Do not read a per-step success rate as the episode success rate. `env.success_buf`
 is **cleared in `_reset_idx`** (which runs inside `step()`), so reading it right
 after `step()` returns 0 for envs that just terminated — the per-step
-`success_rate` looks tiny. The correct **episode** success rate is
-`succeeded / terminated`, accumulated per episode termination (using the
-`extras["succeeded"]` value captured in `_get_rewards` before reset). `eval.py`
-does this accounting for you; the caveat matters if you post-process the raw
-step-level stats yourself.
+`success_rate` looks tiny. To measure env trajectory completion, select terminated
+environments from `extras["succeeded_per_env"]`, captured before reset, and average
+those episode flags (as PPO does). `eval.py` instead computes the closest-approach
+and strict endpoint metrics from episode records; its `succeeded` field is not
+the env flag.
 
 ## play.py
 

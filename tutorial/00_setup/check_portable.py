@@ -39,6 +39,7 @@ def walk() -> list[str]:
 
 
 def main() -> int:
+    problems.clear()
     files = walk()
 
     print("=== symlinks")
@@ -69,7 +70,8 @@ def main() -> int:
         if rel.startswith("tutorial/") and rel.endswith(".py"):
             continue  # this file documents the pattern it searches for
         try:
-            text = open(p, encoding="utf-8", errors="ignore").read()
+            with open(p, encoding="utf-8", errors="ignore") as source:
+                text = source.read()
         except OSError:
             continue
         for m in ABS_RE.finditer(text):
@@ -91,32 +93,43 @@ def main() -> int:
     print("\n=== demonstrations resolve to real data")
     rt_dir = os.path.join(ROOT, "data", "retargeting", "robotool_batch", "mano2sharpa_rh")
     src_dir = os.path.join(ROOT, "data", "robotool_batch")
+    demo_count = 0
     if os.path.isdir(rt_dir):
         for task in sorted(os.listdir(rt_dir)):
+            if not os.path.isdir(os.path.join(rt_dir, task)):
+                continue
             for pkl in sorted(x for x in os.listdir(os.path.join(rt_dir, task))
                               if x.endswith("@0.pkl")):
+                demo_count += 1
                 seq = pkl[:-len("@0.pkl")]
                 need = os.path.join(src_dir, task, seq)
                 ok = os.path.isdir(need) and not os.path.islink(need)
                 meta = os.path.join(need, "meta.json")
                 mesh_ok = True
-                if os.path.exists(meta):
-                    try:
-                        d = json.load(open(meta))
-                        for obj, rel_mesh in (d.get("obj_mesh_paths") or {}).items():
-                            cand = os.path.join(src_dir, rel_mesh)
-                            if not os.path.exists(cand):
-                                mesh_ok = False
-                                problems.append(f"{task}/{seq}: mesh missing ({rel_mesh})")
-                    except Exception:  # noqa: BLE001
-                        mesh_ok = False
+                try:
+                    with open(meta, encoding="utf-8") as source:
+                        metadata = json.load(source)
+                    meshes = metadata.get("obj_mesh_paths")
+                    if not isinstance(meshes, dict) or not meshes:
+                        raise ValueError("obj_mesh_paths must be a nonempty object")
+                    for rel_mesh in meshes.values():
+                        if not isinstance(rel_mesh, str) or not rel_mesh or os.path.isabs(rel_mesh):
+                            raise ValueError("mesh paths must be nonempty relative paths")
+                        candidate = os.path.realpath(os.path.join(src_dir, rel_mesh))
+                        if (os.path.commonpath((os.path.realpath(src_dir), candidate)) != os.path.realpath(src_dir)
+                                or not os.path.isfile(candidate)):
+                            raise ValueError(f"mesh missing or outside the data directory: {rel_mesh}")
+                except (OSError, ValueError, TypeError, AttributeError) as error:
+                    mesh_ok = False
+                    problems.append(f"{task}/{seq}: invalid metadata or mesh ({error})")
                 good = ok and mesh_ok
-                if not good and ok:
-                    pass
-                elif not ok:
+                if not ok:
                     problems.append(f"{task}/{seq}: source directory missing or a symlink")
                 print(f"  [{'ok' if good else 'FAIL'}] {task}/{seq}"
                       + ("" if good else "   source dir or mesh unavailable"))
+
+    if not demo_count:
+        problems.append("no retargeted demonstrations found")
 
     print("\n=== assets referenced by the robot config exist")
     for rel in ("assets/robot", "assets/generated", "checkpoints/teacher_poseobs.pth",

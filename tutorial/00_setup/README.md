@@ -11,51 +11,22 @@ bash tutorial/00_setup/setup_env.sh \
     --isaaclab /path/to/IsaacLab
 ```
 
-It checks your GPU, creates a conda environment, links Isaac Sim into Isaac Lab,
-installs Isaac Lab **without** the extra RL libraries, then matches pytorch3d to
-whatever torch that produced, installs the two `--no-deps` packages and this
-repository — and finally **runs the verification checks**.
-
-Variants:
+The installer targets **Isaac Sim 4.5 + Isaac Lab v2.2.1 + Python 3.10**.
+First prepare the pinned Lab checkout and system prerequisites in
+**[MANUAL_SETUP.md](MANUAL_SETUP.md)**. Lab installs Torch 2.7/cu128, and the
+script matches PyTorch3D to its exact build. Project dependencies are pinned
+where API compatibility requires it and installed under shared constraints.
 
 ```bash
---name myenv                    # a different environment name
---verify-only                   # check an existing env, install nothing
-PYTORCH3D_BASE=0.7.8+5043d15    # override the pytorch3d base version
+--name myenv                  # another dedicated conda environment name
+--verify-only                 # check an existing env; install nothing
+PYTORCH3D_BASE=0.7.8+5043d15   # override the PyTorch3D source/build prefix
 ```
 
-**[MANUAL_SETUP.md](MANUAL_SETUP.md)** is the same procedure done by hand. Read
-it when the script fails, or before trusting it.
-
-### Isaac Sim is the one part you install yourself
-
-It ships through NVIDIA's own installer and the build has to match your driver.
-Download [Isaac Sim 4.5.0](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html),
-unzip it, and pass the path as `--isaacsim`.
-
-### The version rule
-
-> **torch, Isaac Lab and pytorch3d must agree.** Nothing else about the torch
-> version matters.
-
-Do not pin torch to a number from any document — Isaac Lab installs it, and
-pytorch3d then has to be the build compiled against *that* torch. The coupling is
-visible in the package name:
-
-```
-torch      2.5.1+cu118
-pytorch3d  0.7.8+5043d15pt2.5.1cu118
-                      ^^^^^^^^^^^^^
-```
-
-The script derives the right string automatically; MANUAL_SETUP.md step 3 shows
-how to do it by hand.
-
-### Known-good combination
-
-A reference point, not a target: python 3.10, Isaac Sim 4.5.0, isaaclab 0.46.3,
-torch 2.5.1+cu118, pytorch3d 0.7.8+5043d15pt2.5.1cu118, numpy 1.26.4, gymnasium
-0.29.1, on an RTX 4090. `requirements-full.txt` is the frozen snapshot.
+The reference combination is constrained, not a guarantee of runtime success
+on every GPU/driver. `requirements-full.txt` is a compatibility alias, not a
+frozen environment. Paths are chosen by the user; no cluster-specific setup is
+required. Headless still needs the simulator's system and graphics libraries.
 
 ## Check it
 
@@ -63,9 +34,8 @@ torch 2.5.1+cu118, pytorch3d 0.7.8+5043d15pt2.5.1cu118, numpy 1.26.4, gymnasium
 python tutorial/00_setup/check_install.py
 ```
 
-This imports the package, resolves the task registry, and confirms the assets,
-demonstrations, camera calibrations and pretrained teacher are all present and
-consistent with each other. It does **not** start Isaac Sim, so it takes a second
+This checks package files, assets, demonstrations, camera calibrations and the
+pretrained teacher. It does not import the simulator task registry. It does **not** start Isaac Sim, so it takes a second
 and tells you about missing files before a twenty-minute run does.
 
 ## Check the code's dependencies
@@ -74,12 +44,21 @@ and tells you about missing files before a twenty-minute run does.
 python tutorial/00_setup/check_imports.py
 ```
 
-Walks the source, collects every third-party import, and tries each one —
-derived from the code, not from `requirements.txt`. A package can be missing
-from requirements and still imported at module load; you then find out twenty
-minutes into a run. `simple_raycaster` was exactly that: a hard requirement of
-the point-cloud env, in no requirements file, working only because it happened
-to be installed locally.
+Checks simulation imports and critical compiled modules. Real import failures
+are errors; explicit Isaac startup deferrals remain unverified until the runtime
+check. For real-robot transport tools, install `requirements-deploy.txt` and use
+`--include-deploy`. Hardware SDKs are installed on their respective hosts.
+
+```bash
+python tutorial/00_setup/check_versions.py
+python -m pip check
+bash tutorial/run_acceptance.sh
+```
+
+Acceptance starts a headless API/CUDA preflight, then training and evaluation,
+and requires all four demo IDs with ten episodes each. Static checks alone do
+not prove the environment is ready. See the manual for the isolated preflight
+command and how to verify its success marker.
 
 ## Check it can move
 
