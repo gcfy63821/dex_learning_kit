@@ -81,7 +81,7 @@ parser.add_argument("--debug_viz_stride", type=int, default=1,
                          "Useful when running many parallel envs to visually compare frames.")
 parser.add_argument("--no_real_hand_clamp", action="store_true",
                     help="Disable clamping opt_dof_pos to the real-hand reachable range (measured on the "
-                         "Sharpa HA4 hand). "
+                         "Sharpa Wave hand). "
                          "By default (sharpa dexhand only) the clamp is applied so deploy and sim "
                          "see the same target distribution.")
 # ---- Augmentation (object-pose perturbation) ----
@@ -995,7 +995,7 @@ class Mano2Dexhand:
             hand_upper_limits = self.dexhand_dof_upper_limits
 
         # Tighten hand joint limits to the real-hand reachable range (measured
-        # on the Sharpa HA4 hand) so IK
+        # on the Sharpa Wave hand) so IK
         # optimization searches inside the deployable set. Real limits are in
         # cfg order, which matches dexhand_dof_lower/upper_limits layout (built
         # from hand_joint_indices which follow _build_hand_joint_names order).
@@ -1010,7 +1010,7 @@ class Mano2Dexhand:
             hand_lower_limits = torch.maximum(hand_lower_limits, _real_lower)
             hand_upper_limits = torch.minimum(hand_upper_limits, _real_upper)
             print(f"[retarget_2stage] Tightened optimization-loop hand limits to real "
-                  f"real-hand reachable range (measured on the Sharpa HA4 hand, cfg order).")
+                  f"real-hand reachable range (measured on the Sharpa Wave hand, cfg order).")
 
         while iter < max_iter:
             iter += 1
@@ -1264,7 +1264,7 @@ class Mano2Dexhand:
         )
 
         # opt_dof_pos is in cfg (Sharpa) order. On the real hand (range measured
-        # on the Sharpa HA4 hand), the URDF clamp above is looser than what the motors can actually reach
+        # on the Sharpa Wave hand), the URDF clamp above is looser than what the motors can actually reach
         # (esp. ring/pinky MCP_AA due to inter-finger coupling). Apply a second
         # clamp based on empirically measured real-hand range so sim and deploy
         # see the same target distribution.

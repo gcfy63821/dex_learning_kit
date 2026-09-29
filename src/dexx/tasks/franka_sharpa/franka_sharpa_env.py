@@ -368,7 +368,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             self.hand_dof_upper_limits = joint_pos_limits[self.actuated_dof_indices, 1] * self.cfg.dof_limits_scale
 
         # Tighten hand joint limits to the real-hand reachable range (measured on
-        # the Sharpa HA4 hand) so sim
+        # the Sharpa Wave hand) so sim
         # action space and reset sampling match the deployable range. Real limits
         # are in cfg (Sharpa) order; reorder to sorted `actuated_dof_indices` layout.
         if getattr(self.cfg, 'use_real_hand_limits', True) and self.num_hand_dofs == 22:

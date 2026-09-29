@@ -1,8 +1,7 @@
 # Asset provenance and licensing
 
 The robot is a **Franka FR3 arm (7 DOF) + Sharpa Wave hand (22 DOF)**, 29 DOF in
-total. The previous-generation Sharpa HA4 hand's assets are **not shipped** (its
-meshes carry a confidentiality marking).
+total.
 
 This directory holds **two public upstream models**, the **merged URDF** generated
 from them, and the **robot USDs** built from that URDF. Read this before changing
@@ -28,14 +27,9 @@ python scripts/check_asset_equivalence.py --reference_usd <previous robot USD> -
 
 ## Why the hand is the Wave
 
-The HA4 meshes cannot be released; the Wave has a public Apache-2.0 repository.
-The two are nearly equivalent for this pipeline: **the 22 actuated joint names and
-the link names are identical** (the root link is `{side}_hand_C_MC` on both), so
-every name-based lookup is unaffected. Kinematic differences measure about
-**0.2 mm at the fingertips** and joint limits are identical — the differences are
-in geometry and dynamics (collision meshes, inertia, elastomer shapes). The hand
-model the shipped checkpoints were trained on is listed in
-[checkpoints/README.md](../checkpoints/README.md).
+The Sharpa Wave has a public Apache-2.0 model repository, so the release can ship
+it: 22 actuated joints, root link `{side}_hand_C_MC`, the joint and link names
+every name-based lookup in the code uses.
 
 The robot is built from a merged URDF rather than a hand-assembled USD so that
 it is reproducible from the upstream models and checked by a regression gate.
@@ -163,7 +157,7 @@ tolerance. That difference is intentional and affects no demo.
 ## Known limitations
 
 - The tactile UV map (taxel → contact position on the finger pad) is calibrated
-  per hand. Only an HA4 map exists; it is not shipped, and the Wave has none yet.
+  per hand. No calibrated map ships for the Wave yet.
   Without one the deploy env degrades gracefully: contact **position** is zeroed,
   contact **force** is unaffected (`DEXX_TACTILE_MAP_DIR` points at a
   calibration). Current policies are trained with `enable_contact_pos=False` and

@@ -24,7 +24,7 @@ poseobs → pointcloud (configs `FrankaSharpaEnvCfg` → `FrankaSharpaCriticHori
 
 `checkpoints/` holds the PPO teacher and the deployable DAgger point-cloud
 student. What each file is, the settings it expects (observation layout, crop
-box, camera extrinsic, arm mount, hand model) and the evaluation numbers an
+box, camera extrinsic, arm mount) and the evaluation numbers an
 install should reproduce are recorded once, in
 **[checkpoints/README.md](checkpoints/README.md)**.
 
@@ -104,6 +104,19 @@ Claude Code picks them up automatically when run from the repository root.
 - [checkpoints/README.md](checkpoints/README.md) — the shipped checkpoints, the settings they expect, install-check numbers
 - [tools/dataset/README.md](tools/dataset/README.md) — demonstration data format and data tools
 - [tools/sysid/motions/README.md](tools/sysid/motions/README.md) — sysid motion file format
+
+## Citation
+
+If you use this code, please cite:
+
+```bibtex
+@article{chen2026dex,
+  title={Dex-x: Learning visual-tactile dexterous manipulation from human videos with simulated interaction},
+  author={Chen, Ruoqu and Ruan, Feixiang and Cao, Liu and Wang, Zihao and Xu, Botian and Tong, Shiqin and Liu, Jiajun and Pei, Mingzhi and Zhang, Chenyu and Xing, Wanli and others},
+  journal={arXiv preprint arXiv:2609.07747},
+  year={2026}
+}
+```
 
 ## License
 

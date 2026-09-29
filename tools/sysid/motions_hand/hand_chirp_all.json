@@ -53,5 +53,5 @@
   ],
   "description": "Linear frequency chirp 0.2->1.5 Hz on all 22 joints. Single-test Bode characterization.",
   "dof": 22,
-  "hand": "sharpa_ha4"
+  "hand": "sharpa_wave"
 }

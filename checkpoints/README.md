@@ -12,11 +12,9 @@ This is the one place that describes the shipped checkpoints; other docs link he
 
 | | shipped checkpoints | release default |
 |---|---|---|
-| demos | 19 (not shipped) | 4 ship in `data/` (`0416_grasp/cube_small_{1,2}`, `0420_manip/squeegee_{1,2}`) |
 | camera extrinsic | `calib/camera_align/current.npy` | the same file (fallback when `--camera_extrinsic` is omitted) |
 | crop box z | 0.417 … 0.70, recorded in the checkpoint's `pc_env_meta` | `PC_WORKSPACE_MIN/MAX` in `src/dexx/deploy_config.py`, same values |
 | arm base z | 0.432 | `ARM_BASE_Z = 0.415` (robot mounted level with the table) |
-| hand model | Sharpa HA4 | Sharpa Wave; physics parity with the HA4 is not validated |
 
 So retraining here reproduces the recipe, not the checkpoint. On the robot, deploy
 with the crop floor raised to 0.422 (`--pc_workspace_min 0.0,-0.40,0.422`): the
@@ -60,7 +58,7 @@ Teacher, `eval_teacher.py`, random initial states, 256 episodes: **94.9%**
 (cube_small 100%, squeegee 87.4%).
 
 The release sim differs from the one the shipped checkpoints were trained in (arm
-base and hand model, table above), so these are baselines for this release, not
+base height, table above), so these are baselines for this release, not
 training-time numbers. Physics DR, arm-gain and action-delay randomisation stay
 on, so repeated runs are not bit-identical; a per-demo rate from about 100
 episodes has a 95% interval of roughly ±10 points, and a 40-episode run is a smoke

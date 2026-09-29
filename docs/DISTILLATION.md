@@ -36,7 +36,7 @@ python scripts/train_dagger_pc.py --task franka-sharpa-pointcloud \
     --seed 42 --out_dir logs/dagger_pc --headless
 ```
 
-The shipped student's training conditions (demos, arm mount, hand model) are
+The shipped student's training conditions (arm mount, extrinsic, crop box) are
 listed in [checkpoints/README.md](../checkpoints/README.md); a retrain here
 reproduces the recipe, not the checkpoint. Several
 defaults differ from this command (`--num_envs 64`, `--dagger_iters 20`,

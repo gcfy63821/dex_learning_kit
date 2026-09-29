@@ -53,5 +53,5 @@
   ],
   "description": "Thumb oscillates while index curls in counter-phase. Tests opposition \u2014 often the weakest joint in retargeting.",
   "dof": 22,
-  "hand": "sharpa_ha4"
+  "hand": "sharpa_wave"
 }

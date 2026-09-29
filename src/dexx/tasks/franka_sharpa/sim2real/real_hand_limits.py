@@ -1,7 +1,6 @@
 """Empirically measured reachable range of the real hand.
 
-Values were measured on the Sharpa HA4 hand; the release models the Sharpa
-Wave, whose 22-joint layout is the same.
+Values were measured on the Sharpa Wave hand (22 joints, cfg order).
 
 Measured by a joint-limit probe in normal mode (calibration_mode=0 — the
 same mode used at deploy time).

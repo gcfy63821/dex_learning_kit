@@ -51,8 +51,8 @@ class ArmFKTest(unittest.TestCase):
             _, q_fk, v_fk, w_fk = self.fk(torch.from_numpy(q), torch.from_numpy(dq))
             dot = float(np.dot(q_fk.numpy(), quat))
             self.assertGreater(dot, 0.0)  # same sign as PhysX, not just the same rotation
-            # a few degrees: the frames were recorded with an earlier hand model whose
-            # mount differs slightly; the sign is what this test guards
+            # a few degrees: the frames were recorded with a slightly different hand
+            # mount; the sign is what this test guards
             self.assertLess(np.degrees(2 * np.arccos(min(dot, 1.0))), 5.0)
             np.testing.assert_allclose(v_fk.numpy(), v, atol=5e-3)
             np.testing.assert_allclose(w_fk.numpy(), w, atol=5e-3)

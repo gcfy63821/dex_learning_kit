@@ -298,9 +298,8 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         # Tactile UV mapping: taxel (u, v) -> 3D contact position on the pad.
         #
-        # These maps are a per-hand CALIBRATION and are not shipped: the only
-        # existing set is for the Sharpa HA4 hand, whose meshes carry
-        # confidential markings. There is no Sharpa Wave equivalent yet. Rather
+        # These maps are a per-hand CALIBRATION and none ships for the Sharpa
+        # Wave yet. Rather
         # than fail at construction (which would make the whole deploy path
         # unimportable), degrade: contact POSITION is disabled and contact FORCE
         # still works. Point DEXX_TACTILE_MAP_DIR at a directory holding
@@ -1140,7 +1139,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         hand_targets_sharpa = all_joint_targets[0, self.hand_joint_indices].cpu().numpy()
         # Clamp to real-hand reachable range (physical limits measured on the
-        # Sharpa HA4 hand). Avoids commanding motors to targets they cannot reach —
+        # Sharpa Wave hand). Avoids commanding motors to targets they cannot reach —
         # which otherwise triggers limit_protection / overheat, and diverges sim vs real.
         hand_targets_sharpa = clamp_to_real_limits_np(hand_targets_sharpa)
         self._latest_hand_targets_sharpa = hand_targets_sharpa.copy()

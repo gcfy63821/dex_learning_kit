@@ -573,7 +573,7 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # align real
     dof_limits_scale = 0.9
     # Tighten hand joint limits to the real-hand reachable range (measured on
-    # the Sharpa HA4 hand; cfg/Sharpa order). Needed for sim-real alignment of ring/pinky
+    # the Sharpa Wave hand; cfg/Sharpa order). Needed for sim-real alignment of ring/pinky
     # MCP_AA etc. that have inter-finger mechanical coupling.
     use_real_hand_limits: bool = True
     # randomize

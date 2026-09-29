@@ -44,7 +44,7 @@ loop.
 
 ## First-run checklist
 
-The shipped student was trained for the arm mount and hand model stated in
+The shipped student was trained for the arm mount stated in
 `checkpoints/README.md`; check that against your robot before deploying it.
 
 Before trusting any rollout, confirm in this order:

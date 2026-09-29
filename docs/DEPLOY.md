@@ -36,7 +36,7 @@ Sharpa SDK F6 sensors, arm joint/EE state from the Polymetis bridge.
   so the numbers are not meant to be equal
   ([tutorial/07](../tutorial/07_dynamics_alignment/)).
 
-The arm mount and hand model the student expects are listed in
+The arm mount the student expects is listed in
 [checkpoints/README.md](../checkpoints/README.md). On a mount other than the
 one it was trained on, set `ARM_BASE_Z` to match or retrain
 ([tutorial/01](../tutorial/01_frames_and_constants/)).

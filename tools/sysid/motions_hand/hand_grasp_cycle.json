@@ -53,5 +53,5 @@
   ],
   "description": "4x full grasp/release cycles @ 0.5 Hz. Tests coordinated closing.",
   "dof": 22,
-  "hand": "sharpa_ha4"
+  "hand": "sharpa_wave"
 }
