@@ -1,16 +1,15 @@
 # Hand joint ordering (critical for sim2real)
 
-There are **three different joint orderings** in the codebase. Mixing them up maps
+There are **two joint orderings** in the codebase. Mixing them up maps
 joints to the wrong motor — on the real hand this is a safety hazard. Read this
 before any deploy or retarget work.
 
-## The three orderings
+## The two orderings
 
 | Name | How it's built | Where it's used |
 |------|---------------|-----------------|
 | **cfg order** (= Sharpa order = real hand order) | `cfg.actuated_joint_names` list in `franka_sharpa_env_cfg.py` | retarget `opt_dof_pos`, `hand_joint_indices`, real Sharpa `set_joint_position()` |
 | **USD order** (= sorted order) | `actuated_dof_indices` after `.sort()` | `cur_targets`, `hand_dof_pos`, policy action space |
-| **Legacy "isaaclab" order** | `dof_isaaclab2sharpa()` in `deploy/utils.py` | **DEPRECATED — do not use** |
 
 ## cfg order (= Sharpa order)
 
@@ -58,8 +57,8 @@ hand_sharpa = all_joint_targets[0, hand_joint_indices]      # full array → cfg
 real_hand.set_joint_position(hand_sharpa)                   # cfg order = Sharpa order
 ```
 
-**Do NOT use `dof_isaaclab2sharpa()`** — its mapping assumes a legacy ordering that
-doesn't match any current variable. Always route through the `all_joint_targets`
+There is no third ordering: the old `dof_isaaclab2sharpa()` helper assumed a legacy
+order that matches no current variable and has been removed. Always route through the `all_joint_targets`
 intermediate array to convert between sorted (policy) order and cfg (Sharpa) order:
 scatter the policy's sorted-order targets into a full joint array via
 `actuated_dof_indices`, then gather back out in cfg order via `hand_joint_indices`.

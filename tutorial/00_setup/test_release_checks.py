@@ -103,11 +103,6 @@ class ImportChecks(unittest.TestCase):
                 self.assertIsNotNone(checker.module_spec_without_import("release_runtime_pkg.sub"))
                 self.assertIsNone(checker.module_spec_without_import("release_runtime_pkg.missing"))
 
-    def test_rsl_rl_config_is_opt_in(self):
-        files = {"src/dexx/tasks/franka_sharpa/agents/rsl_rl_ppo_cfg.py": "import release_missing_rsl"}
-        self.assertEqual(self.run_check(files), 0)
-        self.assertEqual(self.run_check(files, ["--include-rsl-rl"]), 1)
-
     def test_deploy_dependencies_are_opt_in(self):
         files = {"scripts/use.py": "import json", "src/dexx/scripts/deploy/use.py": "import release_missing_deploy",
                  "tools/calib/capture_multiframe_zmq.py": "import release_missing_deploy"}

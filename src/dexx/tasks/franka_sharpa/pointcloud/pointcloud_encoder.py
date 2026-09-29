@@ -54,7 +54,7 @@ class PointNetBackbone(nn.Module):
 class PointCloudEncoder(nn.Module):
     """Encode (scene, hand, tactile) point clouds → single feature vector.
 
-    Three strategies (plan):
+    Three strategies:
         "early_concat"     : single PointNet over concatenated [xyz,type,force]
         "separate_encode"  : per-source PointNets, concat + linear projection
         "scene_only"       : scene PointNet only (ablation baseline)
@@ -128,7 +128,7 @@ class PointCloudEncoder(nn.Module):
             tactile_pc:    (B, n_tactile, 3)
             tactile_force: (B, n_tactile, tactile_feat_dim)
             tactile_mask:  (B, n_tactile) bool — optional. True = real point,
-                           False = gated/masked. Defaults to all True (legacy).
+                           False = gated/masked. Defaults to all True.
         Returns:
             (B, output_dim)
         """
@@ -204,10 +204,9 @@ class PointCloudEncoder(nn.Module):
             return self.backbone(all_pts, full_mask)
 
         # Tactile: type=tactile, force=value. Force shape (B, n_tactile, fdim)
-        # is passed through as-is (no longer collapsing multi-dim to magnitude,
-        # since the backbone input_dim now accounts for fdim explicitly).
+        # is passed through as-is; the backbone input_dim accounts for fdim.
         if tactile_force.shape[-1] != fdim:
-            # Backward compat: if cfg fdim mismatches actual env output, fall back to
+            # Fallback: if cfg fdim mismatches actual env output, fall back to
             # magnitude when actual > fdim, or pad with zeros otherwise. Should not
             # happen in practice — cfg + env should agree.
             if tactile_force.shape[-1] > fdim:

@@ -1,7 +1,10 @@
-"""Empirically measured reachable range of the Sharpa HA4 real hand.
+"""Empirically measured reachable range of the real hand.
 
-Measured on 2026-04-19 with `probe_hand_limits.py` (normal mode, i.e.
-calibration_mode=0 — the same mode used at deploy time).
+Values were measured on the Sharpa HA4 hand; the release models the Sharpa
+Wave, whose 22-joint layout is the same.
+
+Measured by a joint-limit probe in normal mode (calibration_mode=0 — the
+same mode used at deploy time).
 
 Source of each entry:
   - FE / PIP / DIP / IP / pinky_CMC (non-coupled joints):
@@ -67,43 +70,3 @@ def clamp_to_real_limits_np(hand_pos_sharpa, margin: float = 0.0):
     lo = SHARPA_REAL_LOWER_NP + margin
     hi = SHARPA_REAL_UPPER_NP - margin
     return np.clip(arr, lo, hi).astype(arr.dtype, copy=False)
-
-
-def clamp_to_real_limits_torch(hand_pos_sharpa, margin: float = 0.0):
-    """Torch variant. Last dim must be 22 in cfg order.
-
-    Broadcasts the [22] limit vectors against arbitrary batch shape.
-    Preserves dtype and device of the input.
-    """
-    import torch  # local import to keep numpy-only consumers light
-
-    if hand_pos_sharpa.shape[-1] != 22:
-        raise ValueError(f"last dim must be 22, got {tuple(hand_pos_sharpa.shape)}")
-    lo = torch.tensor(SHARPA_REAL_LOWER_NP, device=hand_pos_sharpa.device,
-                      dtype=hand_pos_sharpa.dtype) + margin
-    hi = torch.tensor(SHARPA_REAL_UPPER_NP, device=hand_pos_sharpa.device,
-                      dtype=hand_pos_sharpa.dtype) - margin
-    return torch.minimum(torch.maximum(hand_pos_sharpa, lo), hi)
-
-
-def report_violations(hand_pos_sharpa, tag: str = "") -> dict:
-    """Count per-joint target-out-of-limit events (no clamping)."""
-    arr = np.asarray(hand_pos_sharpa)
-    if arr.ndim == 1:
-        arr = arr[None, :]
-    under = (arr < SHARPA_REAL_LOWER_NP).sum(axis=0)   # [22]
-    over = (arr > SHARPA_REAL_UPPER_NP).sum(axis=0)
-    max_under = np.where(arr < SHARPA_REAL_LOWER_NP,
-                         SHARPA_REAL_LOWER_NP - arr, 0).max(axis=0)
-    max_over = np.where(arr > SHARPA_REAL_UPPER_NP,
-                        arr - SHARPA_REAL_UPPER_NP, 0).max(axis=0)
-    info = {
-        "tag": tag,
-        "num_frames": int(arr.shape[0]),
-        "joints_under": under.tolist(),
-        "joints_over": over.tolist(),
-        "max_under_amount": max_under.tolist(),
-        "max_over_amount": max_over.tolist(),
-        "any_violation": bool(under.sum() + over.sum() > 0),
-    }
-    return info

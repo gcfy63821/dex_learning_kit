@@ -9,7 +9,6 @@ import math
 
 import numpy as np
 import torch
-import joblib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
@@ -32,28 +31,16 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_conjugate, quat_mul, axis_angle_from_quat, saturate, quat_inv, wrap_to_pi, subtract_frame_transforms
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.managers import SceneEntityCfg
-# from dexx.utils.math import aa_to_quat, aa_to_rotmat, quat_to_aa
 from dexx.tasks.hand_imitation.dataset.transform import aa_to_quat, aa_to_rotmat, rotmat_to_aa, rot6d_to_aa
-# from dexx.tasks.hand_imitation.dataset.transform import (
-#     aa_to_quat,
-#     aa_to_rotmat,
-#     quat_to_rotmat,
-#     rotmat_to_aa,
-#     rotmat_to_quat,
-#     rot6d_to_aa,
-#     rot6d_to_quat,
-#     quat_to_aa,
-# )
 from dexx.tasks.hand_imitation.envs.factory import DexHandFactory
 from dexx.tasks.hand_imitation.dataset.factory import ManipDataFactory
-from dexx.tasks.hand_imitation.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_obj_mass
+from dexx.tasks.hand_imitation.dataset.oakink2_dataset_utils import oakink2_obj_mass
 from dexx.utils.debug_draw import DebugDraw
+from dexx import deploy_config as _dcfg
 # Auto-register hands
-import dexx.tasks.hand_imitation.envs.sharpa
+import dexx.tasks.hand_imitation.envs.sharpa  # noqa: F401
 from isaaclab.assets import RigidObjectCfg
-import pytorch_kinematics as pk
 import os
-import copy
 
 # BPS encoding
 try:
@@ -69,8 +56,7 @@ else:
     from .franka_sharpa_env_cfg import update_cfg_for_hand_side
 
 ROBOT_HEIGHT = 0.00214874
-from dexx.tasks.sharpa_VBTS.sensor_cfg.ray_caster_surface import SharpaVBTSCfg, SharpaVBTS
-#辅助函数-rfx
+# Yaw-rotation helpers (replay retarget-time aug_yaw_deg augmentation).
 def yaw_rotmat_2x2_batch(yaw_deg: torch.Tensor) -> torch.Tensor:
     t = torch.deg2rad(yaw_deg)
     c = torch.cos(t)
@@ -94,7 +80,6 @@ def yaw_rotmat_3x3_batch(yaw_deg: torch.Tensor) -> torch.Tensor:
     R[:, 2, 2] = 1.0
     return R
 
-#辅助函数
 class FrankaSharpaEnv(DirectRLEnv):
     cfg: "FrankaSharpaEnvCfg"
 
@@ -150,11 +135,8 @@ class FrankaSharpaEnv(DirectRLEnv):
         print("Is building data ...")
         dataset_list = list(set([ManipDataFactory.dataset_type(data_idx) for data_idx in self.data_indices]))
 
-        table_width_offset = 0.2
-        table_half_height = 0.015
-        table_half_width = 0.4
 
-        self._table_surface_z = 0.4 + table_half_height
+        self._table_surface_z = _dcfg.TABLE_SURFACE_Z
         mujoco2gym_transf = torch.eye(4, dtype=torch.float32, device=cfg.sim.device)
 
         m1 = aa_to_rotmat(torch.tensor([0, 0, -np.pi/2], dtype=torch.float32, device=cfg.sim.device))
@@ -182,15 +164,15 @@ class FrankaSharpaEnv(DirectRLEnv):
                 dataset_kwargs["retarget_root"] = retarget_root
                 print(f"[INFO] RobotoolBatch retarget_root override: {retarget_root}")
             self.demo_dataset_dict[dataset_type] = ManipDataFactory.create_data(**dataset_kwargs)
-        #新增pkl-retarget扩增读取
+        # Expand robotool_batch indices to all retarget-augmentation entries.
         _has_rt = any(idx.startswith("rt/") or idx.startswith("rt_") for idx in self.data_indices)
         if _has_rt:
             from dexx.tasks.hand_imitation.dataset.robotool_batch_dataset_dexhand import expand_rt_indices
 
-            # 先把 rt_ / rt/task 这种索引规范化展开成 base key
+            # Normalize rt_ / rt/task style indices into base keys.
             normalized_indices = expand_rt_indices(self.data_indices)
 
-            # 从实际 dataset_type 找到对应 dataset 实例
+            # Find the dataset instance for the actual dataset_type.
             rt_dataset = None
             for idx in normalized_indices:
                 ds_type = ManipDataFactory.dataset_type(idx)
@@ -219,7 +201,6 @@ class FrankaSharpaEnv(DirectRLEnv):
                 self.data_indices = normalized_indices
 
         self.data_keys = list(self.demo_dataset_dict.keys())
-        #新增
         self._env0_obj_urdf = self.demo_dataset_dict[self.data_keys[0]][self.data_indices[0]]["obj_urdf_path"]
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -314,7 +295,7 @@ class FrankaSharpaEnv(DirectRLEnv):
         # in [action_delay_min, action_delay_max] at reset; buffer is sized
         # to the MAX delay so any env-specific delay can be read from it.
         # If randomize_action_delay=False: all envs use the same
-        # `action_delay_steps` (legacy behaviour).
+        # `action_delay_steps`.
         self.action_delay_steps = getattr(self.cfg, 'action_delay_steps', 0)
         self._randomize_action_delay = bool(getattr(self.cfg, 'randomize_action_delay', False))
         self._action_delay_min = int(getattr(self.cfg, 'action_delay_min', 0))
@@ -386,7 +367,8 @@ class FrankaSharpaEnv(DirectRLEnv):
             self.hand_dof_lower_limits = joint_pos_limits[self.actuated_dof_indices, 0] * self.cfg.dof_limits_scale
             self.hand_dof_upper_limits = joint_pos_limits[self.actuated_dof_indices, 1] * self.cfg.dof_limits_scale
 
-        # Tighten hand joint limits to Sharpa HA4 real-hand reachable range so sim
+        # Tighten hand joint limits to the real-hand reachable range (measured on
+        # the Sharpa HA4 hand) so sim
         # action space and reset sampling match the deployable range. Real limits
         # are in cfg (Sharpa) order; reorder to sorted `actuated_dof_indices` layout.
         if getattr(self.cfg, 'use_real_hand_limits', True) and self.num_hand_dofs == 22:
@@ -489,7 +471,7 @@ class FrankaSharpaEnv(DirectRLEnv):
         # physics_sim_view
         self.physics_sim_view: physx.SimulationView = sim_utils.SimulationContext.instance().physics_sim_view
         
-        # gravity_curriculum
+        # Gravity scheduler (curriculum)
         self.gravity_scheduler_enabled = self.cfg.gravity_scheduler_enabled
         
         # Virtual object force curriculum buffers
@@ -602,7 +584,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             if getattr(self.cfg, "bind_multiasset_object_root_link", False):
                 # Robotool URDFs spawn a wrapper prim at /object and the actual
                 # rigid body at /object/<root_link>. RigidObject must bind to
-                # the rigid body prim for VBTS taxel ray-casting.
+                # the rigid body prim.
                 multiasset_spawn_cfg.func(
                     object_spawn_prim_path,
                     multiasset_spawn_cfg,
@@ -786,16 +768,6 @@ class FrankaSharpaEnv(DirectRLEnv):
                 dtype=torch.bool, device=self.device,
             )
 
-        # self.object = []
-        # for env_idx in range(self.num_envs):
-        #     obj_cfg = copy.deepcopy(self.cfg.object_cfg)
-        #     idx = self.data_indices[env_idx % len(self.data_indices)]
-        #     obj_cfg.spawn.asset_path = self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]["obj_urdf_path"]
-        #     obj_cfg.prim_path = f"/World/envs/env_{env_idx}/object"
-        #     obj = RigidObject(obj_cfg)
-        #     self.object.append(obj)
-        #     # self.scene.rigid_objects[f"object_{env_idx}"] = obj
-        
         if getattr(self.cfg, "bind_multiasset_object_root_link", False):
             for contact_sensor_cfg in self.cfg.contact_sensor:
                 contact_sensor_cfg.filter_prim_paths_expr = [object_contact_filter_path]
@@ -806,12 +778,6 @@ class FrankaSharpaEnv(DirectRLEnv):
             self._contact_sensor.append(ContactSensor(self.cfg.contact_sensor[id]))
             self.scene.sensors[f"contact_sensor_{id}"] = self._contact_sensor[id]
 
-        
-        # # VBTS, add vision based tactile sensors to the scene
-        # self._vbts_sensor = []
-        # for id in range(len(self.cfg.vbts_sensor)):
-        #     self._vbts_sensor.append(SharpaVBTS(self.cfg.vbts_sensor[id]))
-        #     self.scene.sensors[f"vbts_sensor_{id}"] = self._vbts_sensor[id]
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -1103,7 +1069,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             self.arm_joint_pos_des_prev = arm_joint_pos_des_smooth.clone()
             self.arm_joint_pos_des = arm_joint_pos_des_smooth.clone()
         else:
-            # Direct force/torque control mode (original implementation)
+            # Direct force/torque control mode
             translation_scale = self.translation_scale
             orientation_scale = self.orientation_scale
             
@@ -1206,9 +1172,6 @@ class FrankaSharpaEnv(DirectRLEnv):
 
         # # ==== DEBUG wrist force and torque ====
         # print(f"DEBUG force torque command:{self.apply_forces.mean().item()},{self.apply_torque.mean().item()}")
-        # Debug visualization
-        # if self.cfg.debug_draw:
-        #     self._debug_visualize()
 
 
     def _apply_action(self) -> None:
@@ -1380,7 +1343,6 @@ class FrankaSharpaEnv(DirectRLEnv):
             "policy": obs,
             "priv_info": self.priv_info_buf,
             "proprio_hist": self.proprio_hist_buf,
-            # "vbts_output": torch.cat([self._vbts_sensor[id].data.output["distance_along_normal"] for id in range(len(self.cfg.vbts_sensor))], dim=-1),
         }
         return observations
 
@@ -1538,7 +1500,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             target_state,
             max_length_tensor,
             scale_factor,
-            self.dexhand_weight_idx,   # by-name resolved (cohabits with legacy `self.dexhand.weight_idx` — asserted equal at init)
+            self.dexhand_weight_idx,   # by-name resolved (asserted equal to `self.dexhand.weight_idx` at init)
             self._use_wrist_tracking,
             self._use_abs_hand_tracking,
             self._use_rel_hand_tracking,
@@ -1722,7 +1684,7 @@ class FrankaSharpaEnv(DirectRLEnv):
           step, while the episode terminates on `episode_length_buf >= seq_len-1`
           (steps-since-reset). With non-zero seq_idx (init_curriculum or random
           init), progress_buf overshoots seq_len-1 long before the time_out
-          fires, so direct demo_data indexing was going OOB.
+          fires, so direct demo_data indexing would go OOB.
         """
         if progress is None:
             progress = self.progress_buf
@@ -1906,10 +1868,10 @@ class FrankaSharpaEnv(DirectRLEnv):
         
         # pd randomize
         if self.cfg.randomize_pd_gains:
-            assert self.cfg.randomize_p_gain_scale_lower <= 1, "pd scale参数lower必须<=1, upper必须>=1"
-            assert self.cfg.randomize_p_gain_scale_upper >= 1, "pd scale参数lower必须<=1, upper必须>=1"
-            assert self.cfg.randomize_d_gain_scale_lower <= 1, "pd scale参数lower必须<=1, upper必须>=1"
-            assert self.cfg.randomize_d_gain_scale_upper >= 1, "pd scale参数lower必须<=1, upper必须>=1"
+            assert self.cfg.randomize_p_gain_scale_lower <= 1, "pd gain scale: lower must be <= 1 and upper must be >= 1"
+            assert self.cfg.randomize_p_gain_scale_upper >= 1, "pd gain scale: lower must be <= 1 and upper must be >= 1"
+            assert self.cfg.randomize_d_gain_scale_lower <= 1, "pd gain scale: lower must be <= 1 and upper must be >= 1"
+            assert self.cfg.randomize_d_gain_scale_upper >= 1, "pd gain scale: lower must be <= 1 and upper must be >= 1"
             rand_scale = self._rand_pd_scales(self.cfg.randomize_p_gain_scale_lower, self.cfg.randomize_p_gain_scale_upper, len(env_ids), self.num_hand_dofs)
             self.p_gain[env_ids] = self.p_gain_default[env_ids] * rand_scale
             rand_scale = self._rand_pd_scales(self.cfg.randomize_d_gain_scale_lower, self.cfg.randomize_d_gain_scale_upper, len(env_ids), self.num_hand_dofs)
@@ -2161,9 +2123,9 @@ class FrankaSharpaEnv(DirectRLEnv):
                 obj_default_state[buf_ids, 3:13] = buf_obj_state[buf_ids, 3:13]
 
             # Eval-time object position perturbation (sim2real robustness study).
-            # When set via env.set_eval_perturb_obj_xy(delta), inject random
-            # uniform(-δ,+δ) offset in xy to obj_pos at reset. Tests Step E's
-            # dependence on object being at demo position.
+            # When env._eval_perturb_obj_xy = δ is set (scripts/eval.py
+            # --perturb_obj_xy), inject a uniform(-δ,+δ) xy offset into obj_pos
+            # at reset, to test dependence on the object being at the demo position.
             # cfg.randomize_obj_xy is the TRAINING-time knob; the instance
             # attribute is the eval-time override. Take whichever is larger so
             # an eval can widen a trained policy's displacement but never
@@ -2355,7 +2317,7 @@ class FrankaSharpaEnv(DirectRLEnv):
         extras["terminated"] = self.at_reset_buf.float().mean()
         extras["time_out"] = truncated.float().mean()
 
-        # Add total_rewards to extras (matching original implementation)
+        # Add total_rewards to extras
         extras["total_rewards"] = self.total_rew_buf
         extras["total_steps"] = self.progress_buf
 
@@ -2607,24 +2569,24 @@ class FrankaSharpaEnv(DirectRLEnv):
         - list of single-env assets (objects)
         """
 
-        # 如果是 list（不同物体情况）
+        # List case (a different object per env).
         if isinstance(assets, (list, tuple)):
 
             for env_idx, asset in enumerate(assets):
 
-                # 当前 env 的 friction
+                # Friction for this env.
                 value = values[env_idx]
 
                 materials = asset.root_physx_view.get_material_properties()
 
-                # value shape 可能是 (1,) 或 (1,1)
+                # value shape may be (1,) or (1, 1).
                 if value.ndim > 1:
                     value = value.squeeze()
 
                 materials[..., 0] = value
                 materials[..., 1] = value
 
-                # 单 env 资产，只能写 env 0
+                # Single-env asset: only env 0 can be written.
                 env_ids = torch.tensor([0], device="cpu")
 
                 asset.root_physx_view.set_material_properties(materials, env_ids)
@@ -2632,7 +2594,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             return
 
         # =========================
-        # 原始 batched 情况（hand）
+        # Batched case (hand).
         # =========================
 
         materials = assets.root_physx_view.get_material_properties()
@@ -2707,7 +2669,7 @@ class FrankaSharpaEnv(DirectRLEnv):
         self.translation_scale = self.cfg.translation_scale
         self.orientation_scale = self.cfg.orientation_scale
 
-        # Initialize default DOF pose (matching original implementation)
+        # Initialize default DOF pose
         default_pose = torch.ones(self.num_hand_dofs, device=self.device) * np.pi / 36
         self.dexhand_default_dof_pos = default_pose
 
@@ -2739,7 +2701,7 @@ class FrankaSharpaEnv(DirectRLEnv):
             idx = self.data_indices[k % len(self.data_indices)]
             return self.demo_dataset_dict[ManipDataFactory.dataset_type(idx)][idx]
         
-        # 打印分配情况
+        # Print the assignment.
         print(f"[INFO] Building data for {self.num_envs} envs from {len(self.data_indices)} data indices:")
         for i in range(min(self.num_envs, 20)):
             idx = self.data_indices[i % len(self.data_indices)]
@@ -2805,7 +2767,7 @@ class FrankaSharpaEnv(DirectRLEnv):
         self.demo_data = to_dev(packed)
 
         self._obj_urdf_list = self.demo_data['obj_urdf_path']
-        #新增=== replay aug_yaw_deg exactly like retarget, BEFORE xy/z offset ===
+        # === Replay aug_yaw_deg exactly like retargeting, BEFORE the xy/z offset ===
         if "aug_yaw_deg" in self.demo_data:
             yaw_deg = self.demo_data["aug_yaw_deg"].float().to(self.device)   # [N]
         else:
@@ -2874,27 +2836,27 @@ class FrankaSharpaEnv(DirectRLEnv):
             self.demo_data["mano_joints"] = joints_reshaped.reshape(self.num_envs, max_len, num_hand_bodies * 3)
 
             print(f"[INFO] Applied aug_yaw_deg in env, env0 yaw={yaw_deg[0].item():.2f} deg")
-            # 5) wrist_velocity: [N,T,3]  线速度只转 xy
+            # 5) wrist_velocity: [N,T,3]  linear velocity: rotate xy only
             if "wrist_velocity" in self.demo_data:
                 wrist_vel = self.demo_data["wrist_velocity"]
                 wrist_vel_xy = torch.einsum("nij,ntj->nti", R2, wrist_vel[:, :, :2])
                 wrist_vel[:, :, :2] = wrist_vel_xy
                 self.demo_data["wrist_velocity"] = wrist_vel
 
-            # 6) wrist_angular_velocity: [N,T,3]  角速度转 3D
+            # 6) wrist_angular_velocity: [N,T,3]  angular velocity: rotate in 3D
             if "wrist_angular_velocity" in self.demo_data:
                 wrist_ang_vel = self.demo_data["wrist_angular_velocity"]
                 wrist_ang_vel = torch.einsum("nij,ntj->nti", R3, wrist_ang_vel)
                 self.demo_data["wrist_angular_velocity"] = wrist_ang_vel
 
-            # 7) obj_velocity: [N,T,3]  线速度只转 xy
+            # 7) obj_velocity: [N,T,3]  linear velocity: rotate xy only
             if "obj_velocity" in self.demo_data:
                 obj_vel = self.demo_data["obj_velocity"]
                 obj_vel_xy = torch.einsum("nij,ntj->nti", R2, obj_vel[:, :, :2])
                 obj_vel[:, :, :2] = obj_vel_xy
                 self.demo_data["obj_velocity"] = obj_vel
 
-            # 8) obj_angular_velocity: [N,T,3]  角速度转 3D
+            # 8) obj_angular_velocity: [N,T,3]  angular velocity: rotate in 3D
             if "obj_angular_velocity" in self.demo_data:
                 obj_ang_vel = self.demo_data["obj_angular_velocity"]
                 obj_ang_vel = torch.einsum("nij,ntj->nti", R3, obj_ang_vel)
@@ -2906,7 +2868,7 @@ class FrankaSharpaEnv(DirectRLEnv):
                 joints_vel = torch.einsum("nij,ntkj->ntki", R3, joints_vel)
                 self.demo_data["mano_joints_velocity"] = joints_vel.reshape(self.num_envs, max_len, num_hand_bodies * 3)
         self.xy_offset = self.demo_data["xy_offset"]  # [num_envs, 2] - XY offset only
-        #新增=== replay aug_yaw_deg exactly like retarget, BEFORE xy/z offset ===
+        # === end aug_yaw_deg replay ===
         
         
         # Apply xy_offset to object trajectory (only XY translation)
@@ -3174,9 +3136,8 @@ class FrankaSharpaEnv(DirectRLEnv):
         # ====== weight_idx: body-name resolver + sanity assert ======
         # Build `self.dexhand_weight_idx` by looking up `weight_idx_body_names`
         # against the actual PhysX body order. This is robust to URDF / USD
-        # parse-order changes and to left/right hand variants — much safer than
-        # the hardcoded int indices in `sharpa.py:weight_idx`. The hardcoded
-        # dict is kept (for now) as a cohabit-period ground truth: if the
+        # parse-order changes and to left/right hand variants. The hardcoded
+        # int indices in `sharpa.py:weight_idx` serve as a cross-check: if the
         # resolved indices ever diverge from the hardcoded ones a hard assert
         # fires so we catch the discrepancy at startup instead of in training.
         _wb = self.hand_body_names
@@ -3252,8 +3213,6 @@ class FrankaSharpaEnv(DirectRLEnv):
         print(f"Arm body indices: {self.arm_body_indices}")
         print(f"Arm body names: {[self.hand.body_names[i] for i in self.arm_body_indices]}")
         
-        # Setup actuator parameters for arm and hand joints
-        # self._setup_actuators()
     
     def _init_arm_diff_ik_controller(self):
         """Initialize Differential IK controller for arm control."""
@@ -3319,229 +3278,6 @@ class FrankaSharpaEnv(DirectRLEnv):
         print(f"  Kp xyz={self.cfg.osc_kp_xyz}, Kp rot={self.cfg.osc_kp_rot}, "
               f"damping={self.cfg.osc_damping_ratio}, partial_decoupling={self.cfg.osc_partial_decoupling}")
 
-    def _setup_actuators(self):
-        """Setup actuator parameters for arm and hand joints separately.
-        
-        Arm joints use ImplicitActuator, hand joints use IdealPDActuator.
-        """
-        # Arm joint PD gains (for ImplicitActuator)
-        # Default values: can be adjusted based on requirements
-        arm_k_gains = [400.0, 400.0, 400.0, 400.0, 400.0, 400.0, 400.0]
-        arm_d_gains = [80.0, 80.0, 80.0, 80.0, 80.0, 80.0, 80.0]
-        
-        if len(self.arm_joint_indices) != len(arm_k_gains):
-            print(f"Warning: Arm joint count ({len(self.arm_joint_indices)}) doesn't match gain count ({len(arm_k_gains)})")
-            return
-        
-        # Get arm actuator (ImplicitActuator for arm joints)
-        if "arm_joints" not in self.hand.actuators:
-            print("Warning: 'arm_joints' actuator not found. Available actuators:", list(self.hand.actuators.keys()))
-            return
-        
-        arm_actuator = self.hand.actuators["arm_joints"]
-        
-        # Print current actuator parameters (before setting)
-        print("\n=== Arm Actuator Parameters (ImplicitActuator) ===")
-        print(f"Actuator stiffness shape: {arm_actuator.stiffness.shape}")
-        print(f"Actuator damping shape: {arm_actuator.damping.shape}")
-        
-        # Get current values for arm joints (first environment as reference)
-        if arm_actuator.stiffness.ndim == 2:
-            # Shape: [num_envs, num_joints]
-            # Note: arm_actuator only contains arm joints, so indices are 0-6
-            current_stiffness = arm_actuator.stiffness[0].cpu().numpy()
-            current_damping = arm_actuator.damping[0].cpu().numpy()
-        else:
-            # Shape: [num_joints]
-            current_stiffness = arm_actuator.stiffness.cpu().numpy()
-            current_damping = arm_actuator.damping.cpu().numpy()
-        
-        print(f"Current arm joint stiffness: {current_stiffness}")
-        print(f"Current arm joint damping: {current_damping}")
-        print(f"Arm joint names: {[self.hand.joint_names[i] for i in self.arm_joint_indices]}")
-        
-        # Set new values
-        arm_k_gains_tensor = torch.tensor(arm_k_gains, device=self.device, dtype=torch.float32)
-        arm_d_gains_tensor = torch.tensor(arm_d_gains, device=self.device, dtype=torch.float32)
-        
-        if arm_actuator.stiffness.ndim == 2:
-            # Set for all environments
-            arm_actuator.stiffness[:] = arm_k_gains_tensor[None, :]
-            arm_actuator.damping[:] = arm_d_gains_tensor[None, :]
-        else:
-            # Set for single environment case
-            arm_actuator.stiffness[:] = arm_k_gains_tensor
-            arm_actuator.damping[:] = arm_d_gains_tensor
-        
-        # Print updated actuator parameters (after setting)
-        print("\n=== Arm Actuator Parameters (After Setting) ===")
-        if arm_actuator.stiffness.ndim == 2:
-            updated_stiffness = arm_actuator.stiffness[0].cpu().numpy()
-            updated_damping = arm_actuator.damping[0].cpu().numpy()
-        else:
-            updated_stiffness = arm_actuator.stiffness.cpu().numpy()
-            updated_damping = arm_actuator.damping.cpu().numpy()
-        
-        print(f"Updated arm joint stiffness: {updated_stiffness}")
-        print(f"Updated arm joint damping: {updated_damping}")
-        print(f"Target stiffness: {arm_k_gains}")
-        print(f"Target damping: {arm_d_gains}")
-        print("=" * 50)
-        
-        # Also check hand actuator (IdealPDActuator)
-        if "hand_joints" in self.hand.actuators:
-            hand_actuator = self.hand.actuators["hand_joints"]
-            print("\n=== Hand Actuator Parameters (IdealPDActuator) ===")
-            print(f"Hand actuator stiffness shape: {hand_actuator.stiffness.shape}")
-            print(f"Hand actuator damping shape: {hand_actuator.damping.shape}")
-            print(f"Hand actuator type: {type(hand_actuator).__name__}")
-            
-            # Hand actuator parameters are already set from default_joint_stiffness/damping
-            # They can be modified here if needed
-            if hand_actuator.stiffness.ndim == 2:
-                hand_stiffness = hand_actuator.stiffness[0].cpu().numpy()
-                hand_damping = hand_actuator.damping[0].cpu().numpy()
-            else:
-                hand_stiffness = hand_actuator.stiffness.cpu().numpy()
-                hand_damping = hand_actuator.damping.cpu().numpy()
-            
-            print(f"Hand actuator stiffness (first 5): {hand_stiffness[:5]}")
-            print(f"Hand actuator damping (first 5): {hand_damping[:5]}")
-            print("=" * 50)
-        else:
-            print("Warning: 'hand_joints' actuator not found. Available actuators:", list(self.hand.actuators.keys()))
-    
-    def _debug_visualize(self):
-        """Visualize hand+arm skeleton and contact forces using debug draw.
-        
-        This function visualizes:
-        1. Target hand skeleton from demo data (green lines) - already has xy_offset applied
-        2. Current robot hand+arm body positions (blue lines)
-        3. Contact forces (red lines)
-        """
-        if not hasattr(self, 'debug_draw'):
-            return
-        
-        # Clear previous drawings
-        self.debug_draw.clear()
-        
-        # Get current demo data indices
-        cur_idx = self._get_demo_idx()
-        cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]), self.demo_data["seq_len"] - 1)
-        
-        # Visualize for first few environments (for clarity)
-        num_envs_to_visualize = min(1, self.num_envs)
-        
-        for env_id in range(num_envs_to_visualize):
-            # ===== 1. Draw target hand skeleton from demo data (green lines) =====
-            # Note: demo_data already has xy_offset applied in _build_data
-            cur_wrist_pos = self.demo_data["wrist_pos"][env_id, cur_idx[env_id]]  # [3]
-            cur_mano_joint_pos = self.demo_data["mano_joints"][env_id, cur_idx[env_id]].reshape(-1, 3)  # [n_joints, 3]
-            
-            # Concatenate wrist position with joint positions: [wrist, joint1, joint2, ...]
-            # Note: mano_joints shape is [n_joints, 3] where n_joints = n_bodies - 1 (excluding wrist)
-            target_hand_joints = torch.cat([cur_wrist_pos[None, :], cur_mano_joint_pos], dim=0)  # [n_bodies, 3]
-            
-            # Draw target hand bone links (skeleton) - green lines
-            if hasattr(self.dexhand, 'bone_links') and self.dexhand.bone_links is not None:
-                bone_links = self.dexhand.bone_links
-                for link in bone_links:
-                    parent_idx, child_idx = link[0], link[1]
-                    if parent_idx < target_hand_joints.shape[0] and child_idx < target_hand_joints.shape[0]:
-                        # Convert to world coordinates (add environment origin)
-                        # Note: target_hand_joints already has xy_offset applied, so it's relative to env_origin
-                        parent_pos = target_hand_joints[parent_idx] + self.scene.env_origins[env_id]
-                        child_pos = target_hand_joints[child_idx] + self.scene.env_origins[env_id]
-                        
-                        # Draw line between parent and child (green for target)
-                        line_points = torch.stack([parent_pos, child_pos], dim=0)  # [2, 3]
-                        self.debug_draw.plot(line_points, size=2.0, color=(0.0, 1.0, 0.0, 1.0))  # Green color
-            
-            # ===== 2. Draw current robot hand+arm body positions (blue lines) =====
-            # Get current robot body positions (hand bodies)
-            if hasattr(self, 'hand_body_indices') and len(self.hand_body_indices) > 0:
-                current_hand_body_pos = self.hand.data.body_pos_w[env_id, self.hand_body_indices]  # [n_hand_bodies, 3]
-                
-                # Draw hand body links using bone_links structure
-                if hasattr(self.dexhand, 'bone_links') and self.dexhand.bone_links is not None:
-                    bone_links = self.dexhand.bone_links
-                    for link in bone_links:
-                        parent_idx, child_idx = link[0], link[1]
-                        # Map from dexhand body indices to hand_body_indices
-                        # Note: hand_body_indices may not match exactly with bone_links indices
-                        # We need to find corresponding bodies by name
-                        if parent_idx < len(self.hand_body_names) and child_idx < len(self.hand_body_names):
-                            try:
-                                parent_body_name = self.hand_body_names[parent_idx]
-                                child_body_name = self.hand_body_names[child_idx]
-                                
-                                # Find indices in hand_body_indices
-                                if parent_body_name in self.hand.body_names and child_body_name in self.hand.body_names:
-                                    parent_body_idx_in_hand = self.hand.body_names.index(parent_body_name)
-                                    child_body_idx_in_hand = self.hand.body_names.index(child_body_name)
-                                    
-                                    if (parent_body_idx_in_hand in self.hand_body_indices and 
-                                        child_body_idx_in_hand in self.hand_body_indices):
-                                        # Get local indices in hand_body_indices
-                                        parent_local_idx = self.hand_body_indices.index(parent_body_idx_in_hand)
-                                        child_local_idx = self.hand_body_indices.index(child_body_idx_in_hand)
-                                        
-                                        if (parent_local_idx < current_hand_body_pos.shape[0] and 
-                                            child_local_idx < current_hand_body_pos.shape[0]):
-                                            parent_pos = current_hand_body_pos[parent_local_idx]
-                                            child_pos = current_hand_body_pos[child_local_idx]
-                                            
-                                            # Draw line between parent and child (blue for current robot)
-                                            line_points = torch.stack([parent_pos, child_pos], dim=0)  # [2, 3]
-                                            self.debug_draw.plot(line_points, size=2.5, color=(0.0, 0.0, 1.0, 1.0))  # Blue color
-                            except (ValueError, IndexError):
-                                # Skip if mapping fails
-                                pass
-            
-            # Draw arm base to wrist connection (if available)
-            if hasattr(self, 'arm_end_effector_link') and hasattr(self, 'arm_robot_entity_cfg'):
-                try:
-                    # Get arm base position (root position)
-                    arm_base_pos = self.hand.data.root_pos_w[env_id]  # [3]
-                    
-                    # Get wrist position (end effector)
-                    if hasattr(self.arm_robot_entity_cfg, 'body_ids') and len(self.arm_robot_entity_cfg.body_ids) > 0:
-                        wrist_body_idx = self.arm_robot_entity_cfg.body_ids[0]
-                        wrist_pos = self.hand.data.body_pos_w[env_id, wrist_body_idx]  # [3]
-                        
-                        # Draw line from arm base to wrist (cyan color)
-                        arm_line = torch.stack([arm_base_pos, wrist_pos], dim=0)  # [2, 3]
-                        self.debug_draw.plot(arm_line, size=3.0, color=(0.0, 1.0, 1.0, 1.0))  # Cyan color
-                except (AttributeError, IndexError):
-                    pass
-            
-            # ===== 3. Draw contact forces (red lines) =====
-            # Map contact sensor IDs to body names
-            # _contact_body_ids = [0, 1, 2, 3, 4] corresponds to first 5 sensors (elastomer sensors)
-            # These are: thumb, index, middle, ring, pinky elastomers
-            for idx, sensor_id in enumerate(self._contact_body_ids):
-                if sensor_id < len(self._contact_sensor):
-                    sensor = self._contact_sensor[sensor_id]
-                    # Get net force from contact sensor (latest frame)
-                    net_force = sensor.data.net_forces_w[env_id, 0, :] 
-                    force_magnitude = torch.norm(net_force)
-                    
-                    if force_magnitude > 0.01:  # Only draw if force is significant
-                        # Get corresponding body name from contact_body_names
-                        # idx in _contact_body_ids maps to contact_body_names
-                        if idx < len(self.dexhand.contact_body_names):
-                            body_name = self.dexhand.contact_body_names[idx]
-                            if body_name in self.hand.body_names:
-                                body_idx = self.hand.body_names.index(body_name)
-                                # Get body position in world coordinates
-                                body_pos = self.hand.data.body_pos_w[env_id, body_idx]
-                                # Draw force vector (scaled for visibility)
-                                force_scale = 0.01  # Scale factor for visualization
-                                force_end = body_pos + net_force * force_scale
-                                force_line = torch.stack([body_pos, force_end], dim=0)
-                                self.debug_draw.plot(force_line, size=3.0, color=(1.0, 0.0, 0.0, 1.0))  # Red color
-
-
 @torch.jit.script
 def quat_to_angle_axis(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Computes axis-angle representation from quaternion q.
@@ -3570,6 +3306,10 @@ def quat_to_angle_axis(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 # --success_dist controls closest-approach success, not post-hoc strict3.
 # Baked into the TorchScript function below at script time.
 STRICT_SUCCESS_DIST: float = 0.03
+
+# Table top height (m), from dexx.deploy_config. Baked into the TorchScript
+# reward below as a parameter default, like STRICT_SUCCESS_DIST.
+TABLE_SURFACE_Z: float = float(_dcfg.TABLE_SURFACE_Z)
 
 
 @torch.jit.script
@@ -3600,10 +3340,11 @@ def compute_imitation_reward(
     premature_contact_progress_threshold: int = 50,
     premature_contact_enabled: bool = True,
     eval_no_terminate: bool = False,
-    # Passed as a parameter, not read from the module: TorchScript cannot close
-    # over a global float. The default is evaluated by Python at definition
+    # Passed as parameters, not read from the module: TorchScript cannot close
+    # over a global float. The defaults are evaluated by Python at definition
     # time, so the scripted body still sees one number with one definition.
     strict_success_dist: float = STRICT_SUCCESS_DIST,
+    table_surface_z: float = TABLE_SURFACE_Z,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
 
     # end effector pose reward
@@ -3753,9 +3494,8 @@ def compute_imitation_reward(
     
     diff_obj_rot = quat_mul(target_obj_quat, quat_conjugate(current_obj_quat))
     diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0]
-    # in-hand rotation tweak (2026-06-06): sharpen from exp(-3) → exp(-4) so
-    # rotation tracking penalizes ≥15° errors more strongly. At 15° err the
-    # reward drops 0.46 → 0.37; at 30° it drops 0.21 → 0.12.
+    # exp(-4·|Δrot|) penalizes ≥15° rotation errors strongly: the reward is
+    # ≈0.35 at 15° and ≈0.12 at 30°.
     reward_obj_rot = torch.exp(-4 * (diff_obj_rot_angle).abs())
     
     current_obj_vel = states["manip_obj_vel"]
@@ -3844,10 +3584,8 @@ def compute_imitation_reward(
     survival_reward_scale = 1.0  # Scale factor for survival reward
     survival_reward = survival_reward_scale * (running_progress_buf.float() / max_length.clamp(min=1.0))
     
-    # Arm collision detection with table.
-    # NOTE: this is inside a @torch.jit.script function, which cannot import — so the
-    # value is a literal here. It MUST match dexx.deploy_config.TABLE_SURFACE_Z (0.415).
-    table_surface_z = 0.415
+    # Arm collision detection with table (table_surface_z defaults to
+    # dexx.deploy_config.TABLE_SURFACE_Z).
     # Hardcoded collision threshold: 5cm
     arm_collision_threshold = 0.05
     
@@ -3950,8 +3688,8 @@ def compute_imitation_reward(
         quat_mul(target_states["manip_obj_quat"], quat_conjugate(states["manip_obj_quat"]))
     )[0]
     # Trajectory-tracking failure thresholds:
-    #   pos: |obj − demo_current| > 8cm   (between original 12.3cm and tight 5cm)
-    #   rot: |Δrot|                > ~123° (original env default, 30/0.243 * scale^3)
+    #   pos: |obj − demo_current| > 8cm
+    #   rot: |Δrot|                > ~123° (30/0.243 * scale^3)
     fail_obj_pos = (diff_obj_pos_dist > 0.03 / 0.243 * scale_factor**3) & (running_progress_buf >= 20)
     fail_obj_rot = (
         (diff_obj_rot_angle.abs() / 3.141592653589793 * 180 > 30 / 0.243 * scale_factor**3)
@@ -3990,7 +3728,7 @@ def compute_imitation_reward(
     #   reward_final_pos      — exp(-α·||cur − final||)            full credit at endpoint
     #   reward_final_rot      — exp(-α·|Δrot|)                     orientation at endpoint
     #   reward_final_approach — exp(-α·min_k ||cur − last_K[k]||)  partial credit near endpoint
-    # All default to weight 0 (opt-in via cfg.success_*_weight).
+    # Weights come from cfg.success_*_weight.
     # Optional time-ramp: if success_reward_ramp=True, scale by ramp that's
     # 0 before max_length-K and 1 at max_length. This prevents the policy
     # from "skipping ahead" to dump the object early.
@@ -4059,9 +3797,8 @@ def compute_imitation_reward(
         + abs_w * 0.75 * reward_middle_tip_pos
         + abs_w * 0.6 * reward_pinky_tip_pos
         + abs_w * 0.6 * reward_ring_tip_pos
-        # in-hand tweak (2026-06-06): boost mid/base finger joints so the
-        # policy reproduces the demo's finger SHAPE inside the grasp, not
-        # just the tip contact points. level_1/2 was 0.5/0.3.
+        # Mid/base finger joints are weighted so the policy reproduces the
+        # demo's finger SHAPE inside the grasp, not just the tip contact points.
         + abs_w * 0.7 * reward_level_1_pos
         + abs_w * 0.5 * reward_level_2_pos
         # Relative (wrist-frame) hand body tracking
@@ -4074,13 +3811,11 @@ def compute_imitation_reward(
         + rel_w * 0.5 * reward_rel_level_2
         # Object tracking (always on)
         + 8.0 * reward_obj_pos
-        # in-hand rotation tweak (2026-06-06): obj_rot 4.0 → 6.0 so rotation
-        # tracking carries weight comparable to obj_pos for rotate/spin demos.
+        # obj_rot weight 6.0 so rotation tracking carries weight comparable to obj_pos for rotate/spin demos.
         + 6.0 * reward_obj_rot
         + 0.1 * reward_joints_vel
         + 0.1 * reward_obj_vel
-        # in-hand rotation tweak (2026-06-06): obj_ang_vel 0.1 → 0.4 so policy
-        # learns to MATCH demo angular velocity, not just final orientation.
+        # obj_ang_vel weight 0.4 so the policy learns to MATCH demo angular velocity, not just final orientation.
         + 0.4 * reward_obj_ang_vel
         + 3.0 * reward_finger_tip_force
         + 2.0 * reward_approach
@@ -4088,7 +3823,7 @@ def compute_imitation_reward(
         + 0.1 * reward_action_rate_l2
         - arm_action_rate_penalty * penal_arm_action_rate_l2
         + arm_collision_penalty
-        # Final-frame "success" shaping (default weights all 0 → no-op).
+        # Final-frame "success" shaping (weights from cfg.success_*_weight).
         + success_pos_weight * reward_final_pos
         + success_rot_weight * reward_final_rot
         + success_approach_weight * reward_final_approach
@@ -4234,28 +3969,6 @@ def scale(x, lower, upper):
     return 0.5 * (x + 1.0) * (upper - lower) + lower
 
 @torch.jit.script
-def unscale(x, lower, upper):
-    return (2.0 * x - upper - lower) / (upper - lower)
-
-@torch.jit.script
-def angle_between_axis_and_z(quat: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
-    """
-    quat: (...,4) 格式 [w,x,y,z]
-    返回:
-        angles: (...,) 与 z 轴夹角，单位弧度 [0, pi]
-        对于零旋转，返回 0
-    """
-    v = axis_angle_from_quat(quat, eps)
-    v_norm = torch.linalg.norm(v, dim=-1)
-    zero_mask = v_norm <= eps
-    safe_norm = torch.clamp(v_norm, min=eps).unsqueeze(-1)
-    axis_unit = v / safe_norm
-    cos_theta = torch.clamp(axis_unit[..., 2], -1.0, 1.0)
-    angle = torch.acos(cos_theta)
-    angle = torch.where(zero_mask, torch.zeros_like(angle), angle)
-    return angle
-
-@torch.jit.script
 def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Rotate vector(s) v about the rotation described by quaternion(s) q.
 
@@ -4294,60 +4007,6 @@ def transform_between_frames(p_A: torch.Tensor, q_A: torch.Tensor,
     return p_B
 
 @torch.jit.script
-def quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
-    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-    B = q.shape[0]
-    R = torch.zeros((B, 3, 3), device=q.device, dtype=q.dtype)
-
-    R[:, 0, 0] = 1 - 2 * (y * y + z * z)
-    R[:, 0, 1] = 2 * (x * y - z * w)
-    R[:, 0, 2] = 2 * (x * z + y * w)
-
-    R[:, 1, 0] = 2 * (x * y + z * w)
-    R[:, 1, 1] = 1 - 2 * (x * x + z * z)
-    R[:, 1, 2] = 2 * (y * z - x * w)
-
-    R[:, 2, 0] = 2 * (x * z - y * w)
-    R[:, 2, 1] = 2 * (y * z + x * w)
-    R[:, 2, 2] = 1 - 2 * (x * x + y * y)
-    return R
-
-@torch.jit.script
-def get_random_rotation(env_ids: torch.Tensor, device: str) -> torch.Tensor:
-    N = env_ids.shape[0]
-
-    u1 = torch.rand(N, device=device)
-    u2 = torch.rand(N, device=device) * 2.0 * torch.pi
-    u3 = torch.rand(N, device=device) * 2.0 * torch.pi
-    q1 = torch.sqrt(1.0 - u1) * torch.sin(u2)
-    q2 = torch.sqrt(1.0 - u1) * torch.cos(u2)
-    q3 = torch.sqrt(u1) * torch.sin(u3)
-    q4 = torch.sqrt(u1) * torch.cos(u3)
-    q_rand = torch.stack([q4, q1, q2, q3], dim=-1)
-
-    return q_rand
-
-@torch.jit.script
-def apply_random_rotation_with_center(
-    qs_init: torch.Tensor, pos_init: torch.Tensor, center: torch.Tensor, q_rand: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    qs_new = quat_mul(q_rand, qs_init)
-
-    R = quat_to_rotmat(q_rand)
-    offset = pos_init - center
-    new_offset = torch.bmm(R, offset.unsqueeze(-1)).squeeze(-1)
-    pos_new = new_offset + center
-
-    return qs_new, pos_new
-
-@torch.jit.script
-def rotate_axis_by_quat(axis: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
-    axis_q = torch.cat([torch.zeros(axis.shape[:-1] + (1,), device=axis.device), axis], dim=-1)
-    quat_conj = quat_conjugate(quat)
-    rotated_q = quat_mul(quat_mul(quat, axis_q), quat_conj)
-    return rotated_q[..., 1:]
-
-@torch.jit.script
 def rotmat_to_quat(rotmat: torch.Tensor) -> torch.Tensor:
     """Convert rotation matrix to quaternion (w, x, y, z).
     
@@ -4357,10 +4016,6 @@ def rotmat_to_quat(rotmat: torch.Tensor) -> torch.Tensor:
     Returns:
         Quaternion in (w, x, y, z) format, shape (..., 4)
     """
-    batch_shape = rotmat.shape[:-2]
-    device = rotmat.device
-    dtype = rotmat.dtype
-    
     # Extract matrix elements
     m00, m01, m02 = rotmat[..., 0, 0], rotmat[..., 0, 1], rotmat[..., 0, 2]
     m10, m11, m12 = rotmat[..., 1, 0], rotmat[..., 1, 1], rotmat[..., 1, 2]

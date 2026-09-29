@@ -20,8 +20,7 @@ and the selected CUDA build is required.
 This is a constrained installation baseline, **not a claim that every target
 machine has passed training**. Run the headless acceptance test below.
 `requirements-full.txt` is a compatibility alias to the curated requirements,
-not a lock file. The former development snapshot was inconsistent and cannot
-be used to reconstruct a working environment.
+not a lock file.
 
 The [official Lab compatibility table](https://github.com/isaac-sim/IsaacLab/tree/v2.2.1)
 supports Sim 4.5. This Lab version supplies the contact-point and articulation
@@ -145,10 +144,42 @@ python -m pip install -r requirements-deploy.txt
 python tutorial/00_setup/check_imports.py --include-deploy
 ```
 
-Polymetis, ROS and camera/hand SDKs remain specific to their respective hosts.
-Optional RSL-RL example configurations are excluded from the default scan; use
-`check_imports.py --include-rsl-rl` after separately installing that backend.
-The shipped training scripts use the project's own PPO/DAgger implementations.
+Polymetis, the RealSense SDK and the Sharpa hand SDK remain specific to their
+respective hosts. The shipped training scripts use the project's own PPO/DAgger
+implementations.
+
+## uv route
+
+`setup_uv.sh` installs the same baseline into a uv virtual environment instead
+of conda, and installs every Isaac Lab `source/` package editable, like
+`./isaaclab.sh -i none`. Isaac Sim comes from one of two places:
+
+- **pip (default):** the `isaacsim[all,extscache]==4.5.0` wheels from
+  `pypi.nvidia.com`. Needs glibc >= 2.34; the Lab checkout must not contain an
+  `_isaac_sim` link, and `check_versions.py` reads the Sim version from the wheel.
+- **binary:** pass `--isaacsim /path/to/isaac-sim` (or keep an existing
+  `_isaac_sim` link). The venv's `activate` then sources
+  `_isaac_sim/setup_conda_env.sh`, exactly as Lab's conda environments do. Use
+  this on older glibc such as Ubuntu 20.04 (2.31). Isaac Sim's
+  `exts/omni.isaac.ml_archive/pip_prebundle` holds Torch 2.5.1/cu118, which Kit
+  imports at startup ahead of the venv's Torch 2.7; the installer moves it to
+  `pip_prebundle.disabled-by-dexx` (the venv provides every package in it).
+  Move it back to restore the stock Sim. On glibc < 2.32 PyTorch3D is built
+  from source at the pinned commit, which needs the CUDA 12.8 `nvcc`, `cudart`
+  and `cccl` (e.g. apt `cuda-nvcc-12-8 cuda-cudart-dev-12-8 cuda-cccl-12-8`).
+
+```bash
+git clone --branch v2.2.1 --depth 1 https://github.com/isaac-sim/IsaacLab.git ../IsaacLab
+bash tutorial/00_setup/setup_uv.sh --isaaclab ../IsaacLab --venv .venv --accept-eula
+# glibc < 2.34: add --isaacsim "$ISAACSIM_PATH" to use the binary Sim instead
+source .venv/bin/activate
+bash tutorial/run_acceptance.sh
+```
+
+The constraints file is passed as `UV_CONSTRAINT` and `UV_BUILD_CONSTRAINT`,
+and `UV_INDEX_STRATEGY=unsafe-best-match` keeps the PyTorch/PyTorch3D indexes
+authoritative for their CUDA builds. uv's own variables still apply, e.g.
+`UV_DEFAULT_INDEX` for a PyPI mirror or `UV_CACHE_DIR` for a shared cache.
 
 ## 4. Verify in stages
 
@@ -192,7 +223,7 @@ For videos/RTX cameras, additionally validate `--enable_cameras` on that target.
 ## Troubleshooting
 
 - **Dependency conflict:** use the pinned Lab checkout and constraints from the
-  start. Do not mix the old development snapshot into this environment.
+  start, in a dedicated environment.
 - **Missing contact-point API:** check the imported Lab source and commit;
   removing contact fields changes the observations and is not a compatibility fix.
 - **PyTorch3D import/CUDA error:** match Torch, CUDA, Python and the compiled wheel.

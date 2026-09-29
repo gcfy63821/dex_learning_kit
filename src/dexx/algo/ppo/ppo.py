@@ -15,13 +15,7 @@ import time
 import torch
 
 from dexx.algo.ppo.experience import ExperienceBuffer
-from dexx.algo.models.models import (
-    ActorCritic,
-    ActorCriticAsymmetric,
-    ActorCriticResidual,
-    ActorCriticBimanualSplit,
-    ActorCriticTaxelAsymmetric,
-)
+from dexx.algo.models.models import ActorCritic, ActorCriticAsymmetric
 from dexx.algo.models.running_mean_std import RunningMeanStd
 
 from dexx.utils.misc import AverageScalarMeter
@@ -46,15 +40,6 @@ class PPO(object):
         # ---- Priv Info ----
         self.priv_info_dim = self.ppo_config['priv_info_dim']
         self.priv_info = self.ppo_config['priv_info']
-        taxel_encoder_cfg = dict(self.network_config.get("taxel_encoder", {}))
-        if taxel_encoder_cfg.get("enabled", False):
-            env_unwrapped = getattr(self.env, "unwrapped", None)
-            runtime_base_obs_dim = getattr(env_unwrapped, "_taxel_base_obs_dim", None)
-            runtime_taxel_dim = getattr(env_unwrapped, "_taxel_dim", None)
-            if runtime_base_obs_dim is not None:
-                taxel_encoder_cfg["base_obs_dim"] = int(runtime_base_obs_dim)
-            if runtime_taxel_dim is not None:
-                taxel_encoder_cfg["taxel_dim"] = int(runtime_taxel_dim)
         # ---- Model ----
         net_config = {
             'actor_units': self.network_config["mlp"]["units"],
@@ -64,71 +49,8 @@ class PPO(object):
             'priv_info': self.priv_info,
             'proprio_adapt': False,
             'priv_info_dim': self.priv_info_dim,
-            'taxel_encoder': taxel_encoder_cfg,
         }
-        # self.model = ActorCritic(net_config)
-        # if self.network_config.get("use_residual", False):
-        #     net_config.update({
-        #         "base_ckpt": self.network_config["base_ckpt"],
-        #         "residual_scale": self.network_config.get("residual_scale", 1.0),
-        #         "base_obs_dim": self.network_config.get("base_obs_dim", 390),
-        #         "base_priv_info_dim": self.network_config.get("base_priv_info_dim", 25),
-        #     })
-        #     self.model = ActorCriticResidual(net_config)
-        #     print("INFO: USING RESIDUAL NETWORK")
-        # elif self.network_config.get("asymmetric_ac", False):
-        #     self.model = ActorCriticAsymmetric(net_config)
-        #     print(f"INFO: USING ASYMMETRIC ACTOR-CRITIC (actor_obs={self.obs_shape[0]}, "
-        #           f"critic_obs={self.obs_shape[0]+self.priv_info_dim})")
-        # else:
-        #     self.model = ActorCritic(net_config)
-                # self.model = ActorCritic(net_config)
-        # if self.network_config.get("use_residual", False):
-        #     net_config.update({
-        #         "base_ckpt": self.network_config["base_ckpt"],
-        #         "residual_scale": self.network_config.get("residual_scale", 1.0),
-        #         "base_obs_dim": self.network_config.get("base_obs_dim", 390),
-        #         "base_priv_info_dim": self.network_config.get("base_priv_info_dim", 25),
-        #     })
-        #     self.model = ActorCriticResidual(net_config)
-        #     print("INFO: USING RESIDUAL NETWORK")
-        # elif self.network_config.get("asymmetric_ac", False):
-        #     self.model = ActorCriticAsymmetric(net_config)
-        #     print(f"INFO: USING ASYMMETRIC ACTOR-CRITIC (actor_obs={self.obs_shape[0]}, "
-        #           f"critic_obs={self.obs_shape[0]+self.priv_info_dim})")
-        # else:
-        #     self.model = ActorCritic(net_config)
-        if self.network_config.get("use_residual", False):
-            net_config.update({
-                "base_ckpt": self.network_config["base_ckpt"],
-                "residual_scale": self.network_config.get("residual_scale", 1.0),
-                "base_obs_dim": self.network_config.get("base_obs_dim", 390),
-                "base_priv_info_dim": self.network_config.get("base_priv_info_dim", 25),
-            })
-            self.model = ActorCriticResidual(net_config)
-            print("INFO: USING RESIDUAL NETWORK")
-        elif taxel_encoder_cfg.get("enabled", False):
-            self.model = ActorCriticTaxelAsymmetric(net_config)
-            encoder = self.model.taxel_encoder
-            print(
-                f"INFO: USING TAXEL MLP ASYMMETRIC ACTOR-CRITIC "
-                f"(raw_actor_obs={self.obs_shape[0]}, encoded_actor_obs={encoder.output_dim}, "
-                f"taxel_tail={encoder.taxel_tail_dim}, per_finger={encoder.per_finger_dim}, "
-                f"critic_obs={encoder.output_dim + self.priv_info_dim})"
-            )
-        elif self.network_config.get("bimanual_split", False):
-            # Optional per-side dims (falls back to obs/2, act/2, priv/2)
-            net_config.update({
-                "side_obs_dim": self.network_config.get("side_obs_dim", self.obs_shape[0] // 2),
-                "side_action_dim": self.network_config.get("side_action_dim", self.actions_num // 2),
-                "side_priv_dim": self.network_config.get("side_priv_dim", self.priv_info_dim // 2),
-            })
-            self.model = ActorCriticBimanualSplit(net_config)
-            print(f"INFO: USING BIMANUAL SPLIT ACTOR-CRITIC "
-                f"(actor_obs_per_side={net_config['side_obs_dim']}, "
-                f"action_per_side={net_config['side_action_dim']}, "
-                f"critic_obs={self.obs_shape[0] + self.priv_info_dim})")
-        elif self.network_config.get("asymmetric_ac", False):
+        if self.network_config.get("asymmetric_ac", False):
             self.model = ActorCriticAsymmetric(net_config)
             print(f"INFO: USING ASYMMETRIC ACTOR-CRITIC (actor_obs={self.obs_shape[0]}, "
                 f"critic_obs={self.obs_shape[0]+self.priv_info_dim})")
@@ -542,8 +464,9 @@ class PPO(object):
                 # bounded loss
                 if self.bounds_loss_coef > 0:
                     soft_bound = 1.1
-                    mu_loss_high = torch.clamp_max(mu - soft_bound, 0.0) ** 2
-                    mu_loss_low = torch.clamp_max(-mu + soft_bound, 0.0) ** 2
+                    # Zero inside [-soft_bound, soft_bound], quadratic outside it.
+                    mu_loss_high = torch.clamp_min(mu - soft_bound, 0.0) ** 2
+                    mu_loss_low = torch.clamp_max(mu + soft_bound, 0.0) ** 2
                     b_loss = (mu_loss_low + mu_loss_high).sum(axis=-1)
                 else:
                     b_loss = 0

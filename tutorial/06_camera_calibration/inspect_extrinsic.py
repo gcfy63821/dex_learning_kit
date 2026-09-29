@@ -4,9 +4,9 @@ A 4x4 camera-in-armbase transform in the ROS optical convention (x-right, y-down
 z-forward). This script validates one, and — more usefully — reports how far two
 of them are apart.
 
-That comparison is the whole lesson: a hard-coded extrinsic in this repository
-once drifted 19 cm from the live calibration and nothing raised a warning. A
-number like that is obvious the moment you print it and invisible otherwise.
+That comparison is the whole lesson: two calibrations of the same camera can
+sit centimetres and degrees apart without anything raising a warning. A
+difference like that is obvious the moment you print it and invisible otherwise.
 
     python tutorial/06_camera_calibration/inspect_extrinsic.py
     python tutorial/06_camera_calibration/inspect_extrinsic.py a.npy b.npy
@@ -20,17 +20,6 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# The 2026-05-20 calibration that used to be compiled into TWO places — the sim
-# raycaster and the depth subscriber — and went stale when the camera moved. The
-# code no longer carries it; it is kept here only so the comparison below shows
-# what a stale extrinsic actually costs you.
-STALE_2026_05_20 = np.array([
-    [-0.000129,  0.448341, -0.893862,  1.237400],
-    [ 0.999160,  0.036688,  0.018258, -0.190700],
-    [ 0.040981, -0.893109, -0.447969,  0.675200],
-    [ 0.000000,  0.000000,  0.000000,  1.000000],
-], dtype=np.float64)
 
 
 def validate(name: str, M: np.ndarray) -> bool:
@@ -106,13 +95,6 @@ def main() -> int:
     print("\n=== describe")
     for name, M in mats.items():
         describe(name, M, table_z, base_z)
-
-    print("\n=== drift against the 2026-05-20 calibration (historical)")
-    print("  It was compiled into the sim raycaster and the depth subscriber until")
-    print("  2026-09; policies trained in that window used it. Kept here to show")
-    print("  what a stale extrinsic costs. Nothing reads it any more.")
-    for name, M in mats.items():
-        compare("2026-05-20 (stale)", STALE_2026_05_20, name, M)
 
     if len(mats) > 1:
         print("\n=== drift between the shipped calibrations")

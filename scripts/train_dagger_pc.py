@@ -6,9 +6,9 @@ Pipeline:
     point-cloud student (proprio + scene/hand/tactile PC → action)
 
 Usage:
-    python dexx/scripts/gym_style/train_dagger_pc.py \
+    python scripts/train_dagger_pc.py \
         --task franka-sharpa-pointcloud \
-        --teacher_ckpt logs/.../poseobs/stage1_nn/best.pth \
+        --teacher_ckpt checkpoints/teacher_poseobs.pth \
         --side right \
         --data_idx '[...]' \
         --num_envs 64 --dagger_iters 20 --rollout_steps 4096 \
@@ -18,8 +18,7 @@ Usage:
         --out_dir logs/dagger_pc_$(date +%Y%m%d_%H%M%S) \
         --headless
 
-Three task variants supported (`franka-sharpa-pointcloud{,-sceneonly,-separate}`)
-swap the encoder fusion strategy via the env cfg.
+See docs/DISTILLATION.md for the full lean-student (deployable) command.
 """
 import argparse
 import sys
@@ -36,7 +35,6 @@ parser.add_argument("--student_ckpt", type=str, default=None,
 parser.add_argument("--side", type=str, default="right")
 parser.add_argument("--data_idx", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=64)
-parser.add_argument("--cache", type=str, default=None)
 
 # DAgger schedule
 parser.add_argument("--dagger_iters", type=int, default=20)
@@ -84,7 +82,7 @@ parser.add_argument("--no_contact_force", action="store_true", default=False,
 # PC augmentation (training-time only; defaults preserve env_cfg = no aug).
 parser.add_argument("--pc_aug", action="store_true", default=False,
                     help="Shortcut: enable PC jitter+dropout+hand_noise with sane "
-                         "defaults (jitter 2mm, dropout 5%, hand_noise 1mm). "
+                         "defaults (jitter 2mm, dropout 5%%, hand_noise 1mm). "
                          "Overridden by explicit --pc_jitter_std/--pc_dropout_ratio/"
                          "--pc_hand_noise_std flags if given.")
 parser.add_argument("--pc_jitter_std", type=float, default=None,
@@ -104,8 +102,7 @@ parser.add_argument("--camera_extrinsic", type=str, default=None,
                     help="Path to a 4x4 .npy camera-in-armbase extrinsic (ROS optical). "
                          "Places the sim depth camera at this pose so the point cloud the "
                          "student trains on matches the real (deploy) camera. Omit to use "
-                         "the hardcoded default in visual_raycaster._build_camera_extrinsics, "
-                         "which is a 2026-05-20 calibration and is stale.")
+                         "the shipped calibration calib/camera_align/current.npy.")
 parser.add_argument("--ref_root", type=str, default=None,
                     help="Override robotool_batch retarget reference root (match the teacher's "
                          "training refs, so the teacher sees the obs distribution it was "
@@ -183,8 +180,6 @@ def main():
 
     if args_cli.side:
         env_cfg.hand_side = args_cli.side
-    if args_cli.cache:
-        env_cfg.grasp_cache_path = args_cli.cache
     if args_cli.data_idx:
         try:
             data_indices = json.loads(args_cli.data_idx)
@@ -433,7 +428,7 @@ def main():
     print("[DAggerPC] DIMENSION SUMMARY")
     print("=" * 72)
     print(f"  teacher  obs_dim = {obs_dim}")
-    print(f"  student  proprio = {obs_dim}  + PC feature ({dagger_cfg.pc_output_dim})")
+    print(f"  student  proprio = {dagger_cfg.proprio_dim}  + PC feature ({dagger_cfg.pc_output_dim})")
     print(f"  fusion strategy  = {dagger_cfg.pc_fusion_strategy}")
     print(f"  PC counts: scene={dagger_cfg.n_scene}  hand={dagger_cfg.n_hand}  "
           f"tactile={dagger_cfg.n_tactile}")

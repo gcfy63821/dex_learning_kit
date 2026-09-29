@@ -16,10 +16,10 @@ Why one-env-for-all: Isaac Lab simulation_app can only have ONE sim
 context per process; `gym.make` twice in the same script → RuntimeError.
 
 Usage:
-    python dexx/scripts/gym_style/record_expert_videos.py \\
-        --teacher_ckpt logs/external_teachers/poseobs_T0_best.pth \\
+    python scripts/record_videos.py \\
+        --teacher_ckpt checkpoints/teacher_poseobs_T0.pth \\
         --side right \\
-        --data_idx_list '["rt/0416_grasp/cube_small_2", "rt/0422_multi/peg_1"]' \\
+        --data_idx_list '["rt/0416_grasp/cube_small_2", "rt/0420_manip/squeegee_1"]' \\
         --num_envs 22 --max_steps 400 \\
         --out_dir logs/expert_rollout_videos \\
         --headless
@@ -47,7 +47,6 @@ parser.add_argument("--num_envs", type=int, default=None,
 parser.add_argument("--max_steps", type=int, default=400)
 parser.add_argument("--max_retries", type=int, default=2,
                     help="Reset + re-run if some demos got no success yet.")
-parser.add_argument("--cache", default=None)
 parser.add_argument("--out_dir", default="logs/expert_rollout_videos")
 parser.add_argument("--fps", type=int, default=15)
 parser.add_argument("--cam_height", type=int, default=480)
@@ -66,7 +65,8 @@ parser.add_argument("--save_per_env", action="store_true", default=False,
                     help="Save ONE video per env (instead of one per base demo). Useful when "
                          "data_idx_list contains explicit aug variants (e.g. `demo@0` + "
                          "`demo@0_dxn...`) and you want a separate video per variant.")
-parser.add_argument("--save_fails", action="store_true", default=True)
+parser.add_argument("--save_fails", action=argparse.BooleanOptionalAction, default=True,
+                    help="Also save failed rollouts (--no-save_fails to skip them).")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--snapshot_frames", type=int, default=0,
                     help="If > 0, also save N evenly-spaced PNG snapshots from each "
@@ -108,7 +108,7 @@ import gymnasium as gym
 
 import dexx.tasks.franka_sharpa  # noqa: F401
 
-from dexx.algo.ppo.ppo import PPO  # noqa: F401  used via eval()
+from dexx.algo.ppo.ppo import PPO
 from dexx.wrapper.sharpa_wave_deploy_env_wrapper import GymStyleEnvWrapper
 from dexx.wrapper.config_wrapper import ConfigWrapper
 
@@ -251,9 +251,8 @@ def _build_camera_params(cam_pos: tuple, cam_target: tuple, focal_length: float,
     cy = height / 2.0
     # Camera frame (ROS optical: x-right, y-down, z-forward toward scene).
     # World up = +z. Image-right = world_up × fwd (i.e. +y for a camera looking
-    # along +x with head up in +z). Image-down = right × fwd. The earlier
-    # `cross(fwd, world_up)` ordering put image-right and image-down BOTH
-    # inverted → fingertips projected to negative pixel coords.
+    # along +x with head up in +z). Image-down = right × fwd. The reverse
+    # `cross(fwd, world_up)` ordering would invert both image axes.
     fwd = cam_tgt_ - cam_pos_
     fwd = fwd / (np.linalg.norm(fwd) + 1e-12)
     world_up = np.array([0.0, 0.0, 1.0])
@@ -383,7 +382,7 @@ def main():
     if hasattr(env_cfg, "init_curriculum_enabled"):
         env_cfg.init_curriculum_enabled = False
     for k in ("randomize_mass", "randomize_friction", "randomize_pd_gains",
-              "randomize_object_com", "reset_random_quat"):
+              "randomize_com"):
         if hasattr(env_cfg, k):
             setattr(env_cfg, k, False)
     if args.eval_no_terminate and hasattr(env_cfg, "eval_no_terminate"):
@@ -459,7 +458,12 @@ def main():
 
     config = ConfigWrapper(agent_cfg, env_cfg, test=True)
     log_dir = os.path.join(args.out_dir, "_log")
-    AgentCls = eval(agent_cfg.get("algo", "PPO"))
+    _agents = {"PPO": PPO}
+    _algo = agent_cfg.get("algo", "PPO")
+    if _algo not in _agents:
+        raise SystemExit(f"unsupported algo {_algo!r} in the agent cfg; "
+                         f"this release ships only {sorted(_agents)}")
+    AgentCls = _agents[_algo]
     agent = AgentCls(env_raw, output_dir=log_dir, full_config=config, create_output_dir=False)
     print(f"[ExpertVideo] loading teacher: {args.teacher_ckpt}")
 
@@ -653,7 +657,7 @@ def main():
                             per_base_saved_count[base] += 1
                             break
         else:
-            # Original: one video per base demo (collapse aug variants)
+            # Default: one video per base demo (collapse aug variants)
             for demo in data_idx_list:
                 if demo in base_succ_video_saved:
                     continue

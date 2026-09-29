@@ -1,10 +1,8 @@
 from .base import DexHand
 from .factory import register_dexhand
-from abc import ABC, abstractmethod
+from abc import ABC
 import numpy as np
-# from dexx.utils.math import aa_to_rotmat
 from dexx.tasks.hand_imitation.dataset.transform import aa_to_rotmat
-import torch
 
 class Sharpa(DexHand, ABC):
     def __init__(self):
@@ -82,29 +80,6 @@ class Sharpa(DexHand, ABC):
             "pinky_PIP",
             "pinky_DIP",
         ]
-        # self.hand2dex_mapping = { # old working
-        #     "wrist": ["hand_C_MC"],
-        #     "thumb_proximal": ["thumb_CMC_VL", "thumb_MC"],  # one-to-many mapping
-        #     "thumb_intermediate": ["thumb_MCP_VL", "thumb_PP"],
-        #     "thumb_distal": ["thumb_DP"],
-        #     "thumb_tip": ["thumb_elastomer", "thumb_fingertip"],
-        #     "index_proximal": ["index_MCP_VL", "index_PP"],
-        #     "index_intermediate": ["index_MP"],
-        #     "index_distal": ["index_elastomer","index_DP"],
-        #     "index_tip": ["index_fingertip"],
-        #     "middle_proximal": ["middle_MCP_VL", "middle_PP"],
-        #     "middle_intermediate": ["middle_MP"],
-        #     "middle_distal": ["middle_elastomer","middle_DP"],
-        #     "middle_tip": [ "middle_fingertip"],
-        #     "ring_proximal": ["ring_MCP_VL", "ring_PP"],
-        #     "ring_intermediate": ["ring_MP"],
-        #     "ring_distal": ["ring_elastomer", "ring_DP"],
-        #     "ring_tip": ["ring_fingertip"],
-        #     "pinky_proximal": ["pinky_MC", "pinky_MCP_VL", "pinky_PP"],
-        #     "pinky_intermediate": ["pinky_MP"],
-        #     "pinky_distal": ["pinky_elastomer", "pinky_DP"],
-        #     "pinky_tip": ["pinky_fingertip"],
-        # }
         self.hand2dex_mapping = {
             "wrist": ["hand_C_MC"],
             "thumb_proximal": ["thumb_CMC_VL", "thumb_MC"],  # one-to-many mapping
@@ -259,8 +234,8 @@ class Sharpa(DexHand, ABC):
         }
 
         # Same content as `weight_idx` but addressed by BODY NAME (unprefixed —
-        # the env resolver tacks on `{hand_side}_` per side). Source of truth
-        # going forward; the env builds `self.dexhand_weight_idx` by resolving
+        # the env resolver tacks on `{hand_side}_` per side). Source of truth;
+        # the env builds `self.dexhand_weight_idx` by resolving
         # these against the actual `hand_body_names` order PhysX gives. Keeps
         # rewards robust to URDF / USD parse-order changes and to left-hand vs
         # right-hand switches.
@@ -318,7 +293,6 @@ class SharpaRH(Sharpa):
         self.contact_body_names = ["right_" + name for name in self.contact_body_names]
         # Note: relative_rotation and relative_translation may need manual adjustment
         # self.relative_rotation = aa_to_rotmat(torch.tensor([np.pi / 2, 0, 0], device=self.device)) @ aa_to_rotmat(torch.tensor([0, -np.pi / 2, 0], device=self.device))
-        # # original
         self.relative_rotation = aa_to_rotmat(np.array([np.pi / 2, 0, 0])) @ aa_to_rotmat(np.array([0, -np.pi / 2, 0]))
         self.relative_translation = np.array([0.0, 0.0, 0.0])  # Adjust based on URDF wrist position
         # self.relative_translation = torch.tensor([0.0, 0.0, 0.0], device = device)

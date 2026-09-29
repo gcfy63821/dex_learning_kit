@@ -1,18 +1,17 @@
 """DAgger trainer for the point-cloud student.
 
-Parallel to `dagger_visual.py` (which targets the depth-CNN student). The
-buffer is much cheaper than the depth one — ~7-8 KB per transition vs
-~150 KB — so we can afford large replay sizes without choking RAM.
+The replay buffer is small — ~16 KB per transition — so we can afford large
+replay sizes without choking RAM.
 
 Storage layout (per transition, CPU):
     obs            : (proprio_dim,) fp32      ~1-2 KB
-    scene_pc       : (1024, 3) fp16           ~6 KB
+    scene_pc       : (1024, 3) fp32           ~12 KB
     scene_mask     : (1024,) bool             ~1 KB
-    hand_pc        : (11, 3) fp16              ~66 B
-    tactile_pc     : (25, 3) fp16              ~150 B
-    tactile_force  : (25, 1) fp16              ~50 B
+    hand_pc        : (11, 3) fp32              ~132 B
+    tactile_pc     : (25, 3) fp32              ~300 B
+    tactile_force  : (25, 1) fp32              ~100 B
     expert_action  : (act_dim,) fp32           ~120 B
-Total ≈ 8 KB → 200k transitions ≈ 1.6 GB. Cheap.
+Total ≈ 16 KB → 200k transitions ≈ 3.2 GB.
 """
 from __future__ import annotations
 
@@ -27,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from .pc_env_meta import load_checkpoint
 from .pointcloud_student import PointCloudStudent
 
 
@@ -91,12 +91,12 @@ class DAggerPointCloudConfig:
 
 
 # ----------------------------------------------------------------------------
-# Replay buffer (CPU, fp16 for PC tensors)
+# Replay buffer (CPU, fp32)
 # ----------------------------------------------------------------------------
 class PCReplayBuffer:
     """Fixed-size FIFO of (proprio, scene_pc, scene_mask, hand_pc, tactile_pc,
-    tactile_force, expert_action). Stored CPU-side; PC tensors as fp16 to
-    halve memory; loaded GPU-side per minibatch."""
+    tactile_force, expert_action). Stored CPU-side in fp32; loaded GPU-side
+    per minibatch."""
 
     def __init__(self, max_size: int):
         self.max_size = max_size
@@ -123,10 +123,9 @@ class PCReplayBuffer:
         expert_action: torch.Tensor,
         tactile_mask: torch.Tensor | None = None,
     ) -> None:
-        # Store as fp32 (the previous fp16 was a memory micro-optimization, but
-        # at scene-PC coordinates >1m the fp16 mantissa drops resolution to
-        # ~1mm, which degrades PointNet learning. Doubling RAM 1.6→3.2 GB at
-        # max_buffer=200k still fits comfortably on a 64 GB box).
+        # Store as fp32, not fp16: at scene-PC coordinates >1m the fp16
+        # mantissa drops resolution to ~1mm, which degrades PointNet learning.
+        # 3.2 GB at max_buffer=200k fits comfortably on a 64 GB box.
         obs_np = obs.detach().cpu().numpy().astype(np.float32)
         sc_pc = scene_pc.detach().to(torch.float32).cpu()
         sc_mask = scene_mask.detach().cpu()
@@ -168,8 +167,8 @@ class PCReplayBuffer:
 class DAggerPointCloud:
     """DAgger online distillation: state teacher → point-cloud student.
 
-    Same DAgger schedule as `DAggerVisual` (β-mix expert/student rollout,
-    MSE on expert actions, β-decay), but with the PC student.
+    Standard DAgger schedule (β-mix expert/student rollout, MSE on expert
+    actions, β-decay) with the point-cloud student.
     """
 
     def __init__(
@@ -228,7 +227,7 @@ class DAggerPointCloud:
         ).to(self.device)
 
         if student_ckpt_path is not None:
-            ckpt = torch.load(student_ckpt_path, map_location=self.device, weights_only=False)
+            ckpt = load_checkpoint(student_ckpt_path, map_location=self.device)
             sd = ckpt.get("model", ckpt)
             self.student.load_state_dict(sd)
             print(f"[DAggerPC] Loaded student from {student_ckpt_path}")
@@ -275,6 +274,8 @@ class DAggerPointCloud:
         env = self.env
         n_steps = 0
         n_added = 0
+        n_success = 0.0
+        n_episodes = 0.0
 
         obs_dict = env.reset()
         if isinstance(obs_dict, tuple):
@@ -327,12 +328,29 @@ class DAggerPointCloud:
 
             result = env.step(action)
             if len(result) == 5:
-                obs_dict, _, _, _, _ = result
+                obs_dict, _, terminated, truncated, extras = result
+                done = terminated | truncated
             else:
-                obs_dict, _, _, _ = result
+                obs_dict, _, done, extras = result
             n_steps += proprio.shape[0]
 
-        return {"steps": n_steps, "buffer_size": len(self.buffer), "added": n_added}
+            # Episode success rate of the ROLLOUT policy, over the episodes that
+            # END inside this rollout. The env flags success on the step an
+            # episode ends (reached the demo's end without a failure). Each
+            # rollout starts from reset and lasts rollout_steps_per_iter /
+            # num_envs steps per env, usually far shorter than an episode, so it
+            # only counts episodes short enough to end inside that window, which
+            # skews toward early terminations. It is a trend signal, not a
+            # success rate: even a strong teacher (iteration 1, beta = 1) reads
+            # far lower here than in eval_teacher.py. Use eval.py for students.
+            if isinstance(extras, dict) and "succeeded_per_env" in extras:
+                done = done.bool()
+                n_success += float(extras["succeeded_per_env"][done].sum())
+                n_episodes += float(done.sum())
+
+        return {"steps": n_steps, "buffer_size": len(self.buffer), "added": n_added,
+                "rollout_succ": (n_success / n_episodes) if n_episodes else float("nan"),
+                "rollout_episodes": int(n_episodes)}
 
     # ------------------------------------------------------------------
     def train_student(self) -> dict:
@@ -427,6 +445,8 @@ class DAggerPointCloud:
                 f"β={self.beta:.3f} | "
                 f"loss={train_info['avg_loss']:.6f} | "
                 f"buffer={rollout_info['buffer_size']:,} | "
+                f"roll_succ={rollout_info['rollout_succ']:.3f} "
+                f"(n={rollout_info['rollout_episodes']}) | "
                 f"{dt:.1f}s"
             )
             self.save(os.path.join(self.cfg.out_dir, f"dagger_iter_{it:02d}.pth"))

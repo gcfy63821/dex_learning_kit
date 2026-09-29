@@ -4,8 +4,8 @@
 
 """Deploy environment for force (proprio + tactile) policy on real hardware.
 
-Based on the proven proprio_deploy_env architecture with all fixes applied:
-- Correct joint ordering (hand_joint_indices, no dof_isaaclab2sharpa)
+Hardware handling:
+- Correct joint ordering (hand_joint_indices; see docs/JOINT_ORDERING.md)
 - Arm slow interpolation approach (prevents power_limit_violation)
 - Emergency stop
 - Proper namespace (empty)
@@ -32,13 +32,6 @@ import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-# ROS2 imports
-import rclpy
-
-# Add SharpaWaveSDK python folder to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../../../Sharpa/SharpaWaveSDK/python'))
-from sharpa import SharpaWaveManager, ControlMode, ControlSource
-
 from .sim2real.real_hand_limits import clamp_to_real_limits_np
 
 if TYPE_CHECKING:
@@ -49,10 +42,8 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 import isaaclab.sim as sim_utils
 
 from .franka_sharpa_force_env import FrankaSharpaForceEnv
-from dexx.tasks.hand_imitation.deploy import (
-    ROS2ObservationSubscriber,
-    ROS2ActionPublisher,
-)
+from dexx.tasks.hand_imitation.deploy.polymetis_arm_client import PolymetisArmClient
+from dexx.deploy_config import import_sharpa_sdk
 
 
 class HandSDKWorker:
@@ -60,8 +51,8 @@ class HandSDKWorker:
 
     Why: real_hand.set_joint_position / get_states are blocking LTC requests
     that take ~5–35ms each (latency rises with motor load). Calling them
-    inline inside the env step pinned the deploy loop at ~7.5Hz once motors
-    started moving. This worker decouples them:
+    inline inside the env step would cap the deploy loop far below 30Hz once
+    motors are moving. This worker decouples them:
 
     * set_target(target): non-blocking, latest-write-wins (older pending
       target is overwritten — we never want a stale command queued behind
@@ -79,6 +70,9 @@ class HandSDKWorker:
         self._logger = logger
         self._pending_target = None
         self._cached_angles = None
+        self._last_state_time = None  # time.monotonic() of the newest get_states()
+        self._enabled_at = 0.0        # time.monotonic() when polling last started
+        self._warned = {}             # call -> (time of last warning, suppressed count)
         self._lock = threading.Lock()
         self._target_event = threading.Event()
         self._stop = False
@@ -97,6 +91,9 @@ class HandSDKWorker:
         self._enabled = bool(enabled)
         if self._enabled:
             with self._lock:
+                # Age is measured from when polling (re)starts, not from the last
+                # read before a pause at the reset prompt.
+                self._enabled_at = time.monotonic()
                 self._dropped_targets = 0
                 self._target_count = 0
                 self._state_count = 0
@@ -116,6 +113,15 @@ class HandSDKWorker:
         with self._lock:
             return None if self._cached_angles is None else self._cached_angles.copy()
 
+    def state_age(self) -> float:
+        """Seconds since the newest successful get_states() or since polling
+        started, whichever is later (inf before the first read)."""
+        with self._lock:
+            last, since = self._last_state_time, self._enabled_at
+        if last is None:
+            return float("inf")
+        return time.monotonic() - max(last, since)
+
     def stats(self):
         with self._lock:
             return {
@@ -123,6 +129,19 @@ class HandSDKWorker:
                 'states_read':  self._state_count,
                 'dropped':      self._dropped_targets,
             }
+
+    def _warn(self, call: str, exc: Exception):
+        """At most one line per call per second: this loop runs at 200 Hz."""
+        if self._logger is None:
+            return
+        now = time.monotonic()
+        last, n = self._warned.get(call, (0.0, 0))
+        if now - last >= 1.0:
+            extra = f' (+{n} more in the last second)' if n else ''
+            self._logger.warn(f'[HandSDK] {call} failed: {exc}{extra}')
+            self._warned[call] = (now, 0)
+        else:
+            self._warned[call] = (last, n + 1)
 
     def shutdown(self):
         self._stop = True
@@ -147,13 +166,11 @@ class HandSDKWorker:
                     with self._lock:
                         self._target_count += 1
                 except Exception as e:
-                    if self._logger is not None:
-                        self._logger.warn(f'[HandSDK] set_joint_position failed: {e}')
+                    self._warn('set_joint_position', e)
 
             # 2. Refresh cached state at a bounded rate. Without throttling
-            # this loop hammered get_states() at MHz rate, starving the SDK's
-            # internal locks and hanging set_joint_position (env.step blocked
-            # for seconds).
+            # this loop would hammer get_states() at MHz rate, starving the
+            # SDK's internal locks and hanging set_joint_position.
             now = time.perf_counter()
             if self._enabled and now >= next_state_deadline:
                 try:
@@ -161,10 +178,10 @@ class HandSDKWorker:
                     angles = np.array(s.angles, dtype=np.float32)
                     with self._lock:
                         self._cached_angles = angles
+                        self._last_state_time = time.monotonic()
                         self._state_count += 1
                 except Exception as e:
-                    if self._logger is not None:
-                        self._logger.warn(f'[HandSDK] get_states failed: {e}')
+                    self._warn('get_states', e)
                 # Re-anchor schedule on "now" so a slow get_states call doesn't
                 # cause a burst of catch-up polls.
                 next_state_deadline = now + self._state_poll_period
@@ -189,65 +206,81 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
     """
     cfg: "FrankaSharpaEnvCfg"
 
-    def __init__(self, cfg: "FrankaSharpaEnvCfg", render_mode: str | None = None,
-                 ros2_namespace: str = '', **kwargs):
-        # Initialize ROS2
-        if not rclpy.ok():
-            rclpy.init()
-
-        self.ros2_namespace = ros2_namespace
-        self.ros2_obs_subscriber = ROS2ObservationSubscriber(namespace=self.ros2_namespace)
-        self.ros2_action_publisher = ROS2ActionPublisher()
-
-        # Spin ROS2 in background
-        import threading
-        self.ros2_executor = rclpy.executors.SingleThreadedExecutor()
-        self.ros2_executor.add_node(self.ros2_obs_subscriber)
-        self.ros2_executor.add_node(self.ros2_action_publisher)
-        self.ros2_thread = threading.Thread(target=self._spin_ros2, daemon=True)
-        self.ros2_thread.start()
-
+    def __init__(self, cfg: "FrankaSharpaEnvCfg", render_mode: str | None = None, **kwargs):
         self.cfg = cfg
         cfg.scene.num_envs = 1
 
-        # Wait for ROS2 data
-        self.get_logger().info('Waiting for ROS2 data...')
-        start_time = time.time()
-        while time.time() - start_time < 10.0:
-            if self.ros2_obs_subscriber.arm_data_received and self.ros2_obs_subscriber.wrist_data_received:
-                break
-            time.sleep(0.1)
-        if not (self.ros2_obs_subscriber.arm_data_received and self.ros2_obs_subscriber.wrist_data_received):
-            self.get_logger().warn('ROS2 data not fully received within timeout')
+        # Arm: Polymetis via the NUC joint bridge (ZMQ), or ROS2 (experimental).
+        # Both clients expose the same interface and raise if no arm state
+        # arrives, so everything below starts from real data.
+        backend = getattr(cfg, "arm_backend", "polymetis")
+        if backend == "polymetis":
+            self.arm_client = PolymetisArmClient(
+                ip_address=cfg.polymetis_server_ip,
+                state_port=int(cfg.polymetis_state_port),
+                cmd_port=int(cfg.polymetis_cmd_port),
+                kq=cfg.polymetis_kq,
+                kqd=cfg.polymetis_kqd,
+                side=cfg.hand_side,
+            )
+            self._arm_hint = "Check polymetis_joint_bridge.py on the NUC and the wired link."
+            self.get_logger().info(
+                f'arm backend = Polymetis @ {cfg.polymetis_server_ip}:'
+                f'{cfg.polymetis_state_port}/{cfg.polymetis_cmd_port}'
+            )
+        elif backend == "ros2":
+            from dexx.tasks.hand_imitation.deploy.ros2_arm_client import Ros2ArmClient
+            self.arm_client = Ros2ArmClient(namespace=cfg.ros2_namespace)
+            ns = cfg.ros2_namespace.rstrip("/")
+            self._arm_hint = (f"Check the robot-side controller, wrist_state_publisher.py and "
+                              f"`ros2 topic hz {ns}/joint_states {ns}/franka_wrist_state`.")
+            self.get_logger().info(
+                f'arm backend = ROS2 (namespace {cfg.ros2_namespace!r}: /joint_states + '
+                f'/franka_wrist_state -> /teleop_joint_commands)'
+            )
+        else:
+            raise ValueError(f"cfg.arm_backend must be 'polymetis' or 'ros2', got {backend!r}")
 
         # Initialize real hand
         self.real_hand = None
-        self._init_real_hand()
+        try:
+            self._init_real_hand()
+        except Exception:
+            # The arm is already engaged; do not leave its client running.
+            self.arm_client.shutdown()
+            raise
 
         # Worker thread that owns the (blocking) Sharpa LTC SDK calls. Decouples
         # the env step rate from SDK round-trip latency, which spikes from ~5ms
-        # at idle to ~30ms+ once motors are loaded — that spike was pinning the
-        # deploy loop at ~7.5Hz despite policy/sim being fast. The worker accepts
+        # at idle to ~30ms+ once motors are loaded — enough to cap the deploy
+        # loop far below 30Hz if called inline. The worker accepts
         # latest-target-wins writes (newest write supersedes any pending one) and
         # continuously polls hand state into a cached numpy array readable by
         # the env without blocking. Disabled (=None) until rollout starts; reset
         # phase keeps using direct sync calls so move-to-init can still wait.
-        # NOTE: don't pass a ROS2 logger across threads — rclpy loggers aren't
-        # safe from non-rclpy threads. Worker stays silent on errors; the main
-        # thread surfaces them via _hand_io.stats() in the periodic STATE log.
-        self._hand_io = HandSDKWorker(self.real_hand)
+        # The client's logging.Logger is thread-safe, so SDK errors inside the
+        # worker are logged; persistent failures also age out its state and
+        # trip the stale-sensor e-stop.
+        self._hand_io = HandSDKWorker(self.real_hand, logger=self.get_logger())
 
-        super().__init__(cfg, render_mode, **kwargs)
+        try:
+            super().__init__(cfg, render_mode, **kwargs)
+        except BaseException:
+            # The arm and hand are already connected; do not leave them running.
+            for stop in (self._hand_io.shutdown, self.arm_client.shutdown):
+                try:
+                    stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
 
         # Deploy doesn't need 4-substep PhysX: real_hand / real_arm are commanded
-        # via SDK / ROS2 (not simulated), and observations only need a one-shot
+        # via SDK / Polymetis (not simulated), and observations only need a one-shot
         # FK refresh from articulation state. Inherited DirectRLEnv.step loops
         # decimation × {sim.step, scene.update, _apply_action} which cost ~30+ ms
         # per env step at num_envs=1 with the full Franka+Sharpa+Object scene.
         # Action-delay buffer counts env steps (not substeps) so the trained
         # 2-step delay still represents ~67 ms at 30 Hz regardless of decimation.
-        # Reference: dexx/tasks/inhand_rotate/sharpa_wave_deploy_env.py
-        # which doesn't run sim physics at all in step().
         self.cfg.decimation = 1
         self._is_deploy_env = True  # skip observation noise and contact randomization
         self.wait_reset_object = True
@@ -265,10 +298,10 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         # Tactile UV mapping: taxel (u, v) -> 3D contact position on the pad.
         #
-        # These maps are a per-hand CALIBRATION and are not shipped: the only set
-        # that ever existed is for the previous-generation Sharpa HA4 hand, whose
-        # meshes carry confidential markings. There is no Sharpa Wave equivalent
-        # yet. Rather than fail at construction (which made the whole deploy path
+        # These maps are a per-hand CALIBRATION and are not shipped: the only
+        # existing set is for the Sharpa HA4 hand, whose meshes carry
+        # confidential markings. There is no Sharpa Wave equivalent yet. Rather
+        # than fail at construction (which would make the whole deploy path
         # unimportable), degrade: contact POSITION is disabled and contact FORCE
         # still works. Point DEXX_TACTILE_MAP_DIR at a directory holding
         # tactileSensor_map_{4F,TH}_point.npy to enable it.
@@ -303,16 +336,38 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                 f'  Debug recording enabled: first {self.debug_record_steps} steps to {self.debug_record_dir}'
             )
 
-    # ---- ROS2 / hardware helpers ----
+    # ---- Hardware helpers ----
 
     def get_logger(self):
-        return self.ros2_obs_subscriber.get_logger()
+        return self.arm_client.get_logger()
 
-    def _spin_ros2(self):
+    def _sensor_ages(self) -> dict:
+        """Seconds since each live input last updated. The hand is only polled
+        by the worker during a rollout; reset reads it synchronously."""
+        ages = {"arm": self.arm_client.state_age()}
+        if self._hand_io.is_enabled():
+            ages["hand"] = self._hand_io.state_age()
+        return ages
+
+    def _stale_sensors(self) -> dict:
+        limit = float(getattr(self.cfg, "deploy_max_sensor_age_s", 0.25))
+        return {k: a for k, a in self._sensor_ages().items() if a > limit}
+
+    def close(self):
+        """Stop the hand worker, release the arm (its controller holds position)
+        and give the terminal back its echo."""
         try:
-            self.ros2_executor.spin()
-        except Exception as e:
-            self.get_logger().error(f'Error in ROS2 executor: {e}')
+            self._restore_terminal()
+        except Exception:  # noqa: BLE001
+            pass
+        for fn in (getattr(getattr(self, "_hand_io", None), "shutdown", None),
+                   getattr(getattr(self, "arm_client", None), "shutdown", None)):
+            try:
+                if fn is not None:
+                    fn()
+            except Exception as e:  # noqa: BLE001
+                print(f"[deploy] shutdown error: {e}")
+        return super().close()
 
     def _init_real_hand(self):
         self.real_hand = self._auto_detect_hand()
@@ -375,11 +430,15 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
     def _auto_detect_hand(self):
         self.get_logger().info("Searching for devices...")
         try:
-            manager = SharpaWaveManager.get_instance()
+            manager = import_sharpa_sdk().SharpaWaveManager.get_instance()
             time.sleep(1)
+            deadline = time.time() + float(getattr(self.cfg, "deploy_hand_detect_timeout_s", 30.0))
             while True:
                 devices = manager.get_all_device_sn()
                 if not devices:
+                    if time.time() > deadline:
+                        self.get_logger().error("No Sharpa device found before the timeout")
+                        return None
                     self.get_logger().warn("No available devices found")
                     time.sleep(1)
                     continue
@@ -390,7 +449,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             return None
 
     def _initialize_hand(self):
-        err = self.real_hand.set_control_mode(ControlMode.POSITION)
+        err = self.real_hand.set_control_mode(import_sharpa_sdk().ControlMode.POSITION)
         if err.code != 0:
             return False
         err = self.real_hand.set_speed_coeff(0.1)
@@ -399,17 +458,12 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         err = self.real_hand.set_current_coeff(self.cfg.current_coef)
         if err.code != 0:
             return False
-        err = self.real_hand.set_control_source(ControlSource.SDK)
+        err = self.real_hand.set_control_source(import_sharpa_sdk().ControlSource.SDK)
         if err.code != 0:
             return False
         return True
 
     # ---- Keyboard helpers ----
-
-    def _wait_for_keyboard_input(self):
-        if select.select([sys.stdin], [], [], 0)[0]:
-            return sys.stdin.read(1)
-        return None
 
     def _setup_terminal_for_input(self):
         if self.old_terminal_settings is None:
@@ -422,8 +476,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             self.old_terminal_settings = None
 
     def _check_keyboard_command(self) -> str | None:
-        import select as _select
-        if _select.select([sys.stdin], [], [], 0)[0]:
+        if select.select([sys.stdin], [], [], 0)[0]:
             key = sys.stdin.read(1)
             if key == 'r':
                 return "reset"
@@ -519,10 +572,9 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             prev_io = getattr(self, '_debug_prev_io_stats', {'targets_sent': 0, 'states_read': 0, 'dropped': 0})
             self._debug_prev_io_stats = io_stats
 
-            wrist_msgs = int(getattr(self.ros2_obs_subscriber, 'wrist_msg_count', 0))
+            wrist_msgs = int(self.arm_client.wrist_msg_count)
             prev_wrist = getattr(self, '_debug_prev_wrist_msg_count', wrist_msgs)
             self._debug_prev_wrist_msg_count = wrist_msgs
-            wrist_src_active = bool(getattr(self.ros2_obs_subscriber, 'wrist_state_topic_active', False))
 
             # E-stop limits for offline analysis (so we don't have to look up
             # the cfg defaults when reviewing a run).
@@ -561,9 +613,8 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                 "obs_policy": obs_policy,
                 "obs_priv_info": obs_priv,
                 "obs_proprio_hist": obs_hist.reshape(-1),
-                # ---- Diagnostics for sim2real debugging (added for the deploy
-                # bug-hunt around 2026-04-28). All are per-step deltas / latest
-                # snapshots so a single npz tells the full story without the log.
+                # ---- Diagnostics for sim2real debugging. All are per-step
+                # deltas / latest snapshots so a single npz tells the full story without the log.
                 "dt_step": np.array([dt_step], dtype=np.float32),
                 "loop_hz": np.array([1.0 / dt_step if dt_step > 1e-6 else 0.0], dtype=np.float32),
                 "hand_io_targets_sent_step": np.array([io_stats['targets_sent'] - prev_io['targets_sent']], dtype=np.int32),
@@ -575,7 +626,6 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                 "hand_io_enabled":  np.array([1 if self._hand_io.is_enabled() else 0], dtype=np.int32),
                 "wrist_msg_step":   np.array([wrist_msgs - prev_wrist], dtype=np.int32),
                 "wrist_msg_total":  np.array([wrist_msgs], dtype=np.int32),
-                "wrist_src_active": np.array([1 if wrist_src_active else 0], dtype=np.int32),
                 "estop_limits": estop,  # [arm_vel, arm_delta, hand_delta]
                 "decim_substeps": np.array([int(self.cfg.decimation)], dtype=np.int32),
                 "control_freq":   np.array([float(self.cfg.control_freq)], dtype=np.float32),
@@ -620,8 +670,24 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         self.aux_present_mask_list = []
 
         self.hand = Articulation(self.cfg.robot_cfg)
-        if hasattr(self, '_env0_obj_urdf'):
-            self.cfg.object_cfg.spawn.asset_path = self._env0_obj_urdf
+        if getattr(self, '_env0_obj_urdf', None):
+            # Branch on asset type, as the training env does: robotool objects
+            # prefer a hand-authored tool.usd, which must spawn via UsdFileCfg.
+            # Setting it as asset_path on the default UrdfFileCfg yields a prim
+            # without RigidBodyAPI ("Failed to find a rigid body ... /object").
+            _ext = os.path.splitext(self._env0_obj_urdf)[1].lower()
+            if _ext in (".usd", ".usda", ".usdc"):
+                _orig = self.cfg.object_cfg.spawn
+                self.cfg.object_cfg.spawn = sim_utils.UsdFileCfg(
+                    usd_path=self._env0_obj_urdf,
+                    rigid_props=getattr(_orig, "rigid_props", None),
+                    collision_props=getattr(_orig, "collision_props", None),
+                    mass_props=getattr(_orig, "mass_props", None),
+                )
+                self.get_logger().info(f'[deploy] object asset = USD: {self._env0_obj_urdf}')
+            else:
+                self.cfg.object_cfg.spawn.asset_path = self._env0_obj_urdf
+                self.get_logger().info(f'[deploy] object asset = URDF: {self._env0_obj_urdf}')
         self.object = RigidObject(self.cfg.object_cfg)
         self.table = RigidObject(self.cfg.table_cfg)
 
@@ -721,8 +787,8 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         full_joints = torch.zeros(self.hand.num_joints, device=self.device)
         full_joints[self.hand_joint_indices] = hand_angles_sharpa
-        arm_pos_ros2 = self.ros2_obs_subscriber.arm_joint_positions.to(self.device)
-        full_joints[self.arm_joint_indices] = arm_pos_ros2
+        arm_pos_real = self.arm_client.arm_joint_positions.to(self.device)
+        full_joints[self.arm_joint_indices] = arm_pos_real
 
         # Write to sim for FK
         full_joints_batch = full_joints.unsqueeze(0)
@@ -732,60 +798,47 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         )
 
         self.hand_dof_pos = full_joints[self.actuated_dof_indices].unsqueeze(0)
-        self.arm_joint_pos = arm_pos_ros2.unsqueeze(0)
+        self.arm_joint_pos = arm_pos_real.unsqueeze(0)
 
-        # Real wrist state from ROS2, with calibration offsets for EE frame mismatch.
-        # Root cause: sim uses right_hand_C_MC (Sharpa base) as EE; ROS2 publishes fr3_hand/EE.
-        # Calibrate via Exp 0 (compare_obs.py --frame 10), then set in cfg.
-        ros2_pos  = self.ros2_obs_subscriber.wrist_position.to(self.device)
-        ros2_quat = self.ros2_obs_subscriber.wrist_quaternion.to(self.device)  # [w,x,y,z]
+        # Real wrist state in sim's EE frame (right_hand_C_MC, the Sharpa base),
+        # in the arm-base frame: both arm clients compute it by FK of the
+        # measured joints on the sim URDF. cfg.wrist_pos_offset moves it to
+        # env-local; cfg.wrist_quat_offset stays identity.
+        wrist_pos, wrist_quat, wrist_lin_vel, wrist_ang_vel = self.arm_client.wrist_state()
+        arm_wrist_pos = wrist_pos.to(self.device)
+        arm_wrist_quat = wrist_quat.to(self.device)  # [w,x,y,z]
 
         pos_offset  = torch.tensor(self.cfg.wrist_pos_offset,  dtype=torch.float32, device=self.device)
         quat_offset = torch.tensor(self.cfg.wrist_quat_offset, dtype=torch.float32, device=self.device)
 
         # Apply position offset (pure translation in world frame)
-        self.base_pos = (ros2_pos + pos_offset).unsqueeze(0)
+        self.base_pos = (arm_wrist_pos + pos_offset).unsqueeze(0)
 
-        # Apply quaternion pre-rotation: R_corrected = R_offset ⊗ R_ros2
-        from isaaclab.utils.math import quat_mul
-        self.base_quat = quat_mul(quat_offset.unsqueeze(0), ros2_quat.unsqueeze(0))
+        # Apply quaternion pre-rotation: R_corrected = R_offset ⊗ R_arm
+        from isaaclab.utils.math import quat_apply, quat_mul
+        self.base_quat = quat_mul(quat_offset.unsqueeze(0), arm_wrist_quat.unsqueeze(0))
 
-        # Prefer velocities from Float32MultiArray /franka_wrist_state (1kHz from
-        # state broadcaster). When falling back to PoseStamped, that topic carries
-        # no velocities, so finite-diff base_pos/base_quat instead of leaving zeros.
-        if self.ros2_obs_subscriber.wrist_state_topic_active:
-            self.base_lin_vel = self.ros2_obs_subscriber.wrist_linear_velocity.unsqueeze(0).to(self.device)
-            self.base_ang_vel = self.ros2_obs_subscriber.wrist_angular_velocity.unsqueeze(0).to(self.device)
-        else:
-            dt_base = 1.0 / self.cfg.control_freq
-            if not hasattr(self, '_prev_base_pos_deploy'):
-                self._prev_base_pos_deploy = self.base_pos.clone()
-                self._prev_base_quat_deploy = self.base_quat.clone()
-                self.base_lin_vel = torch.zeros_like(self.base_pos)
-                self.base_ang_vel = torch.zeros_like(self.base_pos)
-            else:
-                self.base_lin_vel = (self.base_pos - self._prev_base_pos_deploy) / dt_base
-                from isaaclab.utils.math import quat_mul, quat_conjugate, axis_angle_from_quat
-                dq = quat_mul(self.base_quat, quat_conjugate(self._prev_base_quat_deploy))
-                self.base_ang_vel = axis_angle_from_quat(dq) / dt_base
-                self._prev_base_pos_deploy = self.base_pos.clone()
-                self._prev_base_quat_deploy = self.base_quat.clone()
+        # The constant pre-rotation maps the angular velocity by R_offset;
+        # translation leaves the linear velocity unchanged.
+        self.base_lin_vel = wrist_lin_vel.unsqueeze(0).to(self.device)
+        self.base_ang_vel = quat_apply(
+            quat_offset.unsqueeze(0),
+            wrist_ang_vel.unsqueeze(0).to(self.device),
+        )
 
         # Use actual elapsed wall-clock time (not nominal 1/control_freq) so a
-        # blocked/stalled step doesn't produce phantom huge velocities. When
-        # the env stalls for 200ms (e.g. a blocking SDK call), the arm has
-        # been physically tracking the previous target during that whole time
-        # — using dt=33ms underflates the denominator and yields ~6x inflated
-        # vel that trips the e-stop on a benign motion.
+        # stalled step (e.g. a blocking SDK call) does not produce phantom
+        # velocities: the arm keeps tracking the previous target during the
+        # stall, and dividing by the nominal period would inflate the velocity
+        # and trip the e-stop on a benign motion.
         now_t = time.perf_counter()
         nominal_dt = 1.0 / self.cfg.control_freq
         prev_t = getattr(self, '_prev_refresh_time', None)
         if prev_t is None:
             dt = nominal_dt
         else:
-            # Clamp to [0.5*nominal, 5*nominal] so single-frame jitter doesn't
-            # explode the FD either way; longer stalls fall back to actual dt
-            # to keep velocities physical.
+            # Floor at 0.5*nominal so single-frame jitter doesn't explode the
+            # FD; longer stalls use the actual dt to keep velocities physical.
             dt = max(nominal_dt * 0.5, now_t - prev_t)
         self._prev_refresh_time = now_t
 
@@ -816,8 +869,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             wrist = self.base_pos[0].cpu().numpy()
             hand_q = self.hand_dof_pos[0, :5].cpu().numpy()  # first 5 hand joints
             contact_str = ' '.join([f'{v:.2f}' for v in force_vals])
-            wrist_msgs = self.ros2_obs_subscriber.wrist_msg_count
-            wrist_src = 'F32MA' if self.ros2_obs_subscriber.wrist_state_topic_active else 'PoseStamped'
+            wrist_msgs = self.arm_client.wrist_msg_count
             wrist_delta = wrist_msgs - getattr(self, '_prev_wrist_msg_count', 0)
             self._prev_wrist_msg_count = wrist_msgs
             io_stats = self._hand_io.stats() if self._hand_io.is_enabled() else None
@@ -832,14 +884,12 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                 f'[STATE #{self._refresh_debug_count}] '
                 f'force=[{contact_str}] '
                 f'wrist=[{wrist[0]:.3f},{wrist[1]:.3f},{wrist[2]:.3f}] '
-                f'wrist_src={wrist_src} msgs/s={wrist_delta}{io_str} '
+                f'arm_msgs/s={wrist_delta}{io_str} '
                 f'hand_q0-4=[{" ".join(f"{v:.2f}" for v in hand_q)}]'
             )
             if wrist_delta == 0:
                 self.get_logger().error(
-                    'WRIST OBS STALE: no /franka_wrist_state nor '
-                    '/franka_robot_state_broadcaster/current_pose received in last 1s. '
-                    'Check ros2 topic list, namespace, and that the state broadcaster is running.'
+                    f'ARM STATE STALE: no arm state in the last 1s. {self._arm_hint}'
                 )
             # Print contact positions for fingers that have contact
             for i in range(5):
@@ -848,148 +898,6 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                     self.get_logger().info(
                         f'  finger[{i}] force={force_vals[i]:.3f} pos=[{p[0]:.4f},{p[1]:.4f},{p[2]:.4f}]'
                     )
-
-    # ---- Observations: override to use real tactile instead of sim contact sensors ----
-
-    def compute_observations(self):
-        """Compute observations using real tactile data instead of sim contact sensors.
-
-        Reuses the parent FrankaSharpaForceEnv's obs structure but replaces the
-        sim contact sensor section (lines 372-411) with real tactile data from
-        self.last_contacts and self._last_tactile_pos (set in _refresh_lab).
-        """
-        from dexx.tasks.hand_imitation.dataset.transform import aa_to_quat
-        from isaaclab.utils.math import quat_conjugate, quat_mul
-
-        self._refresh_lab()
-
-        # Proprioception observations (same as parent)
-        obs_values = []
-        q = self.hand_dof_pos
-        obs_values.append(q)
-        obs_values.append(torch.cos(q))
-        obs_values.append(torch.sin(q))
-        base_obs = torch.cat([torch.zeros_like(self.base_pos), self.base_quat, self.base_lin_vel, self.base_ang_vel], dim=-1)
-        obs_values.append(base_obs)
-        proprioception_obs = torch.cat(obs_values, dim=-1)
-
-        # Target observations (same as parent)
-        obs_future_length = self.obs_future_length
-        if self.loop_trajectory:
-            seq_len = self.demo_data["seq_len"]
-            cur_idx = (self._get_demo_idx() + 1) % seq_len
-            future_indices = torch.stack([(self._get_demo_idx() + 1 + t) % seq_len for t in range(obs_future_length)], dim=-1)
-        else:
-            cur_idx = self.progress_buf + 1
-            cur_idx = torch.clamp(cur_idx, torch.zeros_like(self.demo_data["seq_len"]), self.demo_data["seq_len"] - 1)
-            future_indices = torch.stack([cur_idx + t for t in range(obs_future_length)], dim=-1)
-        nE, nT = self.demo_data["wrist_pos"].shape[:2]
-        nF = obs_future_length
-
-        def indicing(data, idx):
-            assert data.shape[0] == nE and data.shape[1] == nT
-            remaining_shape = data.shape[2:]
-            expanded_idx = idx
-            for _ in remaining_shape:
-                expanded_idx = expanded_idx.unsqueeze(-1)
-            expanded_idx = expanded_idx.expand(-1, -1, *remaining_shape)
-            return torch.gather(data, 1, expanded_idx)
-
-        target_wrist_pos = indicing(self.demo_data["wrist_pos"], future_indices)
-        cur_wrist_pos = self.base_pos
-        delta_wrist_pos = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
-
-        target_wrist_vel = indicing(self.demo_data["wrist_velocity"], future_indices)
-        cur_wrist_vel = self.base_lin_vel
-        wrist_vel = target_wrist_vel.reshape(nE, -1)
-        delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
-
-        target_wrist_rot_raw = indicing(self.demo_data["wrist_rot"], future_indices)
-        if target_wrist_rot_raw.ndim > 3:
-            target_wrist_rot_raw = target_wrist_rot_raw[:, :, 0, :]
-        target_wrist_rot = target_wrist_rot_raw
-        target_wrist_quat = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))
-        delta_wrist_quat = quat_mul(
-            self.base_quat[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
-            quat_conjugate(target_wrist_quat),
-        ).reshape(nE, -1)
-        wrist_quat = target_wrist_quat.reshape(nE, -1)
-
-        target_wrist_ang_vel_raw = indicing(self.demo_data["wrist_angular_velocity"], future_indices)
-        if target_wrist_ang_vel_raw.ndim > 3:
-            target_wrist_ang_vel_raw = target_wrist_ang_vel_raw[:, :, 0, :]
-        target_wrist_ang_vel = target_wrist_ang_vel_raw
-        cur_wrist_ang_vel = self.base_ang_vel
-        wrist_ang_vel = target_wrist_ang_vel.reshape(nE, -1)
-        delta_wrist_ang_vel = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
-
-        target_joints_pos = indicing(self.demo_data["mano_joints"], future_indices).reshape(nE, nF, -1, 3)
-        cur_joint_pos = self.hand.data.body_pos_w[:, self.hand_body_indices[1:]] - self.scene.env_origins.unsqueeze(1)
-        delta_joints_pos = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
-
-        target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], future_indices).reshape(nE, nF, -1, 3)
-        cur_joint_vel = self.hand.data.body_lin_vel_w[:, self.hand_body_indices[1:]]
-        joints_vel = target_joints_vel.reshape(self.num_envs, -1)
-        delta_joints_vel = (target_joints_vel - cur_joint_vel[:, None]).reshape(self.num_envs, -1)
-
-        target_obs_list = [
-            delta_wrist_pos, wrist_vel, delta_wrist_vel,
-            wrist_quat, delta_wrist_quat, wrist_ang_vel, delta_wrist_ang_vel,
-            delta_joints_pos, joints_vel, delta_joints_vel,
-        ]
-
-        _asymmetric_ac = getattr(self.cfg, 'asymmetric_ac', False)
-        if hasattr(self, 'object') and self.object is not None and not _asymmetric_ac:
-            gt_tips_distance = indicing(self.demo_data["tips_distance"], future_indices).reshape(nE, -1)
-            target_obs_list.append(gt_tips_distance)
-
-        # BPS gated by cfg.enable_bps (mirror training env).
-        _include_bps = (self.obj_bps is not None
-                        and not _asymmetric_ac
-                        and getattr(self.cfg, 'enable_bps', True))
-        if _include_bps:
-            target_obs_list.append(self.obj_bps)
-
-        # ---- REAL TACTILE DATA (replaces sim contact sensor) ----
-        # self.last_contacts was set in _refresh_lab from get_tactile_info()
-        sensed_contacts = self.last_contacts.clone().reshape(nE, -1)
-        target_obs_list.append(sensed_contacts)
-
-        # self._last_tactile_pos was set in _refresh_lab from get_tactile_info()
-        contact_pos = self._last_tactile_pos.clone().reshape(nE, -1) if hasattr(self, '_last_tactile_pos') else torch.zeros(nE, 15, device=self.device)
-        target_obs_list.append(contact_pos)
-
-        # Combine
-        target_obs = torch.cat(target_obs_list, dim=-1)
-        obs_buf = torch.cat([proprioception_obs, target_obs], dim=-1)
-
-        # ProprioAdapt history buffer
-        obs_part_for_hist = obs_buf[:, :self.proprio_hist_dim]
-        prev_obs_buf = self.obs_buf_lag_history[:, 1:].clone()
-        cur_obs_buf = obs_part_for_hist.unsqueeze(1)
-        self.obs_buf_lag_history[:] = torch.cat([prev_obs_buf, cur_obs_buf], dim=1)
-
-        if self.cfg.prop_hist_len > 0:
-            self.proprio_hist_buf[:] = self.obs_buf_lag_history[:, -self.cfg.prop_hist_len:].clone()
-
-        at_reset_env_ids = self.at_reset_buf.nonzero(as_tuple=False).squeeze(-1)
-        if len(at_reset_env_ids) > 0:
-            reset_obs = obs_part_for_hist[at_reset_env_ids]
-            self.obs_buf_lag_history[at_reset_env_ids] = reset_obs.unsqueeze(1).repeat(1, self.obs_buf_lag_history.shape[1], 1)
-            self.proprio_hist_buf[at_reset_env_ids] = reset_obs.unsqueeze(1).repeat(1, self.cfg.prop_hist_len, 1)
-
-        # Privileged info (not used at deploy, but fill for compatibility)
-        dq = self.hand_dof_vel
-        self.priv_info_buf[:, :22] = dq
-        self.priv_info_buf[:, 27:40] = torch.cat([self.object_pos, self.object_rot, self.object_velocities], dim=-1)
-
-        if not hasattr(self, '_obs_dim_checked'):
-            actual_dim = obs_buf.shape[-1]
-            expected_dim = self.cfg.observation_space
-            print(f"[DEBUG] Deploy obs dimension: actual={actual_dim}, expected={expected_dim}, diff={actual_dim - expected_dim}")
-            self._obs_dim_checked = True
-
-        return obs_buf
 
     # ---- Rewards: not meaningful in deploy ----
 
@@ -1015,6 +923,24 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
     def _check_emergency_stop(self, arm_targets, hand_targets_sharpa):
         if not getattr(self.cfg, 'emergency_stop_enabled', True):
             return False
+        # The policy acts on its latest observation; if any input stopped
+        # updating it is acting blind, so stop before sending the command.
+        stale = self._stale_sensors()
+        if stale:
+            ages = ', '.join(f'{k}={v:.3f}s' for k, v in stale.items())
+            self.get_logger().error(
+                f'E-STOP: stale sensor data ({ages}) > '
+                f'deploy_max_sensor_age_s={getattr(self.cfg, "deploy_max_sensor_age_s", 0.25)}'
+            )
+            return True
+        # NaN compares False against every limit below and np.clip passes it
+        # through, so a non-finite target would reach the hardware unchecked.
+        arm_ok = bool(torch.isfinite(arm_targets).all())
+        hand_ok = bool(np.isfinite(np.asarray(hand_targets_sharpa, dtype=np.float64)).all())
+        if not (arm_ok and hand_ok):
+            self.get_logger().error(
+                f'E-STOP: non-finite target (arm finite={arm_ok}, hand finite={hand_ok})')
+            return True
         # DEBUG: track how many times we've run the check, so we can dump
         # per-joint breakdowns for the first few steps after reset.
         self._estop_check_count = int(getattr(self, '_estop_check_count', 0)) + 1
@@ -1068,18 +994,40 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
                     f'(joint_idx={max_idx}, target={hand_targets_sharpa[max_idx]:.4f}, current={hand_cur[max_idx]:.4f})'
                 )
                 return True
-        except Exception as e:
-            self.get_logger().warn(f'Failed to read hand states for e-stop check: {e}')
+        except Exception as e:  # noqa: BLE001
+            # Without a hand reading the delta check cannot run; acting blind
+            # is exactly what the e-stop is for.
+            self.get_logger().error(f'E-STOP: failed to read hand states for the e-stop check: {e}')
+            return True
         return False
 
     def _emergency_stop(self):
         self.get_logger().error('EMERGENCY STOP - holding current position')
+        stale = self._stale_sensors()
         # Disable async worker so hold-position takes effect immediately
         # (and isn't superseded by a stale pending target).
         self._hand_io.enable(False)
-        hand_states = self.real_hand.get_states()
-        self.real_hand.set_joint_position(list(hand_states.angles))
-        self.ros2_action_publisher.publish_arm_joint_pos(self.arm_joint_pos)
+        # Hand: hold at the measured angles; if the SDK is what failed, at the
+        # last reading we have.
+        try:
+            hold = list(self.real_hand.get_states().angles)
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f'E-STOP: hand get_states failed ({e}); holding last reading')
+            cached = getattr(self, '_cached_hand_angles_np', None)
+            hold = None if cached is None else cached.tolist()
+        if hold is not None:
+            try:
+                self.real_hand.set_joint_position(hold)
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().error(f'E-STOP: hand hold failed: {e}')
+        # Arm: hold at the measured pose — unless that measurement is what went
+        # stale. Then send nothing: the arm controller keeps tracking the last target,
+        # which already passed the checks above, rather than an outdated pose.
+        if "arm" in stale:
+            self.get_logger().error('E-STOP: arm state stale; not commanding the arm '
+                                    '(the arm controller holds its last target)')
+        else:
+            self.arm_client.publish_arm_joint_pos(self.arm_joint_pos)
         self.reset_buf[:] = 1
 
     # ---- Actions ----
@@ -1091,16 +1039,16 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         self._decim_substep = 0
 
         # First-step baseline refresh. Between _reset_idx (which seeds
-        # `arm_joint_pos_des_prev` from `franka_joint_pos` in base env line
-        # 2075, and `_prev_arm_targets_deploy` from cur_arm_pos here) and the
-        # very first env step, the arm continues impedance-settling toward
-        # target_arm_pos — observed drift ~0.23 rad on j5. That drift produces
-        # a fake `arm_delta` on ACTION #1 (base env's MA blends stale
+        # `arm_joint_pos_des_prev` from `franka_joint_pos` in the base env, and
+        # `_prev_arm_targets_deploy` from cur_arm_pos here) and the very first
+        # env step, the arm continues impedance-settling toward target_arm_pos
+        # (~0.2 rad on j5). That drift would produce a fake `arm_delta` on
+        # ACTION #1 (base env's MA blends stale
         # `arm_joint_pos_des_prev` with fresh `arm_joint_pos` → arm_des shifts
         # off measured pose; e-stop check then sees arm_des vs stale
         # `_prev_arm_targets_deploy` and reports big delta).
         #
-        # Fix: at the start of the FIRST `_pre_physics_step` after a reset,
+        # So at the start of the FIRST `_pre_physics_step` after a reset,
         # refresh the measured arm pose ONE FINAL TIME and snapshot it into
         # BOTH MA history slots, so super()'s MA blend has a consistent
         # baseline and the e-stop check sees a clean delta.
@@ -1180,7 +1128,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         self.hand.set_joint_position_target(all_joint_targets)
 
         # Decide whether this is the final decimation substep. Real-hand SDK,
-        # ROS2 publish, and emergency check all happen ONLY here. Real hand
+        # Polymetis command, and emergency check all happen ONLY here. Real hand
         # cannot react faster than the env control rate (30Hz), so issuing the
         # same target 4× per env step just multiplies LTC blocking latency
         # without any control benefit.
@@ -1191,8 +1139,8 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             return
 
         hand_targets_sharpa = all_joint_targets[0, self.hand_joint_indices].cpu().numpy()
-        # Clamp to real-hand reachable range (Sharpa HA4 physical limits, measured
-        # 2026-04-19). Avoids commanding motors to targets they cannot reach —
+        # Clamp to real-hand reachable range (physical limits measured on the
+        # Sharpa HA4 hand). Avoids commanding motors to targets they cannot reach —
         # which otherwise triggers limit_protection / overheat, and diverges sim vs real.
         hand_targets_sharpa = clamp_to_real_limits_np(hand_targets_sharpa)
         self._latest_hand_targets_sharpa = hand_targets_sharpa.copy()
@@ -1223,8 +1171,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         else:
             self.real_hand.set_joint_position(hand_targets_sharpa.tolist())
         self.prev_targets = self.cur_targets.clone()
-        self.ros2_action_publisher.publish_arm_joint_pos(self.arm_joint_pos_des)
-        self.ros2_action_publisher.publish_hand_joints(hand_targets_sharpa)
+        self.arm_client.publish_arm_joint_pos(self.arm_joint_pos_des)
 
         self._prev_arm_targets_deploy = self.arm_joint_pos_des.clone()
         self._prev_hand_targets_deploy = hand_targets_sharpa.copy()
@@ -1236,6 +1183,17 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         # control to ensure each interpolated target lands in order, and the
         # 2s settle-pause needs blocking confirmation.
         self._hand_io.enable(False)
+
+        # The ramps start from the measured arm pose; an outdated one would make
+        # the first target a jump. Wait briefly for fresh state, else refuse.
+        limit = float(getattr(self.cfg, "deploy_max_sensor_age_s", 0.25))
+        deadline = time.time() + 2.0
+        while self.arm_client.state_age() > limit and time.time() < deadline:
+            time.sleep(0.05)
+        if self.arm_client.state_age() > limit:
+            raise RuntimeError(
+                f"arm state is {self.arm_client.state_age():.1f}s old — not moving the arm. "
+                f"{self._arm_hint}")
 
         seq_idx = self.progress_buf[env_ids]
 
@@ -1269,6 +1227,8 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         # Arm: two-stage interpolation to avoid stabbing the table.
         #
+        # Either straight to the demo start, or (operator's choice, below) in
+        # two stages via home:
         # Stage A: current pose -> Franka FR3 factory home (q_ready) pose.
         #   q_ready = [0, -pi/4, 0, -3pi/4, 0, pi/2, pi/4] — same pose used by
         #   franka_ros2's "go home" service / desk app's home button. EE is
@@ -1286,7 +1246,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             [0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4],
             dtype=np.float32,
         )
-        start_arm_pos = self.ros2_obs_subscriber.arm_joint_positions.cpu().numpy()
+        start_arm_pos = self.arm_client.arm_joint_positions.cpu().numpy()
         home_arm_pos = FRANKA_FR3_HOME
         target_arm_pos = arm_joint_pos_np
 
@@ -1294,7 +1254,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             dist = float(np.abs(p_from - p_to).max())
             if dist < 1e-3:
                 self.get_logger().info(f'  Arm {label}: already at target (max_dist={dist:.4f}); skipping.')
-                self.ros2_action_publisher.publish_arm_joint_pos(p_to)
+                self.arm_client.publish_arm_joint_pos(p_to)
                 return
             approach_time = max(3.0, dist * 5.0)
             n_steps = int(approach_time * 30)
@@ -1304,18 +1264,33 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
             for i in range(n_steps):
                 alpha = (i + 1) / n_steps
                 interp = p_from * (1 - alpha) + p_to * alpha
-                self.ros2_action_publisher.publish_arm_joint_pos(interp)
+                self.arm_client.publish_arm_joint_pos(interp)
                 time.sleep(1.0 / 30.0)
 
-        _ramp_arm(start_arm_pos, home_arm_pos, label='-> home (lift)')
-        # Re-read actual pose after Stage A — real arm may not exactly match
-        # the last commanded interp (impedance lag), so Stage B starts from
-        # the true position to avoid a small jump at the seam.
-        try:
-            stage_b_start = self.ros2_obs_subscriber.arm_joint_positions.cpu().numpy()
-        except Exception:
-            stage_b_start = home_arm_pos
-        _ramp_arm(stage_b_start, target_arm_pos, label='-> demo start')
+        # Route choice. After a rollout the arm is already on the demo
+        # trajectory, so going straight to the next init frame is both faster
+        # and the normal case; the via-home detour exists for when the arm is
+        # somewhere awkward and a straight joint interpolation would sweep the
+        # hand across the table. That judgement is the operator's — they can
+        # see the arm, this code cannot.
+        # Ctrl+C here aborts the reset (propagates); only a closed stdin falls
+        # back to the configured route.
+        via_home = not bool(getattr(self.cfg, 'deploy_direct_init_move', True))
+        if bool(getattr(self.cfg, 'deploy_prompt_home_route', True)):
+            try:
+                ans = input('  Route via home first? [y/N] (Enter = direct): ').strip().lower()
+                via_home = ans.startswith('y')
+            except EOFError:
+                pass
+
+        if via_home:
+            _ramp_arm(start_arm_pos, home_arm_pos, label='-> home (lift)')
+            # Stage B starts from the measured pose: the arm lags the last
+            # commanded interp (impedance), so this avoids a jump at the seam.
+            stage_b_start = self.arm_client.arm_joint_positions.cpu().numpy()
+            _ramp_arm(stage_b_start, target_arm_pos, label='-> demo start')
+        else:
+            _ramp_arm(start_arm_pos, target_arm_pos, label='-> demo start (direct)')
         self.get_logger().info('  Arm at init pose.')
 
         self.real_hand.set_joint_position(hand_joint_pos_sharpa.tolist())
@@ -1328,19 +1303,19 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         # Reset finite-diff history so the first refresh after reset doesn't
         # produce a phantom velocity from the (large) jump in arm/hand state
-        # caused by reset itself. Without this, frame 0/5/10 reliably triggered
-        # e-stop with arm_vel >> 2 rad/s on the very first env step.
-        cur_arm_pos = self.ros2_obs_subscriber.arm_joint_positions.to(self.device).unsqueeze(0)
+        # caused by reset itself, which would trip the e-stop (arm_vel >> 2 rad/s)
+        # on the very first env step.
+        cur_arm_pos = self.arm_client.arm_joint_positions.to(self.device).unsqueeze(0)
         self._prev_arm_joint_pos_deploy = cur_arm_pos.clone()
 
         # Initialize e-stop prev targets to the MEASURED arm pose, NOT the
         # demo target_arm_pos. After ramp_arm, the real arm settles to
         # target_arm_pos ± impedance steady-state error (~0.1-0.2 rad on j5).
         # If we baseline e-stop on target_arm_pos, ACTION #1 shows a fake
-        # 0.18 rad arm_delta (60% of the 0.3 e-stop margin) even when
+        # ~0.18 rad arm_delta (60% of the 0.3 e-stop margin) even when
         # --action_ramp_steps fully suppresses policy contribution — because
         # the base env's MA smoother seeds arm_joint_pos_des from measured
-        # arm_joint_pos (line 2075 in franka_sharpa_env.py), not target.
+        # arm_joint_pos (_reset_idx in franka_sharpa_env.py), not target.
         # Using cur_arm_pos here aligns the baseline so first-step delta ≈ 0.
         # NOTE: cur_arm_pos here is still stale by the time the FIRST env step
         # runs (impedance keeps settling during the ~100ms+ between this read
@@ -1480,8 +1455,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
     def step(self, action: torch.Tensor):
         """Custom deploy step that bypasses DirectRLEnv.step.
 
-        Mirrors the pattern in inhand_rotate/sharpa_wave_deploy_env.py: real
-        arm/hand are commanded via SDK / ROS2, not simulated, so we do not
+        The real arm/hand are commanded via SDK / Polymetis, not simulated, so we do not
         need DirectRLEnv's full physics loop (decimation × {sim.step,
         scene.update, _apply_action} + event_manager + auto-reset wrapper).
         Sim is kept around only for articulation FK — body_pos_w drives the
@@ -1507,7 +1481,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         t1 = time.perf_counter()
 
         # 2. Push targets to sim articulation, send to real hardware. Real-side
-        # IO goes through the HandSDKWorker (non-blocking) and ROS2 publisher.
+        # IO goes through the HandSDKWorker (non-blocking) and the Polymetis client.
         self._apply_action()
         t2 = time.perf_counter()
 
@@ -1527,10 +1501,9 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         t4 = time.perf_counter()
 
         # 5. Episode bookkeeping. progress_buf / running_progress_buf are
-        # normally advanced by FrankaSharpaEnv.step (line 1786), which we
-        # bypass — so we MUST increment them manually here. Without this
-        # the demo target index stays frozen at start_frame for the entire
-        # rollout (observed: progress 50->50, 120->120). See compute_observations
+        # normally advanced by FrankaSharpaEnv.step, which we bypass — so we
+        # MUST increment them manually here. Without this the demo target index
+        # stays frozen at start_frame for the entire rollout. See compute_observations
         # which reads `cur_idx = self.progress_buf + 1` to pull the demo
         # target for the next frame.
         self.episode_length_buf += 1
@@ -1582,7 +1555,7 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
         t7 = time.perf_counter()
 
         # Per-stage timing (1/s). Buckets show exactly where the cycle time
-        # goes — if t4-t3 (sim.step FK) dominates, stage 2 is replacing it
+        # goes — if t4-t3 (sim.step FK) dominates, use V3, which replaces it
         # with a pytorch_kinematics FK call.
         if not hasattr(self, '_step_prof'):
             self._step_prof = {k: 0.0 for k in ('pre', 'apply', 'sync', 'fk',
@@ -1626,12 +1599,12 @@ class FrankaSharpaForceDeployEnvV2(FrankaSharpaForceEnv):
 
         Uses cached angles from the HandSDKWorker when available; falls back
         to a synchronous SDK read only on the first call. Arm comes from the
-        ROS2 /joint_states subscriber (already populated in _refresh_lab,
-        but read here directly to keep step() self-contained).
+        Polymetis client (already populated in _refresh_lab, but read here
+        directly to keep step() self-contained).
         """
-        # Arm joint pos from ROS2
+        # Arm joint pos from Polymetis
         try:
-            arm_pos = self.ros2_obs_subscriber.arm_joint_positions.to(
+            arm_pos = self.arm_client.arm_joint_positions.to(
                 self.device, dtype=torch.float32
             )
         except Exception:

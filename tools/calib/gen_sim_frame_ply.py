@@ -10,7 +10,6 @@ import argparse, pickle, numpy as np, trimesh, yourdfpy
 from dexx import deploy_config as _dcfg
 
 # The merged arm+hand URDF this release builds (scripts/build_merged_urdf.py).
-# The old path pointed at the HA4 hand, which this release no longer ships.
 URDF = "assets/generated/fr3_with_right_sharpa_wave.urdf"
 
 def main():

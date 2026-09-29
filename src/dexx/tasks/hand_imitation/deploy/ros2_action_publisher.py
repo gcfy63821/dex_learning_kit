@@ -47,8 +47,11 @@ class ROS2ActionPublisher(Node):
         'fr3_joint5', 'fr3_joint6', 'fr3_joint7',
     ]
 
-    def __init__(self):
+    def __init__(self, namespace: str = ''):
         super().__init__('franka_action_publisher')
+        # Same prefix as the state topics, so a namespaced robot is commanded
+        # on its own controller's topic.
+        self.command_topic = f"{namespace.rstrip('/')}/teleop_joint_commands"
 
         # BestEffort QoS to match teleop controller subscription
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
@@ -74,7 +77,7 @@ class ROS2ActionPublisher(Node):
         # Arm joint command: JointState on /teleop_joint_commands (matches TeleopJointImpedanceController)
         self.arm_joint_pos_pub = self.create_publisher(
             JointState,
-            '/teleop_joint_commands',
+            self.command_topic,
             qos_best_effort,
         )
 
@@ -87,7 +90,7 @@ class ROS2ActionPublisher(Node):
 
         self.get_logger().info('Franka action publisher initialized')
         self.get_logger().info('  Publishing to:')
-        self.get_logger().info('    - /teleop_joint_commands (sensor_msgs/JointState, BestEffort)')
+        self.get_logger().info(f'    - {self.command_topic} (sensor_msgs/JointState, BestEffort)')
         self.get_logger().info('    - hand_joint_positions (sensor_msgs/JointState)')
         self.get_logger().info('    - wrist_pose (geometry_msgs/PoseStamped)')
     

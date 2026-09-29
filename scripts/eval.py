@@ -1,17 +1,16 @@
 """Per-episode eval for a DAgger / PPO PointCloud student.
 
-Like `play_dagger_pc.py` (auto-detects DAgger PointCloudStudent vs PPO
+Like `play.py` (auto-detects DAgger PointCloudStudent vs PPO
 ActorCriticPointCloud from the ckpt) but records `end_final_dist`,
 `fail_causes`, `demo_idx` per episode and dumps `records.json` — the same
-schema as `eval_policy.py` — so strict3/strict2/strict5 funnel post-processing
-just works.
+record schema as `eval_teacher.py`.
 
 Usage:
-    python dexx/scripts/gym_style/eval_dagger_pc.py \
+    python scripts/eval.py \
         --task franka-sharpa-pointcloud \
-        --load_path logs/.../dagger_final.pth \
+        --load_path checkpoints/student_lean_v6_L1.pth \
         --side right --data_idx '[...]' \
-        --num_envs 128 --max_episodes 5000 --out_dir logs/eval_dagger_pc/<tag>
+        --num_envs 128 --max_episodes 8000 --out_dir logs/eval_dagger_pc/<tag>
 """
 import argparse
 import sys
@@ -26,9 +25,10 @@ parser.add_argument("--load_path", type=str, required=True)
 parser.add_argument("--side", type=str, default="right")
 parser.add_argument("--data_idx", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=128)
-parser.add_argument("--cache", type=str, default=None)
-parser.add_argument("--max_episodes", type=int, default=5000)
-parser.add_argument("--max_steps", type=int, default=12000)
+# Defaults are the reference evaluation protocol:
+# every retarget augmentation variant, first-to-finish, physics DR on.
+parser.add_argument("--max_episodes", type=int, default=8000)
+parser.add_argument("--max_steps", type=int, default=30000)
 parser.add_argument("--out_dir", type=str, required=True)
 parser.add_argument("--success_dist", type=float, default=0.05,
                     help="Closest-approach success threshold (min_final_dist<this). "
@@ -64,61 +64,41 @@ parser.add_argument("--no_tactile", action="store_true", default=None,
 parser.add_argument("--inject_jitter", type=float, default=None,
                     help="Override pc_jitter_std at eval time (e.g. 0.005 = 5mm).")
 parser.add_argument("--inject_dropout", type=float, default=None,
-                    help="Override pc_dropout_ratio at eval time (e.g. 0.10 = 10%).")
+                    help="Override pc_dropout_ratio at eval time (e.g. 0.10 = 10%%).")
 parser.add_argument("--inject_hand_noise", type=float, default=None,
                     help="Override pc_hand_noise_std at eval time (e.g. 0.003 = 3mm).")
-# Stage-1 estimator drop-in (optional)
-parser.add_argument("--stage1_ckpt", type=str, default=None,
-                    help="Estimator+planner ckpt (best.pt). When set, replaces 19d obs "
-                         "the target_obj_pose, tips_distance and obj_pose_tail slots with estimator outputs before "
-                         "feeding the student. Goal-quat for hemisphere alignment is "
-                         "extracted from demo final frame.")
-parser.add_argument("--estimator_inject_pose_noise", action="store_true", default=False,
-                    help="Add training-time PoseObs noise (8mm/0.06rad) to the [550:557] "
-                         "slot when using estimator drop-in.")
-parser.add_argument("--use_planner", action="store_true", default=False,
-                    help="ALSO use the planner (from --stage1_ckpt) to replace K=1 wrist/"
-                         "joints demo target slots (the ref_tracking block) via env.set_planner_targets(). "
-                         "Combined with estimator drop-in this is fully demo-free obs.")
-parser.add_argument("--flow_planner_ckpt", type=str, default=None,
-                    help="If set, use FlowMatchingPlanner from this ckpt instead of the "
-                         "MLP planner inside --stage1_ckpt. Implies --use_planner.")
 parser.add_argument("--perturb_obj_xy", type=float, default=0.0,
                     help="Eval-time random xy perturbation of obj init pos (meters). "
                          "0=off, 0.05=±5cm uniform. Hooks env._eval_perturb_obj_xy.")
-parser.add_argument("--per_demo_quota", type=int, default=None,
-                    help="Episodes to collect PER DEMO. Default None = balanced, "
-                         "ceil(max_episodes / n_demos). Pass 0 for the old "
-                         "first-to-finish collection, which is biased: a successful "
-                         "episode ends sooner than a failing one, so the easy demos "
-                         "fill the quota first and the aggregate is weighted toward "
-                         "them. Per-demo rates are reported either way.")
-parser.add_argument("--keep_physics_dr", action="store_true", default=False,
-                    help="Leave the physical domain randomisation ON during eval: object "
-                         "mass 0.01-0.15 kg, friction x1.0-2.5, COM +-2 cm, PD gains x0.5-2. "
-                         "It is force-disabled by default for a clean deterministic eval, "
-                         "but that also removes the only variation contact force could help "
-                         "with — a policy cannot show a benefit from sensing grip force when "
-                         "every object weighs its nominal mass. Turn this on to test whether "
-                         "tactile pays off under the physical uncertainty it is meant for.")
+parser.add_argument("--per_demo_quota", type=int, default=0,
+                    help="Episodes to collect per demo. 0 (default, reference protocol) = "
+                         "first-to-finish until --max_episodes; N > 0 = N per demo; -1 = "
+                         "balanced, ceil(max_episodes / n_demos). First-to-finish weights the "
+                         "aggregate toward demos whose episodes end sooner; per-demo rates "
+                         "are reported either way.")
+parser.add_argument("--expand_aug", action=argparse.BooleanOptionalAction, default=True,
+                    help="Evaluate every retarget augmentation variant ({demo}@{aug}) of each "
+                         "demo (default, reference protocol). --no-expand_aug evaluates only the "
+                         "base demos and reports them under their base IDs (DISABLE_AUG_EXPAND=1).")
+parser.add_argument("--keep_physics_dr", action=argparse.BooleanOptionalAction, default=True,
+                    help="Keep the physical domain randomisation on during eval (default, "
+                         "reference protocol): object mass 0.01-0.15 kg, friction x1.0-2.5, "
+                         "COM +-2 cm, hand PD gains x0.5-2. --no-keep_physics_dr holds them at "
+                         "nominal for a clean run; that also removes the variation contact "
+                         "force is meant to help with.")
 parser.add_argument("--camera_extrinsic", type=str, default=None,
                     help="Path to a 4x4 .npy camera-in-armbase extrinsic (ROS optical). "
                          "Must match what the student was TRAINED with, or its scene cloud "
                          "arrives from a different viewpoint than it ever saw.")
 parser.add_argument("--ref_root", type=str, default=None,
                     help="Override robotool_batch retarget reference root.")
-parser.add_argument("--pc_ablate_scene_pc", action="store_true", default=False,
-                    help="Modality ablation: drop the camera-derived scene points.")
+parser.add_argument("--pc_ablate_scene_pc", action="store_true", default=None,
+                    help="Modality ablation: drop the camera-derived scene points "
+                         "(default: whatever the checkpoint was trained with).")
 parser.add_argument("--mask_obs_slots", type=str, default=None,
                     help="Comma-separated obs-slot ranges to zero before feeding student. "
                          "Format: 'lo:hi,lo:hi,...' e.g. '390:397,550:557' — take the bounds from the [obs-slots] line the env prints at startup, never from a remembered number; the block order has changed before. "
                          "Useful for K=1 demo-target field ablations (eval-only).")
-parser.add_argument("--obj_shift_correction", type=str, default="none",
-                    choices=["none", "oracle", "estimator"],
-                    help="Geometric demo correction: shift K=1 wrist/joint target by "
-                         "δ = current_obj_pos - demo_K1_obj_pos. Compensates for "
-                         "object position perturbation. 'oracle' uses env GT obj_pos, "
-                         "'estimator' uses --stage1_ckpt estimator's prediction.")
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -132,6 +112,16 @@ import os
 import time
 import collections
 import importlib
+
+# Base demos unless --expand_aug: the env reads this when it builds data_indices.
+if args_cli.expand_aug:
+    if os.environ.pop("DISABLE_AUG_EXPAND", None) is not None:
+        print("[EvalPC] NOTE: ignoring DISABLE_AUG_EXPAND from the environment because "
+              "--expand_aug is on (default); pass --no-expand_aug for base demos only.",
+              flush=True)
+else:
+    os.environ["DISABLE_AUG_EXPAND"] = "1"
+
 from dataclasses import dataclass, asdict
 
 import torch
@@ -140,7 +130,7 @@ from omegaconf import OmegaConf
 
 import dexx.tasks.franka_sharpa  # noqa: F401
 
-from dexx.algo.dagger.pc_env_meta import align_pc_dims_to_ckpt, apply_pc_env_meta
+from dexx.algo.dagger.pc_env_meta import align_pc_dims_to_ckpt, apply_pc_env_meta, load_checkpoint
 
 
 def parse_entry_point(entry_point: str):
@@ -228,8 +218,6 @@ def main():
         env_cfg.sim.device = args_cli.device
     if args_cli.side:
         env_cfg.hand_side = args_cli.side
-    if args_cli.cache:
-        env_cfg.grasp_cache_path = args_cli.cache
     if args_cli.data_idx:
         try:
             data_indices = json.loads(args_cli.data_idx)
@@ -254,9 +242,6 @@ def main():
             setattr(env_cfg, fl, 0.0)
     if hasattr(env_cfg, "init_curriculum_enabled"):
         env_cfg.init_curriculum_enabled = False
-    if args_cli.pc_ablate_scene_pc:
-        env_cfg.pc_ablate_scene_pc = True
-        print("[EvalPC] pc_ablate_scene_pc = True (scene points dropped)", flush=True)
     if args_cli.camera_extrinsic:
         assert os.path.exists(args_cli.camera_extrinsic), \
             f"--camera_extrinsic not found: {args_cli.camera_extrinsic}"
@@ -281,7 +266,7 @@ def main():
     # ----- pre-load ckpt so the env emits exactly the point counts / tactile
     # width the student was trained with. Shared with play.py; see
     # dexx.algo.dagger.pc_env_meta.
-    _ckpt_peek = torch.load(args_cli.load_path, map_location="cpu", weights_only=False)
+    _ckpt_peek = load_checkpoint(args_cli.load_path)
     align_pc_dims_to_ckpt(env_cfg, _ckpt_peek, tag="EvalPC")
     # Restore the env-side PC transforms the student was TRAINED with. Without
     # this a policy trained on e.g. force/10 with 0.05 gating is evaluated on
@@ -295,6 +280,7 @@ def main():
             "pc_tactile_force_gate": args_cli.pc_tactile_force_gate,
             "pc_tactile_gate_mode": args_cli.pc_tactile_gate_mode,
             "pc_force_repr": args_cli.pc_force_repr,
+            "pc_ablate_scene_pc": args_cli.pc_ablate_scene_pc,
             "pc_ablate_tactile_pc": args_cli.pc_ablate_tactile_pc,
             "pc_ablate_tactile_force": args_cli.pc_ablate_tactile_force,
             "pc_tactile_use_vec3": args_cli.pc_tactile_use_vec3,
@@ -304,8 +290,8 @@ def main():
         tag="EvalPC",
     )
 
-    # (the legacy tactile_feat_dim -> vec3 fallback now lives in
-    # align_pc_dims_to_ckpt above, so an explicit pc_env_meta block wins over it)
+    # (the tactile_feat_dim -> vec3 fallback lives in align_pc_dims_to_ckpt
+    # above, so an explicit pc_env_meta block wins over it)
     print(f"[EvalPC] env: {args_cli.task} num_envs={args_cli.num_envs}", flush=True)
     env_raw = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
     base_env = env_raw.unwrapped
@@ -319,6 +305,11 @@ def main():
     expanded_indices = [str(x) for x in getattr(base_env, "data_indices", [])]
     print(f"[EvalPC] expanded data_indices: {len(expanded_indices)} variants; "
           f"env e -> data_indices[e % {len(expanded_indices)}]", flush=True)
+    if len(expanded_indices) > args_cli.num_envs:
+        print(f"[EvalPC] WARNING: {len(expanded_indices)} variants but only "
+              f"{args_cli.num_envs} envs; {len(expanded_indices) - args_cli.num_envs} variants "
+              f"(data_indices[{args_cli.num_envs}:]) will NOT be evaluated. Raise --num_envs "
+              f"to at least {len(expanded_indices)} or pass --no-expand_aug.", flush=True)
     with open(os.path.join(args_cli.out_dir, "expanded_data_indices.json"), "w") as f:
         json.dump({"data_indices": expanded_indices}, f, indent=2)
 
@@ -328,7 +319,7 @@ def main():
         return "unknown"
 
     print(f"[EvalPC] loading ckpt: {args_cli.load_path}", flush=True)
-    ckpt = torch.load(args_cli.load_path, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args_cli.load_path, map_location=device)
     sd_keys = list(ckpt.get("model", {}).keys())
     if any(k.startswith("actor_mlp.") for k in sd_keys):
         model, arch_label = _build_ppo_student(ckpt, device)
@@ -338,63 +329,6 @@ def main():
         raise RuntimeError(f"Unknown ckpt format; first 5 sd keys: {sd_keys[:5]}")
     print(f"[EvalPC] architecture: {arch_label}", flush=True)
 
-    # Optional Stage-1 estimator drop-in (--stage1_ckpt). Replaces 19d obs slots
-    # the target_obj_pose / tips_distance / obj_pose_tail slots with estimator
-    # outputs before feeding the student.
-    _est = None
-    _pln = None
-    if args_cli.stage1_ckpt is not None:
-        from dexx.algo.goal_planner import (
-            Estimator, EstimatorConfig, Planner, PlannerConfig,
-        )
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from _planner_helpers import extract_proprio_subset, extract_goal  # noqa
-        _s1 = torch.load(args_cli.stage1_ckpt, map_location=device, weights_only=False)
-        # Back-compat: old quat-only ckpts have no rot_repr field
-        _est_cfg_dict = dict(_s1["estimator_cfg"])
-        _est_cfg_dict.setdefault("rot_repr", "quat")
-        _est = Estimator(EstimatorConfig(**_est_cfg_dict)).to(device)
-        _sd = dict(_s1["estimator_state_dict"])
-        # Back-compat: old quat-only ckpts saved as head_quat, new code uses head_rot
-        if "head_quat.weight" in _sd and "head_rot.weight" not in _sd:
-            _sd["head_rot.weight"] = _sd.pop("head_quat.weight")
-            _sd["head_rot.bias"] = _sd.pop("head_quat.bias")
-        _est.load_state_dict(_sd)
-        _est.eval()
-        if args_cli.flow_planner_ckpt is not None:
-            args_cli.use_planner = True
-            from dexx.algo.goal_planner import FlowMatchingPlanner, FlowPlannerConfig
-            _fck = torch.load(args_cli.flow_planner_ckpt, map_location=device, weights_only=False)
-            _pln_flow = FlowMatchingPlanner(FlowPlannerConfig(**_fck["flow_planner_cfg"])).to(device)
-            _pln_flow.load_state_dict(_fck["flow_planner_state_dict"])
-            _pln_flow.eval()
-            _target_mean = _fck["target_mean"].to(device)
-            _target_std = _fck["target_std"].to(device)
-            _pln = _pln_flow   # signals downstream block to call flow.sample()
-            _is_flow_planner = True
-            print(f"[EvalPC] FLOW PLANNER enabled from {args_cli.flow_planner_ckpt}", flush=True)
-        elif args_cli.use_planner:
-            _pln = Planner(PlannerConfig(**_s1["planner_cfg"])).to(device)
-            _pln.load_state_dict(_s1["planner_state_dict"])
-            _pln.eval()
-            _is_flow_planner = False
-            print(f"[EvalPC] MLP PLANNER also enabled — full demo-free obs", flush=True)
-        else:
-            _is_flow_planner = False
-        # PC encoder from student model (PointCloudStudent or ActorCriticPointCloud)
-        _encoder = getattr(model, "pc_encoder", None)
-        if _encoder is None:
-            raise RuntimeError("model has no pc_encoder; cannot do estimator drop-in")
-        _expected_fdim = _encoder.tactile_feat_dim
-        _POS_SIGMA = 0.008
-        _ROT_SIGMA = 0.06
-        print(f"[EvalPC] estimator drop-in ENABLED from {args_cli.stage1_ckpt}",
-              flush=True)
-        print(f"  → replacing the target_obj_pose + tips_distance and obj_pose_tail slots "
-              "with estimator output",
-              flush=True)
-
-    # Parse mask_obs_slots once
     # ---- Restore the student's trained proprio layout ----------------------
     # A lean student was trained on a sliced obs; feeding it the env's full
     # vector would be a silent distribution shift (or a shape error).
@@ -421,24 +355,6 @@ def main():
                 f"{_live}. The saved keep-indices would select the wrong channels.")
         _keep_t = torch.as_tensor(_student_keep_idx, dtype=torch.long, device=device)
 
-    # ---- Resolve observation offsets from the env, never by hand ----------
-    # These used to be literals (410:413 for target_obj_pos, 417:422 for
-    # tips_distance). They were written for a layout in which the tactile block
-    # preceded target_obj_pose; the block order has since changed, so the
-    # literals pointed 20 dims high — into obj_bps. Anything writing through
-    # them corrupted the shape encoding and left the pose untouched, silently.
-    _slots_live = getattr(base_env, "actor_obs_slots", None)
-    if _slots_live is None:
-        base_env._get_observations()
-        _slots_live = getattr(base_env, "actor_obs_slots", None)
-    if _slots_live:
-        _OBJ_POSE_LO = _slots_live["target_obj_pose"][0]          # pos 3 + quat 4
-        _TIPS_LO, _TIPS_HI = _slots_live["tips_distance"]
-        _TAIL_LO, _TAIL_HI = _slots_live.get("obj_pose_tail", (None, None))
-        _REF_LO = _slots_live["ref_tracking"][0]
-    else:
-        _OBJ_POSE_LO = _TIPS_LO = _TIPS_HI = _TAIL_LO = _TAIL_HI = _REF_LO = None
-
     _mask_ranges = []
     if args_cli.mask_obs_slots:
         for part in args_cli.mask_obs_slots.split(","):
@@ -446,159 +362,12 @@ def main():
             _mask_ranges.append((int(lo), int(hi)))
         print(f"[EvalPC] OBS MASK ACTIVE: zeroing slots {_mask_ranges}", flush=True)
 
-    # Obj-shift correction setup
-    _obj_shift = args_cli.obj_shift_correction
-    if _obj_shift != "none":
-        print(f"[EvalPC] OBJ SHIFT CORRECTION: '{_obj_shift}' "
-              f"(shift K=1 wrist+joints by δ = curr_obj - demo_K1_obj)", flush=True)
-        if _obj_shift == "estimator" and _est is None:
-            raise RuntimeError("--obj_shift_correction estimator requires --stage1_ckpt")
-
-    # Initial-frame δ for shift correction (constant per episode):
-    # δ_init = obj_at_reset - demo_obj_at_init_frame.
-    # We track per-env init frame and re-compute δ_init whenever an env resets.
-    _shift_delta_init = torch.zeros((base_env.num_envs, 3), device=device)
-    _shift_init_frame = torch.zeros(base_env.num_envs, dtype=torch.long, device=device)
-    _shift_prev_progress = torch.full((base_env.num_envs,), -1, dtype=torch.long,
-                                       device=device)
-    _shift_initialized = torch.zeros(base_env.num_envs, dtype=torch.bool, device=device)
-
-    @torch.no_grad()
-    def _refresh_init_delta(reset_mask, pred_est_pos=None):
-        """Compute and cache δ_init for envs that just reset (reset_mask is bool)."""
-        if not reset_mask.any():
-            return
-        nE = base_env.num_envs
-        # init_frame for this episode = current progress_buf (env stores frame index here)
-        # demo_data["obj_trajectory"] indexed by (env_id, init_frame)
-        ids = reset_mask.nonzero(as_tuple=False).flatten()
-        init_idx = base_env.progress_buf[ids].clamp(min=0)
-        demo_obj_T = base_env.demo_data["obj_trajectory"][ids, init_idx]
-        demo_obj_pos = demo_obj_T[:, :3, 3]
-        if _obj_shift == "oracle":
-            cur_obj_pos = (base_env.object.data.root_pos_w[ids]
-                           - base_env.scene.env_origins[ids])
-        else:
-            cur_obj_pos = pred_est_pos[ids] if pred_est_pos is not None else torch.zeros_like(demo_obj_pos)
-        _shift_delta_init[ids] = cur_obj_pos - demo_obj_pos
-        _shift_init_frame[ids] = init_idx
-
-    def _apply_obj_shift(obs_t, delta):
-        """In-place shift of the K=1 target slots by delta_xyz.
-
-        Shifts delta_wrist_pos, the 32 per-finger delta_joints_pos, the target
-        object position and the pose-observation tail. Rotation is not
-        corrected. Offsets come from the env's slot map, not from literals.
-        """
-        obs_t[:, _REF_LO:_REF_LO + 3] += delta                  # delta_wrist_pos
-        # delta_joints_pos sits 23 dims into ref_tracking (7 wrist blocks) and
-        # is (B, 96) = 32 fingers x 3.
-        _jp_lo = _REF_LO + 23
-        b = obs_t.shape[0]
-        jp = obs_t[:, _jp_lo:_jp_lo + 96].view(b, 32, 3)
-        jp += delta.unsqueeze(1)
-        obs_t[:, _jp_lo:_jp_lo + 96] = jp.view(b, 96)
-        obs_t[:, _OBJ_POSE_LO:_OBJ_POSE_LO + 3] += delta        # target_obj_pos
-        if _TAIL_LO is not None:
-            obs_t[:, _TAIL_LO:_TAIL_LO + 3] += delta            # pose-obs tail
-        return obs_t
-
     def _make_inp(d):
         obs_in = d["policy"]
         if _mask_ranges:
             obs_in = obs_in.clone()
             for lo, hi in _mask_ranges:
                 obs_in[:, lo:hi] = 0.0
-        if _est is not None:
-            with torch.no_grad():
-                tf = d["tactile_force"]
-                if tf.shape[-1] != _expected_fdim:
-                    if tf.shape[-1] < _expected_fdim:
-                        pad = torch.zeros(tf.shape[0], tf.shape[1],
-                                          _expected_fdim - tf.shape[-1],
-                                          device=tf.device, dtype=tf.dtype)
-                        tf = torch.cat([tf, pad], dim=-1)
-                    else:
-                        tf = tf[..., :_expected_fdim]
-                pc_feat = _encoder(d["scene_pc"], d["scene_mask"], d["hand_pc"],
-                                   d["tactile_pc"], tf, d.get("tactile_mask"))
-                proprio = extract_proprio_subset(base_env)
-                goal = extract_goal(base_env, 32)
-                pred = _est.predict_aligned(pc_feat, proprio, goal[..., 3:7])
-                # ---- Planner-driven K=1 target replacement (ref_tracking) ----
-                if _pln is not None:
-                    if _is_flow_planner:
-                        # Flow planner samples (B, K, per_frame_dim); de-normalize.
-                        s = _pln.sample(goal, pc_feat, proprio, num_steps=1)
-                        s_flat = s.reshape(s.shape[0], -1)
-                        s_flat = s_flat * _target_std + _target_mean
-                        plan_out = s_flat
-                    else:
-                        plan_out = _pln(goal, pc_feat, proprio)   # (B, 1055)
-                    # First 211d = K=1 frame: wp(3)+wv(3)+wq(3)+wang(3)+jp(96)+jv(96)+op(3)+oq(4)
-                    pf = plan_out[:, :211]
-                    base_env.set_planner_targets({
-                        "wrist_pos":     pf[:, 0:3],
-                        "wrist_vel":     pf[:, 3:6],
-                        "wrist_rot":     pf[:, 6:9],
-                        "wrist_ang_vel": pf[:, 9:12],
-                        "joints_pos":    pf[:, 12:108],
-                        "joints_vel":    pf[:, 108:204],
-                    })
-                    # Note: obs_in (d["policy"]) was computed BEFORE we set planner_targets.
-                    # The next compute_observations() (after env.step) will see them.
-                    # For the CURRENT step, replace target_obj_pos+quat manually:
-                    obs_in = obs_in.clone()
-                    obs_in[:, _OBJ_POSE_LO:_OBJ_POSE_LO + 3] = pf[:, 204:207]
-                    obs_in[:, _OBJ_POSE_LO + 3:_OBJ_POSE_LO + 7] = pf[:, 207:211]
-                else:
-                    obs_in = obs_in.clone()
-                    obs_in[:, _OBJ_POSE_LO:_OBJ_POSE_LO + 3] = pred["obj_pos"]
-                    obs_in[:, _OBJ_POSE_LO + 3:_OBJ_POSE_LO + 7] = pred["obj_quat"]
-                # Estimator fills tips + PoseObs tail regardless of planner
-                obs_in[:, _TIPS_LO:_TIPS_HI] = pred["tips_distance"]
-                pp = pred["obj_pos"]; pq = pred["obj_quat"]
-                if args_cli.estimator_inject_pose_noise:
-                    pp = pp + torch.randn_like(pp) * _POS_SIGMA
-                    pq = pq + torch.randn_like(pq) * _ROT_SIGMA
-                    pq = pq / (pq.norm(dim=-1, keepdim=True) + 1e-8)
-                obs_in[:, _TAIL_LO:_TAIL_LO + 3] = pp
-                obs_in[:, _TAIL_LO + 3:_TAIL_HI] = pq
-        # Obj-shift correction (use INIT-FRAME δ, constant per episode).
-        if _obj_shift != "none":
-            with torch.no_grad():
-                cur_prog = base_env.progress_buf
-                # Reset detection: progress_buf went DOWN compared to prev step
-                # (env reset and re-sampled an init_frame), OR first call (prev=-1).
-                need_refresh = (cur_prog < _shift_prev_progress) | (~_shift_initialized)
-                if need_refresh.any():
-                    if _obj_shift == "estimator":
-                        tf2 = d["tactile_force"]
-                        if tf2.shape[-1] != _expected_fdim:
-                            if tf2.shape[-1] < _expected_fdim:
-                                pad = torch.zeros(tf2.shape[0], tf2.shape[1],
-                                                  _expected_fdim - tf2.shape[-1],
-                                                  device=tf2.device, dtype=tf2.dtype)
-                                tf2 = torch.cat([tf2, pad], dim=-1)
-                            else:
-                                tf2 = tf2[..., :_expected_fdim]
-                        pc_feat2 = _encoder(d["scene_pc"], d["scene_mask"],
-                                            d["hand_pc"], d["tactile_pc"], tf2,
-                                            d.get("tactile_mask"))
-                        proprio2 = extract_proprio_subset(base_env)
-                        goal2 = extract_goal(base_env, 32)
-                        pred2 = _est.predict_aligned(pc_feat2, proprio2, goal2[..., 3:7])
-                        _refresh_init_delta(need_refresh, pred_est_pos=pred2["obj_pos"])
-                    else:
-                        _refresh_init_delta(need_refresh)
-                # Mark all envs as initialized (refresh either just updated their δ
-                # or they keep using the prev one for in-episode steps).
-                _shift_initialized[:] = True
-                _shift_prev_progress[:] = cur_prog
-                # Apply cached δ_init (constant for whole episode) to obs
-                if obs_in is d["policy"]:
-                    obs_in = obs_in.clone()
-                _apply_obj_shift(obs_in, _shift_delta_init)
         # Reduce to the student's trained layout LAST: mask indices refer to the
         # env's original obs, slicing changes the width.
         if _student_mask_idx:
@@ -637,11 +406,10 @@ def main():
     t_start = time.time()
 
     # ---- Per-demo quota ----------------------------------------------------
-    # Collecting the first N episodes to finish biases the aggregate: success
-    # terminates an episode earlier than failure, so whichever demo the policy
-    # handles best contributes the most episodes. Collect a fixed share each.
+    # 0 = first-to-finish (reference protocol). A fixed share per demo instead
+    # keeps a demo whose episodes end sooner from dominating the aggregate.
     _demo_universe = sorted({_env_demo(i) for i in range(args_cli.num_envs)})
-    if args_cli.per_demo_quota is None:
+    if args_cli.per_demo_quota < 0:
         _demo_quota = -(-args_cli.max_episodes // max(1, len(_demo_universe)))
     else:
         _demo_quota = int(args_cli.per_demo_quota)
@@ -650,8 +418,9 @@ def main():
         print(f"[EvalPC] per-demo quota = {_demo_quota} x {len(_demo_universe)} demos "
               f"= {_demo_quota * len(_demo_universe)} episodes", flush=True)
     else:
-        print("[EvalPC] per-demo quota DISABLED: first-to-finish collection "
-              "(aggregate is biased toward the easier demos)", flush=True)
+        print("[EvalPC] first-to-finish collection (reference protocol): demos whose "
+              "episodes end sooner contribute more episodes; read the per-demo rates",
+              flush=True)
 
     print(f"[EvalPC] running until {args_cli.max_episodes} eps or "
           f"{args_cli.max_steps} steps", flush=True)

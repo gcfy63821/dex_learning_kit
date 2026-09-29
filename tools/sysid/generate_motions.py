@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 import numpy as np
@@ -190,7 +189,7 @@ def gen_step_per_joint(freq: float, step_size: float = 0.08,
     # = 10 * step_size / ramp_s^2 ≈ 3.2 rad/s² (under j2 limit 5.25)
     """Sequentially step each joint up, back to center, down, back to center.
 
-    Same protocol as the existing step_response_real.py, just in CSV form so
+    Same protocol as tools/sysid/step_response_sim.py, just in CSV form so
     it can be replayed via the unified motion pipeline.
     """
     # Use a short linear ramp (ramp_s) between levels instead of instant jump,

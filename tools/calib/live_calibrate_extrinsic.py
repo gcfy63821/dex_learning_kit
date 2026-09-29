@@ -9,8 +9,8 @@ arm-base (fr3_link0) frame, alongside reference scene objects:
   - workspace bbox outline (matches sim's pc_workspace_min/max)
   - target object marker at the expected cube position (CLI)
 
-GUI sliders apply a small `(tx, ty, tz, rx, ry, rz)` DELTA on top of the
-DEFAULT_T_CAM_IN_ARMBASE. Drag until the PC clearly shows table + cube where
+GUI sliders apply a small `(tx, ty, tz, rx, ry, rz)` DELTA on top of
+the --init_extrinsic (default: the shipped current.npy). Drag until the PC clearly shows table + cube where
 they physically are. Click "Save" → writes a 4x4 .npy you can pass to deploy
 via `--camera_extrinsic <file>`.
 
@@ -21,11 +21,13 @@ Offline against a captured cloud (the usual path — see tutorial/06):
       --sim_frame_pkl data/retargeting/robotool_batch/mano2sharpa_rh/0416_grasp/cube_small_2@0.pkl \\
       --sim_frame_idx 0 \\
       --init_extrinsic calib/camera_align/current.npy \\
-      --out calib/camera_align/current.npy --port 8080
+      --out calib/camera_align/extrinsic_YYYYMMDD.npy --port 8080
 
-Live against a ROS2 depth topic, if you have one running:
+Write to a new, dated file, never over current.npy (calib/camera_align/README.md).
 
-  --depth_topic /camera/camera/aligned_depth_to_color/image_raw
+Live against the camera host's depth publisher (deploy/realsense_depth_zmq_pub.py):
+
+  --depth_zmq_addr tcp://<CAM_HOST>:5562
 
 Open http://<host>:8080 in a browser. Drag sliders, watch the cloud move, save.
 """
@@ -88,11 +90,11 @@ def _rot_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--depth_topic", type=str,
-                   default="/camera/camera/aligned_depth_to_color/image_raw")
+    p.add_argument("--depth_zmq_addr", type=str, default=None,
+                   help="Live mode: ZMQ addr of realsense_depth_zmq_pub.py, "
+                        "e.g. tcp://<CAM_HOST>:5562.")
     p.add_argument("--depth_height", type=int, default=_dcfg.DEPTH_H)
     p.add_argument("--depth_width", type=int, default=_dcfg.DEPTH_W)
-    p.add_argument("--namespace", type=str, default="")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--subsample", type=int, default=15000,
                    help="Subsample real PC for viz (per frame).")
@@ -102,23 +104,24 @@ def main():
     p.add_argument("--target_obj_size", type=float, default=0.03,
                    help="Half-extent of the red reference cube (m).")
     p.add_argument("--update_hz", type=float, default=3.0,
-                   help="How often viser fetches a new depth frame from ROS2.")
+                   help="How often viser fetches a new live depth frame.")
     p.add_argument("--max_translation_m", type=float, default=0.30)
     p.add_argument("--max_rotation_deg", type=float, default=30.0)
     p.add_argument("--out", type=str, required=True,
-                   help="Path to save final 4x4 extrinsic .npy on Save click.")
+                   help="Path to save final 4x4 extrinsic .npy on Save click; use a new, "
+                        "dated file, not calib/camera_align/current.npy.")
     p.add_argument("--depth_file", type=str, default=None,
-                   help="Offline mode: skip ROS2 and load depth from this .npy file "
+                   help="Offline mode: load depth from this .npy file "
                         "(units: meters, shape (H, W)). Use to run viser locally on "
-                        "a copied dump from the robot — no ROS2 needed.")
+                        "a copied dump from the robot.")
     p.add_argument("--sim_scene_ply", type=str, default=None,
-                   help="Path to sim scene_pc PLY (output of viz_pointcloud.py). "
+                   help="Path to sim scene_pc PLY (e.g. from tools/calib/gen_sim_frame_ply.py). "
                         "Loaded as orange reference cloud. Subtracts arm_base_pos to "
                         "convert env-local → fr3_link0 frame so it overlays the real PC.")
     p.add_argument("--sim_hand_ply", type=str, default=None,
                    help="Path to sim hand_pc PLY (yellow markers).")
     p.add_argument("--real_pc_npz", type=str, default=None,
-                   help="OFFLINE real-PC mode: skip ROS2/depth entirely and load a "
+                   help="OFFLINE real-PC mode: skip depth entirely and load a "
                         "captured point cloud directly. Accepts .npz with a 'points' "
                         "(N,3, camera frame, meters) [+ optional 'colors'] array, or a "
                         ".ply/.npy of xyz. Use when you have a live RealSense capture "
@@ -140,16 +143,14 @@ def main():
                         "directly into viser at frame --sim_frame_idx (fr3_link0 frame). "
                         "Cleaner than a sampled --sim_scene_ply.")
     p.add_argument("--sim_frame_idx", type=int, default=0)
-    p.add_argument("--sim_table_z", type=float, default=0.415,
+    p.add_argument("--sim_table_z", type=float, default=_dcfg.TABLE_SURFACE_Z,
                    help="table-top z in env-local; drawn at (table_z - arm_base_z) in link0.")
     p.add_argument("--point_size", type=float, default=0.005,
                    help="real PC point size in viser (smaller = finer). Try 0.0015.")
     args = p.parse_args()
 
     # Pull these in both modes.
-    from dexx.scripts.deploy.ros2_depth_subscriber import (
-        DEFAULT_T_CAM_IN_ARMBASE, SIM_INTRINSICS,
-    )
+    SIM_INTRINSICS = _dcfg.SIM_INTRINSICS
 
     sub = None
     static_depth_np: Optional[np.ndarray] = None
@@ -187,7 +188,7 @@ def main():
         )
 
     if args.real_pc_npz is not None:
-        pass  # neither ROS2 nor depth_file needed
+        pass  # no live depth or depth_file needed
     elif args.depth_file is not None:
         static_depth_np = np.load(args.depth_file).astype(np.float32)
         if static_depth_np.ndim != 2:
@@ -199,32 +200,25 @@ def main():
               f"valid_frac={(static_depth_np > 0).mean():.2%}")
 
     else:
-        # ---- ROS2 depth subscriber (CPU buffer; we don't need GPU here) ----
-        import rclpy
-        from rclpy.executors import SingleThreadedExecutor
-        from dexx.scripts.deploy.ros2_depth_subscriber import (
-            RealSenseDepthSubscriber,
+        # ---- Live depth from the camera host (CPU buffer; no GPU needed) ----
+        if not args.depth_zmq_addr:
+            p.error("pass --real_pc_npz / --depth_file for offline mode, or "
+                    "--depth_zmq_addr for live mode")
+        from dexx.scripts.deploy.realsense_depth_zmq_subscriber import (
+            RealSenseDepthZmqSubscriber,
         )
-        if not rclpy.ok():
-            rclpy.init()
-        sub = RealSenseDepthSubscriber(
-            node_name="live_calib_depth_sub",
-            topic=args.depth_topic,
-            height=args.depth_height, width=args.depth_width,
-            device="cpu", namespace=args.namespace,
+        sub = RealSenseDepthZmqSubscriber(
+            addr=args.depth_zmq_addr,
+            height=args.depth_height, width=args.depth_width, device="cpu",
         )
-        ex = SingleThreadedExecutor()
-        ex.add_node(sub)
-        spin_thr = threading.Thread(target=ex.spin, daemon=True)
-        spin_thr.start()
-        print(f"[live-calib] subscribed to {args.depth_topic}; waiting for first frame…")
+        print(f"[live-calib] subscribed to {args.depth_zmq_addr}; waiting for first frame…")
         t0 = time.time()
         while time.time() - t0 < 10.0:
             if sub.get_latest() is not None:
                 break
             time.sleep(0.05)
         if sub.get_latest() is None:
-            print("[live-calib] ERROR: no depth frame in 10s. Check the topic + RealSense node.")
+            print("[live-calib] ERROR: no depth frame in 10s. Is realsense_depth_zmq_pub.py running?")
             return 1
         print("[live-calib] depth OK; opening viser…")
 
@@ -252,7 +246,7 @@ def main():
         assert T_base.shape == (4, 4), f"init_extrinsic must be 4x4, got {T_base.shape}"
         print(f"[live-calib] baseline T_cam_in_armbase from {args.init_extrinsic}")
     else:
-        T_base = DEFAULT_T_CAM_IN_ARMBASE.astype(np.float32).copy()
+        T_base = _dcfg.default_camera_extrinsic().astype(np.float32).copy()
     print(f"[live-calib] baseline T_cam_in_armbase:\n{T_base}")
 
     # ---- viser ----
@@ -372,7 +366,7 @@ def main():
     gh = server.gui
     gh.add_markdown("## Camera extrinsic — drag to align")
     gh.add_markdown(
-        "Sliders apply a **delta** on top of DEFAULT_T_CAM_IN_ARMBASE.\n"
+        "Sliders apply a **delta** on top of the initial extrinsic.\n"
         "Goal: blue real PC should land on **table top (z=0)** and the **red cube** should "
         "overlap with the actual cube in the PC."
     )
@@ -547,14 +541,7 @@ def main():
     finally:
         stop_evt.set()
         if sub is not None:
-            try:
-                import rclpy
-                ex.shutdown()
-                sub.destroy_node()
-                if rclpy.ok():
-                    rclpy.shutdown()
-            except Exception:
-                pass
+            sub.shutdown()
     return 0
 
 

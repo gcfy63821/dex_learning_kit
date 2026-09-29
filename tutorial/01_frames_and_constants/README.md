@@ -10,38 +10,53 @@ assumes these are right.
 
 ## One file
 
-Everything lives in `src/dexx/deploy_config.py`. Edit there; every consumer
-imports it.
+The sim2real geometry, camera and comm constants live in
+`src/dexx/deploy_config.py`. Edit there; the env cfgs, the deploy env, the depth
+subscriber, the retargeter and the calibration tools take their values from it.
 
 | constant | value | meaning |
 |---|---|---|
-| `TABLE_SURFACE_Z` | 0.415 | table top, env-local. Objects rest relative to this |
-| `ARM_BASE_Z` / `ARM_BASE_POS` | 0.415 / (-0.1, 0, 0.415) | `fr3_link0` origin |
-| `WRIST_POS_OFFSET` | (-0.1, 0, 0.415) | places the human demo into the scene |
-| `SIM_INTRINSICS` | fx 193.33, fy 193.06, cx 160.08, cy 121.05 | depth camera, 320×240 |
-| `PC_WORKSPACE_MIN/MAX` | z 0.420 … 1.30 | point-cloud crop box |
+| `TABLE_SURFACE_Z` | 0.415 | table top, env-local. Objects rest relative to this; the env, the env cfg's table box and the retargeter all read it |
+| `ARM_BASE_Z` / `ARM_BASE_POS` | 0.415 / (-0.1, 0, 0.415) | `fr3_link0` origin, env-local |
+| `SIM_INTRINSICS` | fx 193.33, fy 193.06, cx 160.08, cy 121.05 | depth camera at 320×240 (D455 640×480 decimated ×2) |
+| `DEPTH_H`, `DEPTH_W` | 240, 320 | depth resolution |
+| `PC_WORKSPACE_MIN/MAX` | (0.00, -0.40, 0.417) … (0.80, 0.25, 0.70) | point-cloud crop box, env-local; recorded in every student checkpoint and restored at eval/deploy |
 | `POLYMETIS_STATE_PORT` / `_CMD_PORT` | 5560 / 5561 | ZMQ bridge to the arm |
+| `CAMERA_ZMQ_ADDR_EXAMPLE` | an example address | shown in help text only; pass `--depth_zmq_addr` |
+| `CAMERA_EXTRINSIC_DEFAULT_FILE` | `calib/camera_align/current.npy` | the extrinsic loaded when `--camera_extrinsic` is omitted (lesson 06) |
+| `SHARPA_SDK_ENV` | `SHARPA_SDK_PYTHON` | env var naming the Sharpa SDK's `python/` directory |
+
+Two things are deliberately **not** in that file:
+
+- **The camera extrinsic.** It is a property of how the camera is bolted down, so
+  it is a calibrated file in `calib/camera_align/`, passed with
+  `--camera_extrinsic` (lesson 06). `deploy_config` only names the default file.
+- **The bridge's ports.** `deploy/polymetis_joint_bridge.py` runs on the NUC,
+  where `dexx` is not installed, so its `5560` / `5561` defaults are literals that
+  must be kept in sync by hand.
 
 ## The table and the arm base are independent
 
-They happen to be equal right now (both 0.415) because the robot is bolted level
-with the table surface. They were **not** equal between 2026-07-16 and
-2026-09-01, when the base sat 1.7 cm proud of the table.
+They are equal in the reference setup (both 0.415) because the robot is bolted level
+with the table surface. A different mount makes them differ.
 
-That coincidence is a trap, and it caught this project. `WRIST_POS_OFFSET` — the
-constant that places the human demonstration into the scene — had been written as
-`ARM_BASE_Z` rather than as the table height, because the two were the same
-number. When the base was lowered by 1.7 cm, the demonstration's hand trajectory
-followed it down while the object, anchored to the table, stayed put. The grasp
-was silently 1.7 cm too low.
+That coincidence is a trap. The human demonstration is lifted into the scene by
+the loader's `mujoco2gym` transform, whose translation is the table height.
+Suppose it were written as `ARM_BASE_Z` rather than `TABLE_SURFACE_Z`, because the
+two are the same number. Lower the base and the
+demonstration's hand trajectory follows it down while the object, anchored to the
+table, stays put. The grasp is then silently too low by exactly the change in
+mount height.
 
 The rule that falls out:
 
 > A constant must be written as **what it physically is**, not as whatever other
 > constant happens to share its value today.
 
-`WRIST_POS_OFFSET` is now written as `TABLE_SURFACE_Z` and carries a comment
-saying why. Moving the arm base no longer moves the demonstration.
+The env and the retargeter both build that transform from `TABLE_SURFACE_Z`, and
+`check_frames.py` asserts it. Moving the arm base does not move the demonstration.
+(The deploy's wrist offset is a different quantity: the wrist is computed in the
+arm-base frame, so it is moved to env-local by `ARM_BASE_POS`.)
 
 ### What *should* change when the base moves
 
@@ -79,14 +94,18 @@ retarget a new sequence — lesson 03.
 
 `PC_WORKSPACE_MIN/MAX` is applied before the point cloud is subsampled, so the
 1024 points land on the manipulation region instead of being spent on the table
-and the背景 curtain. The floor sits 5 mm above the table top on purpose: lower
-and the table dominates every cloud; much higher and short objects vanish. An
-earlier value of 0.50 cut off the bottom 8.5 cm and removed the objects
-entirely.
+and the background curtain. The floor sits 2 mm above the table top on purpose:
+level with the table top, the table takes most of the points; a few millimetres
+higher, the object's base is cut off. The ceiling of 0.70 removes the robot's own
+arm, which would otherwise take a large share of the points and whose pose the
+policy already has from forward kinematics.
 
-This box must match on both sides. The deploy-side depth converter crops with the
-same numbers; if they diverge, the student sees a differently-shaped world than it
-trained on.
+This box must match on both sides. Eval and deploy restore it from the checkpoint,
+so the student sees the crop it trained on. A deliberate deviation is possible:
+`--pc_workspace_min 0.0,-0.40,0.422` raises the floor 5 mm above training's, for
+when the real table sits a few mm higher in the cloud than the simulated one and
+would otherwise leak into it. Make such an override on purpose,
+knowing why, and check the result with lesson 06's cropped overlay.
 
 ## Check
 

@@ -29,7 +29,7 @@ say () { echo; echo "=== $*"; }
 # one it is.
 if ! python -c "import dexx, torch" 2>/dev/null; then
   echo 'ERROR: dexx and torch must be importable.'
-  echo "       conda activate <your isaaclab env>  &&  pip install -e ."
+  echo "       activate your Isaac Lab env (conda activate <env> or source <venv>/bin/activate)"
   exit 1
 fi
 
@@ -87,7 +87,8 @@ for check in tutorial/00_setup/check_install.py \
   fi
   tail -1 "$log"
 done
-if ! python -m pip check >"$OUT/pip_check.log" 2>&1; then
+# A binary Sim puts its own bundled packages on PYTHONPATH; check this env.
+if ! PYTHONPATH= python -m pip check >"$OUT/pip_check.log" 2>&1; then
   cat "$OUT/pip_check.log"
   echo "DEPENDENCY CHECK FAILED"
   exit 1
@@ -121,6 +122,7 @@ watch_for "$OUT/eval/summary.json" "$OUT/eval.log" 90 -- \
   python -u scripts/eval.py --load_path "$OUT/student/dagger_final.pth" \
     --out_dir "$OUT/eval" --side right --data_idx "$DEMOS" \
     --num_envs 64 --max_episodes 40 --max_steps 4000 \
+    --no-expand_aug --per_demo_quota -1 \
     --keep_physics_dr --camera_extrinsic "$EXTR" --headless \
   || { echo "EVAL FAILED"; exit 1; }
 

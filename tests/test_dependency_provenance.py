@@ -35,11 +35,17 @@ class RaycasterProvenanceTests(unittest.TestCase):
         self.verify(json.dumps({"url": self.url,
                                 "vcs_info": {"vcs": "git", "commit_id": self.sha}}))
 
+    def test_uv_url_without_git_suffix_passes(self):
+        self.verify(json.dumps({"url": self.url.removesuffix(".git"),
+                                "vcs_info": {"vcs": "git", "commit_id": self.sha}}))
+
     def test_wrong_commit_source_or_missing_provenance_fails(self):
         examples = [None, "{invalid", "null", "[]", "{}",
                     json.dumps({"url": self.url, "dir_info": {"editable": True}}),
                     json.dumps({"url": self.url, "vcs_info": {"vcs": "git", "commit_id": "2" * 40}}),
                     json.dumps({"url": "https://example.invalid/fork.git",
+                                "vcs_info": {"vcs": "git", "commit_id": self.sha}}),
+                    json.dumps({"url": "https://example.invalid/raycaster-fork",
                                 "vcs_info": {"vcs": "git", "commit_id": self.sha}}),
                     json.dumps({"url": self.url, "vcs_info": {"vcs": "git", "requested_revision": self.sha}})]
         for metadata in examples:

@@ -39,7 +39,6 @@ parser.add_argument("--camera_extrinsic", type=str, default=None,
 parser.add_argument("--side", type=str, default="right")
 parser.add_argument("--data_idx", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=16)
-parser.add_argument("--cache", type=str, default=None)
 parser.add_argument("--max_episodes", type=int, default=200)
 parser.add_argument("--max_steps", type=int, default=1_000_000)
 parser.add_argument("--label", type=str, default=None,
@@ -87,7 +86,7 @@ from omegaconf import OmegaConf
 
 import dexx.tasks.franka_sharpa  # noqa: F401
 
-from dexx.algo.dagger.pc_env_meta import align_pc_dims_to_ckpt, apply_pc_env_meta
+from dexx.algo.dagger.pc_env_meta import align_pc_dims_to_ckpt, apply_pc_env_meta, load_checkpoint
 
 
 def parse_entry_point(entry_point: str):
@@ -162,8 +161,6 @@ def main():
         env_cfg.sim.device = args_cli.device
     if args_cli.side:
         env_cfg.hand_side = args_cli.side
-    if args_cli.cache:
-        env_cfg.grasp_cache_path = args_cli.cache
     if args_cli.data_idx:
         try:
             data_indices = json.loads(args_cli.data_idx)
@@ -204,7 +201,7 @@ def main():
     # the student was TRAINED with; without this the policy is played on a
     # different input distribution than it learned. Peek the ckpt before the env
     # is built so the cfg overrides take effect. CLI flags still win.
-    _ckpt_peek = torch.load(args_cli.load_path, map_location="cpu", weights_only=False)
+    _ckpt_peek = load_checkpoint(args_cli.load_path)
     # Make the env emit the point counts / tactile width the student was trained
     # with, before the env is built.
     align_pc_dims_to_ckpt(env_cfg, _ckpt_peek, tag="PlayPC")
@@ -231,7 +228,7 @@ def main():
     device = torch.device(str(env.device))
 
     print(f"[PlayPC] loading ckpt: {args_cli.load_path}")
-    ckpt = torch.load(args_cli.load_path, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args_cli.load_path, map_location=device)
     sd_keys = list(ckpt.get("model", {}).keys())
 
     # Detect architecture

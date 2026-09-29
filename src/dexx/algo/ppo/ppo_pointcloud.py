@@ -1,8 +1,8 @@
 """Minimal PPO fine-tune trainer for `ActorCriticPointCloud`.
 
-Designed to be lighter than `PPOVisual` (855 LoC) but enough to do useful
-fine-tune from a DAgger initialization. Standard clipped PPO with GAE,
-bf16 autocast forward/backward, AdamW + fused.
+Deliberately small, but enough to do a useful fine-tune from a DAgger
+initialization. Standard clipped PPO with GAE,
+fp32 forward/backward, AdamW + fused.
 
 Buffer layout (on GPU, since num_envs * horizon * PC size is small):
     obses       (num_envs, horizon, proprio_dim) fp32
@@ -23,7 +23,6 @@ import os
 import time
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -63,7 +62,7 @@ class PPOPointCloudConfig:
     clip: float = 0.2
     value_clip: bool = True
     entropy_coef: float = 1e-4
-    critic_coef: float = 0.5            # was 2.0 — critic random-init at PPO start,
+    critic_coef: float = 0.5            # critic is random-init at PPO start and
                                          # raw rewards push critic loss to thousands
     critic_loss_clip: float = 10.0      # clamp per-sample (values - returns)^2 to keep
                                          # gradient bounded under bf16 autocast
@@ -291,8 +290,9 @@ class PPOPointCloud:
         for t in range(self.cfg.horizon):
             mdl_in = self._make_obs_dict(env_obs)
             res = self.model.act(mdl_in)
+            # Store the raw sample (its log-prob is what `neglogpacs` holds);
+            # clamp only what goes to the env, as ppo.py does.
             actions = torch.clamp(res["actions"], -self.cfg.action_clip, self.cfg.action_clip)
-            res["actions"] = actions
 
             step_result = self.env.step(actions)
             if len(step_result) == 5:
@@ -376,10 +376,9 @@ class PPOPointCloud:
                     "prev_actions": b["actions"][mb],
                 }
 
-                # Keep PPO update in fp32: bf16 autocast was causing gradient
-                # overflow / NaN once actor-loss spikes (initial iters: a_loss
-                # ~1e5-1e6 from huge unclipped ratios). The forward pass is
-                # the only PC-encoder cost that benefits from bf16 anyway.
+                # Keep the PPO update in fp32 (no autocast): early actor-loss
+                # spikes from large unclipped ratios overflow bf16 into NaN
+                # gradients.
                 out = self.model(batch_dict)
                 new_log_probs = -out["prev_neglogp"]
                 values = out["values"].squeeze(-1)

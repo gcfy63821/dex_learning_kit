@@ -18,6 +18,7 @@ CHECKS: list[tuple[str, str, str]] = [
     ("data/retargeting/robotool_batch/mano2sharpa_rh", "retargeted demonstrations", "03"),
     ("data/robotool_batch", "source demonstrations + object meshes", "03"),
     ("checkpoints/teacher_poseobs.pth", "the pretrained state expert", "04"),
+    ("checkpoints/student_lean_v6_L1.pth", "the deployed lean student", "05"),
     ("calib/camera_align/current.npy", "the live camera extrinsic", "06"),
     ("scripts/train_dagger_pc.py", "the distillation entry point", "05"),
     ("scripts/eval.py", "the evaluation entry point", "08"),

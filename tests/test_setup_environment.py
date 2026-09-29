@@ -115,6 +115,17 @@ class BaselineVersionTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.run_check()
 
+    def test_sim_version_comes_from_pip_wheels_without_link(self):
+        self.sim_version.unlink()
+        self.sim_version.parent.rmdir()
+        with self.assertRaisesRegex(RuntimeError, "Isaac Sim not found"):
+            self.run_check()
+        self.versions["isaacsim"] = "4.5.0.0"
+        self.assertEqual(self.run_check(), 0)
+        self.versions["isaacsim"] = "5.0.0.0"
+        with self.assertRaisesRegex(RuntimeError, "Isaac Sim 4.5"):
+            self.run_check()
+
     def test_cpu_and_mixed_cuda_builds_fail(self):
         self.torch.version.cuda = None
         with self.assertRaisesRegex(RuntimeError, "CUDA-enabled"):
@@ -193,6 +204,9 @@ elif name == "python":
             env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ["PATH"],
                        TEST_SETUP_LOG=str(log), TEST_PROJECT_MARKER=str(marker),
                        TEST_CONDA_BASE=str(conda_base), TERM="dumb")
+            # A developer's own Isaac paths must not leak into the installer.
+            env.pop("ISAACSIM_PATH", None)
+            env.pop("ISAACLAB_PATH", None)
             upstream = subprocess.run(
                 [str(lab / "isaaclab.sh"), "-i", "none"], env=env, text=True,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20,

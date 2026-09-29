@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import pickle
 import sys
 from pathlib import Path
@@ -34,18 +33,18 @@ parser.add_argument("--motion", required=True, type=str)
 parser.add_argument("--output", required=True, type=str)
 parser.add_argument("--control_freq_override", type=float, default=None)
 parser.add_argument("--record_freq", type=float, default=100.0)
-# 480, not the 120 this was inherited with. The arm PD here is an EXPLICIT
+# 480 Hz, not 120. The arm PD here is an EXPLICIT
 # torque loop (the implicit actuator is zeroed so gravity comp can be added), and
-# at 120 Hz it is unstable for this robot: the chirp tracks cleanly below ~1 Hz
-# and then diverges, reaching 659 rad of error against a 0.12 rad target. At 480
-# Hz the same run holds 0.095 rad max. Lower this only if you check the result.
+# at 120 Hz it is unstable for this robot: a chirp tracks cleanly at low
+# frequency and then diverges, while at 480 Hz the same motion tracks within
+# its target amplitude. Lower this only if you check the result.
 parser.add_argument("--physics_freq", type=float, default=480.0)
 parser.add_argument("--approach_s", type=float, default=2.0)
 parser.add_argument("--arm_kp", type=str, default=None,
                     help="Comma-separated 7 stiffness values overriding the training "
                          "gains, e.g. '1600,1600,1200,800,500,300,150'.")
 parser.add_argument("--arm_kd", type=str, default=None,
-                    help="Comma-separated 7 damping values. The 2026-07-16 Polymetis "
+                    help="Comma-separated 7 damping values. The Polymetis "
                          "realignment candidate is '85,135,110,25,18,10,5' "
                          "(ARM_KD_POLYMETIS_IT2); the training default is "
                          "'145,135,110,100,50,30,15'.")
@@ -97,11 +96,14 @@ from isaaclab.actuators import ImplicitActuatorCfg
 
 # Arm gains: default to what TRAINING uses, so the replay measures the plant the
 # trained policy actually meets. --arm_kp / --arm_kd override for evaluating a
-# candidate set (e.g. the 2026-07-16 Polymetis realignment, ARM_KD_POLYMETIS_IT2).
+# candidate set (e.g. ARM_KD_POLYMETIS_IT2 from the Polymetis realignment).
 from dexx import deploy_config as _dcfg  # noqa: E402
-from dexx.tasks.franka_sharpa.franka_sharpa_critic_horizon_cfg import (  # noqa: E402
-    ARM_TUNED_KP, ARM_TUNED_KD,
-)
+try:
+    from dexx.robot_constants import ARM_TUNED_KP, ARM_TUNED_KD  # noqa: E402
+except ImportError:  # fallback: the critic-horizon cfg re-exports the tuned arm set
+    from dexx.tasks.franka_sharpa.franka_sharpa_critic_horizon_cfg import (  # noqa: E402
+        ARM_TUNED_KP, ARM_TUNED_KD,
+    )
 
 _JOINTS = [f"fr3_joint{i}" for i in range(1, 8)]
 
@@ -126,9 +128,6 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-
-
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 def main():
@@ -179,9 +178,7 @@ def main():
                 joint_names_expr=["fr3_joint.*"],
                 # Default to the gains TRAINING uses, so the replay answers
                 # "what plant does my trained policy actually meet?". Override
-                # with --arm_kp / --arm_kd to evaluate a candidate set; this
-                # file used to carry its own private copy, which meant it could
-                # validate gains the trainer never used.
+                # with --arm_kp / --arm_kd to evaluate a candidate set.
                 stiffness=dict(_ARM_KP),
                 damping=dict(_ARM_KD),
             ),
@@ -349,6 +346,11 @@ def main():
         pickle.dump(data, f)
     print(f"[OK] Saved to {out_path}")
 
+    # Release the simulation context first; otherwise simulation_app.close() hangs.
+    _sim = sim_utils.SimulationContext.instance()
+    if _sim is not None:
+        _sim.clear_all_callbacks()
+        _sim.clear_instance()
     simulation_app.close()
 
 

@@ -5,14 +5,13 @@ can replay, and verify it rather than trust it.
 
 ## Run it
 
-```bash
-python scripts/retarget.py --side right \
-  --data_idx rt/0416_grasp/cube_small_2 --iter 5000 --headless
-```
+The command and flags are in [RETARGET.md](../../docs/RETARGET.md). Point
+`--dump_root` at a scratch directory such as `logs/retarget`: the default output
+root is where the shipped demos live.
 
 Two stages of Adam: stage 1 solves the arm alone to reach the wrist target, stage
-2 opens up the hand and the arm's base yaw together to match fingertips. 5000
-iterations takes roughly three minutes on one GPU.
+2 opens up the hand and the arm together to match fingertips. The default
+`--iter 4000` is the recommended value.
 
 **Pass the sequence's placement offsets** (lesson 01's table). Omitting them moves
 the object and confounds whatever you were actually testing.
@@ -23,62 +22,75 @@ After fitting, the mean arm end-effector error over the trajectory is compared
 against `--reachability_th` (0.08 m). Above it, the variant is marked
 `reachable=False` and a partial pkl is written, which the training loader skips.
 
-Healthy values for the shipped demos are 1.3–2.1 cm. A sequence at 7 cm is
-telling you the demonstration does not fit your robot's workspace, not that it
-needs more iterations.
+Healthy values are a small fraction of the threshold — a couple of centimetres.
+A sequence close to the threshold is telling you the demonstration does not fit
+your robot's workspace, not that it needs more iterations.
 
 ## Two things that will waste your afternoon
 
-**The output has to be copied to where it is read.** `scripts/retarget.py` writes
-into `data/retargeting/...`, but the motion-preparation step goes through the
-dataset loader, which reads the same relative path under its own root. A retarget
-that is not copied across is silently ignored — the next stage reports success and
-emits a file built from whatever was there before.
+**The output path is also the input path.** By default `scripts/retarget.py`
+writes to `data/retargeting/robotool_batch/mano2sharpa_rh/<task>/<obj>@<n>.pkl`,
+the same root the dataset loader reads — no copy step, but also no protection: a
+retarget run replaces what training will use next. An unreachable result never
+overwrites a reachable one (`[KEEP]`), but a worse reachable one will. Retarget
+into a scratch `--dump_root`, check it, and then either move it into place or
+point training at it (`--env_cfg robotool_batch_retarget_root=<dir>`, `--ref_root`).
 
-**Isaac Sim does not exit when the work is done.** The process finishes its
-optimization, writes its pkl, and then sits at 100% CPU forever. A `for` loop over
-sequences therefore never reaches the second one. One such process was found still
-spinning **seven days** after it had written its output.
-
-So do not key a runner on whether the process is alive, and do not key it on CPU
-either — a hung process is indistinguishable from a working one by load. Key it on
-**the artefact the process was supposed to produce**:
+**Isaac Sim can hang on exit.** If the simulation context is still alive when
+`simulation_app.close()` runs, the process can finish its optimization, write its
+pkl, and then sit at 100% CPU forever. `retarget.py` releases the context first
+(as `env.close()` does in the gym scripts) and exits normally, so a plain loop
+works:
 
 ```bash
-before=$(stat -c %Y "$PKL" 2>/dev/null || echo 0)
-python -u scripts/retarget.py ... &          # note -u: block-buffered logs look like hangs
-pid=$!
-while sleep 10; do
-  [ "$(stat -c %Y "$PKL" 2>/dev/null || echo 0)" != "$before" ] && break
+for seq in 0416_grasp/cube_small_1 0416_grasp/cube_small_2; do
+  python -u scripts/retarget.py --data_idx rt/$seq --side right --headless \
+      --dump_root logs/retarget_scratch        # note -u: see below
 done
-sleep 20; kill -9 $pid                        # let it flush, then stop it
 ```
 
+If you write a new Isaac entry point, close the env (or clear the
+`SimulationContext`) before `simulation_app.close()`, or it will hang the same way.
+
 The `-u` matters: without it Python block-buffers stdout to a file and the log can
-sit unchanged for 45 minutes while the run is perfectly healthy. Two separate
-diagnoses were wasted on that.
+sit unchanged for a long time while the run is perfectly healthy. Do not diagnose
+a stalled log before you have ruled that out.
 
 ## Verify before you train on it
 
+Look at the demonstration itself first: `tools/dataset/vis_sequence.py --sequence
+<task>/<seq>` shows the hand and object as the loader will see them. Rotating a
+task, fixing the object's resting height or a hand offset are all in
+[tools/dataset](../../tools/dataset/README.md); every such edit needs a re-run of
+the retarget.
+
+Check the reachability numbers the run printed (above), then look at the result
+the way the environment will load it:
+
 ```bash
-python scripts/check_asset_equivalence.py     # asset side
+python tools/dataset/view_retarget.py --data_idx rt/<task>/<seq>@0 [--retarget_root logs/retarget]
 ```
 
-and, for the motion itself, replay the stored joint trajectory through the URDF
-and compare against the stored body positions. Under a millimetre means the joint
-ordering, the frame convention and the frame rate all line up. Two orders of
-magnitude worse means a joint-order bug (lesson 02).
+It draws the robot (FK of the retargeted joints on the merged URDF), the object,
+the table and the MANO targets in env-local coordinates, with a frame slider, and
+prints the frame-0 checks (`--summary_only` prints them without a browser):
+object bottom vs table, wrist height, end-effector position and rotation error,
+per-finger tip error, fingertips within 8 mm of the object. Scrub through the
+grasp: the closest fingertip-to-object distance is the number that tells you the
+*hand-object relationship* survived, which is what lesson 01 is protecting.
 
-Also look at the closest fingertip-to-object distance across the demo. It is the
-one number that tells you the *hand-object relationship* survived, which is what
-lesson 01 is protecting.
+`FK vs retarget's stored EE` replays the stored joints through the URDF and
+compares with the body positions the retarget stored: more than a few mm means
+the joints are being applied in the wrong order or to the wrong URDF (lesson 02).
 
 ## Porting: a new task or new objects
 
 1. Collect the MANO demonstration and object trajectory in the source format.
 2. Retarget it; record its placement offsets in lesson 01's table.
-3. Check reachability, then replay-verify.
+3. Check reachability, then `view_retarget.py`: frame 0 and the grasp.
 4. Add it to `--data_idx` for the teacher (04) and the student (05).
 
-Object *shape* reaches the policy through a BPS encoding of the mesh, so a new
-object needs its mesh present — not just its trajectory.
+A new object needs its mesh present, not just its trajectory: the teacher reads
+the object's shape as a BPS encoding of the mesh, the simulator needs it for
+contact, and the depth camera renders it. The lean student does not read BPS — it
+sees shape only through the point cloud — but it is labelled by a teacher that does.

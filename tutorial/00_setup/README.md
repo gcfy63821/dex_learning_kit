@@ -17,6 +17,20 @@ First prepare the pinned Lab checkout and system prerequisites in
 script matches PyTorch3D to its exact build. Project dependencies are pinned
 where API compatibility requires it and installed under shared constraints.
 
+**uv alternative** — no conda; Isaac Sim comes from NVIDIA's pip wheels
+(needs glibc >= 2.34), or from a binary download with `--isaacsim`:
+
+```bash
+bash tutorial/00_setup/setup_uv.sh --isaaclab /path/to/IsaacLab --venv .venv --accept-eula
+#   older glibc (e.g. Ubuntu 20.04): add --isaacsim /path/to/isaac-sim
+source .venv/bin/activate
+```
+
+`--accept-eula` accepts the NVIDIA Omniverse EULA in the venv's activate
+script; without it the Sim wheels prompt on first import. Behind a slow
+PyPI, point uv at a mirror with `UV_DEFAULT_INDEX=<mirror>/simple`.
+See [MANUAL_SETUP.md](MANUAL_SETUP.md#uv-route).
+
 ```bash
 --name myenv                  # another dedicated conda environment name
 --verify-only                 # check an existing env; install nothing
@@ -71,10 +85,9 @@ would it still work? It looks for symlinks that leave the repository, absolute
 paths baked into code or config, and demonstrations whose source data or meshes
 are not actually committed.
 
-Run it after adding a demonstration or an asset. The first time it ran it found
-four external symlinks — three of the four shipped demonstrations resolved only
-on the author's machine — and eleven absolute paths. Nothing had failed; the
-repository simply could not have been used anywhere else.
+Run it after adding a demonstration or an asset. A repository can pass every
+other check and still work only on the machine it was built on; nothing fails
+until someone else tries to use it.
 
 ## What runs where
 

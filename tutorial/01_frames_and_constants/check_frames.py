@@ -8,6 +8,7 @@ Pure arithmetic — no Isaac Sim, runs in a second.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 from dexx import deploy_config as dc
@@ -27,25 +28,25 @@ def main() -> int:
     table = float(dc.TABLE_SURFACE_Z)
     base_z = float(dc.ARM_BASE_Z)
     base = tuple(float(x) for x in dc.ARM_BASE_POS)
-    wrist = tuple(float(x) for x in dc.WRIST_POS_OFFSET)
     lo = tuple(float(x) for x in dc.PC_WORKSPACE_MIN)
     hi = tuple(float(x) for x in dc.PC_WORKSPACE_MAX)
 
-    print(f"table={table}  arm_base_z={base_z}  wrist_offset_z={wrist[2]}")
+    print(f"table={table}  arm_base_z={base_z}")
     print(f"workspace x {lo[0]}..{hi[0]}  y {lo[1]}..{hi[1]}  z {lo[2]}..{hi[2]}\n")
 
     print("=== the decoupling invariant")
     # The demonstration is placed relative to the TABLE, never the arm base.
     # If these are tied together, moving the robot drags the demo with it and the
-    # grasp silently shifts. This is the bug that motivated the check.
-    check("demo placement is anchored to the table, not the arm base",
-          abs(wrist[2] - table) < 1e-9,
-          f"WRIST_POS_OFFSET.z={wrist[2]} should equal TABLE_SURFACE_Z={table}. "
-          f"If it equals ARM_BASE_Z instead, re-mounting the arm will move the "
-          f"demonstration and break the hand-object relationship.")
-    check("demo placement xy matches the arm base xy",
-          abs(wrist[0] - base[0]) < 1e-9 and abs(wrist[1] - base[1]) < 1e-9,
-          f"{wrist[:2]} vs {base[:2]}")
+    # grasp silently shifts.
+    # The demo is lifted into the scene by the loader's mujoco2gym transform,
+    # whose translation must be the table height in both the env and the retargeter.
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    for rel in ("src/dexx/tasks/franka_sharpa/franka_sharpa_env.py", "scripts/retarget.py"):
+        src = open(os.path.join(repo, rel)).read()
+        check(f"demo placement in {rel} is anchored to TABLE_SURFACE_Z",
+              "_dcfg.TABLE_SURFACE_Z" in src and "ARM_BASE_Z" not in src,
+              "the mujoco2gym translation must read deploy_config.TABLE_SURFACE_Z; "
+              "tying it to the arm base moves the demonstration when the arm is re-mounted")
 
     print("\n=== the crop box")
     check("crop floor is above the table top",

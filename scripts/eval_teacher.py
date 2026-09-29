@@ -26,7 +26,7 @@ Per-episode records (saved to JSON):
   - fail_cause (list of fail/* that fired)
 
 Usage:
-  python dexx/scripts/gym_style/eval_policy.py \
+  python scripts/eval_teacher.py \
       --task franka-sharpa-force-poseobs \
       --load_path logs/.../best.pth \
       --side right \
@@ -62,18 +62,7 @@ parser.add_argument("--max_steps_per_mode", type=int, default=4000,
                     help="Hard ceiling on play steps per mode (safety).")
 parser.add_argument("--modes", nargs="+",
                     default=["early", "pre_contact", "random", "per_stage"],
-                    choices=["early", "pre_contact", "random", "per_stage",
-                             "semantic_stage"])
-parser.add_argument("--stage_json", type=str, default=None,
-                    help="Path to stage JSON (from label_trajectory_stages.py); "
-                         "required when 'semantic_stage' is in --modes.")
-parser.add_argument("--semantic_window", type=int, default=0,
-                    help="`semantic_stage`: sample init seq_idx uniformly in "
-                         "[stage_start - W, stage_start + W] per env (clamped). "
-                         "Default 0 = lo=hi=stage_start (exact reset).")
-parser.add_argument("--early_cap_by_reach", action="store_true", default=False,
-                    help="`early` mode: cap hi by each demo's t_grasp (= reach_max_idx) "
-                         "from --stage_json. So hi = min(early_max_frame, t_grasp) per env.")
+                    choices=["early", "pre_contact", "random", "per_stage"])
 parser.add_argument("--save_traj", action="store_true", default=False,
                     help="Store per-frame trajectory tracking arrays "
                          "(traj_pos_dist, traj_rot_deg) in records.json. "
@@ -90,6 +79,10 @@ parser.add_argument("--eval_no_terminate", action="store_true",
                     help="Disable env terminations; let episode run to time_out.")
 parser.add_argument("--out_dir", type=str, required=True)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--expand_aug", action="store_true", default=False,
+                    help="Evaluate every retarget augmentation variant ({demo}@{aug}) of each "
+                         "demo. By default only the base demos are evaluated and reported "
+                         "under their base IDs (DISABLE_AUG_EXPAND=1).")
 
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
@@ -98,6 +91,12 @@ app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 # Rest follows
+# Base demos unless --expand_aug: the env reads this when it builds data_indices.
+if args.expand_aug:
+    os.environ.pop("DISABLE_AUG_EXPAND", None)
+else:
+    os.environ["DISABLE_AUG_EXPAND"] = "1"
+
 import ast
 import json as _json
 import time
@@ -109,7 +108,6 @@ import numpy as np
 import torch
 
 import dexx.tasks.franka_sharpa  # noqa: F401
-import dexx.tasks.hand_imitation  # noqa: F401
 from dexx.algo.ppo.ppo import PPO
 from dexx.wrapper.sharpa_wave_env_wrapper import GymStyleEnvWrapper
 from dexx.wrapper.config_wrapper import ConfigWrapper
@@ -168,13 +166,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     if hasattr(env_cfg, "data_indices"):
         env_cfg.data_indices = parse_data_idx(args.data_idx)
     # Disable randomness / curriculum for clean eval
-    env_cfg.reset_random_quat = False
     env_cfg.randomize_pd_gains = False
     env_cfg.randomize_friction = False
     env_cfg.randomize_com = False
     env_cfg.randomize_mass = False
     env_cfg.sim.gravity = (0, 0, -9.81)
-    env_cfg.gravity_curriculum = False
     if hasattr(env_cfg, "init_curriculum_enabled"):
         env_cfg.init_curriculum_enabled = False
     env_cfg.random_state_init = True  # We override via _eval_init_seq_idx_*
@@ -200,7 +196,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
               f"({len(expanded_indices)}); variants {args.num_envs}.. are NOT covered.")
 
     def _demo_category(idx_str: str) -> str:
-        """`rt/0422_multi/peg_1@0_dxn1.3cm...` -> `peg` (strip path/@aug/_N)."""
+        """`rt/0420_manip/squeegee_1@0_dxn1.3cm...` -> `squeegee` (strip path/@aug/_N)."""
         base = idx_str.split("@")[0].rstrip("/")
         exp = base.split("/")[-1]
         head, _, tail = exp.rpartition("_")
@@ -218,7 +214,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     # Build agent
     config = ConfigWrapper(agent_cfg, env_cfg, test=True)
     log_dir = os.path.join(args.out_dir, "_log")
-    AgentCls = eval(agent_cfg.get("algo", "PPO"))
+    _agents = {"PPO": PPO}
+    _algo = agent_cfg.get("algo", "PPO")
+    if _algo not in _agents:
+        raise SystemExit(f"unsupported algo {_algo!r} in the agent cfg; "
+                         f"this release ships only {sorted(_agents)}")
+    AgentCls = _agents[_algo]
     agent = AgentCls(env, output_dir=log_dir, full_config=config, create_output_dir=False)
     print(f"[eval_policy] loading ckpt: {args.load_path}")
     agent.restore_test(args.load_path)
@@ -420,83 +421,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         base_env.set_eval_init_range(None, None)  # restore default sampling
         return records
 
-    # ---- Load semantic stage JSON (reach/grasp/move boundaries) ----
-    # Loaded if semantic_stage mode is requested OR --early_cap_by_reach is set.
-    stage_data = None
-    _need_stage = ("semantic_stage" in args.modes) or getattr(args, "early_cap_by_reach", False)
-    if _need_stage:
-        if not args.stage_json:
-            raise SystemExit("[eval_policy] --stage_json is required for "
-                             "'semantic_stage' / --early_cap_by_reach.")
-        if not os.path.exists(args.stage_json):
-            raise SystemExit(f"[eval_policy] --stage_json not found: {args.stage_json}")
-        with open(args.stage_json) as f:
-            stage_data = _json.load(f)
-        print(f"[eval_policy] loaded stage_json: {args.stage_json} "
-              f"({len(stage_data)} demos)")
-
-    def _base_demo(e: int) -> str:
-        """env e -> base demo idx `rt/<group>/<name>` (strip @aug suffix)."""
-        if not expanded_indices:
-            return ""
-        return expanded_indices[e % len(expanded_indices)].split("@")[0].rstrip("/")
-
-    SEMANTIC_STAGES = ["reach", "grasp", "move"]
-
-    def _semantic_stage_range(stage: str):
-        """Per-env (lo, hi) tensors, both = the stage-start frame for `stage`.
-        reach -> 0, grasp -> t_grasp, move -> t_move. Clamped to [0, seq_len-1].
-        Envs whose base demo is missing from stage_json get lo=hi=0 + warning.
-
-        Special case: when an entry has `stage_type == "move-only"`, *all three*
-        stage modes for that env sample uniformly over the **whole trajectory**
-        `[0, seq_len-1]` (the semantic_window is ignored). This is for tasks
-        where the whole demo is one continuous "move" (rotation / in-place
-        manipulation): pooling across the 3 modes then yields ~3× uniform
-        random-frame samples per demo.
-        """
-        frames = torch.zeros(args.num_envs, dtype=torch.long, device=device)
-        is_move_only = torch.zeros(args.num_envs, dtype=torch.bool, device=device)
-        for e in range(args.num_envs):
-            base = _base_demo(e)
-            entry = stage_data.get(base) if stage_data else None
-            if entry is None:
-                print(f"[eval_policy] WARNING: base demo '{base}' (env {e}) not "
-                      f"in stage_json; using lo=hi=0 for stage '{stage}'.")
-                frames[e] = 0
-                continue
-            if entry.get("stage_type") == "move-only":
-                is_move_only[e] = True
-                frames[e] = 0  # placeholder; lo/hi will be overridden below
-                continue
-            if stage == "reach":
-                f = 0
-            elif stage == "grasp":
-                f = int(entry.get("t_grasp", 0))
-            else:  # move
-                f = int(entry.get("t_move", 0))
-            frames[e] = f
-        frames = torch.clamp(frames, min=0)
-        frames = torch.minimum(frames, (seq_lens - 1).clamp(min=0))
-        # Optional ±window sampling around each stage's start frame: env will
-        # uniformly sample seq_idx in [lo, hi] per env. window=0 (default) ->
-        # lo=hi=frames (exact reset, current behaviour).
-        w = int(getattr(args, "semantic_window", 0) or 0)
-        if w > 0:
-            lo = torch.clamp(frames - w, min=0)
-            hi = torch.minimum(frames + w, (seq_lens - 1).clamp(min=0))
-        else:
-            lo = frames.clone(); hi = frames.clone()
-        # NOTE: move-only override removed —— now move-only demos use the
-        # stage_json's (t_grasp, t_move) as-is (typically both 0) and sample
-        # the standard semantic_window around them. With t_grasp=t_move=0 and
-        # window=W, all 3 stages sample [0, W]. To revert to full-trajectory
-        # uniform sampling for move-only, uncomment:
-        # max_idx = (seq_lens - 1).clamp(min=0)
-        # lo = torch.where(is_move_only, torch.zeros_like(lo), lo)
-        # hi = torch.where(is_move_only, max_idx, hi)
-        return lo, hi
-
     # ---- Define each mode's per-env (lo, hi) ----
     def mode_ranges():
         out = {}
@@ -504,18 +428,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
             lo = torch.zeros(args.num_envs, dtype=torch.long, device=device)
             hi = torch.full((args.num_envs,), args.early_max_frame, dtype=torch.long, device=device)
             hi = torch.minimum(hi, (seq_lens - 1).clamp(min=0))
-            # Optional: cap upper bound by each demo's reach_max_idx (= t_grasp).
-            # Requires --stage_json. For demos with t_grasp=0 (grasp+move /
-            # move-only types), this collapses to hi=0 (only frame 0 allowed).
-            if getattr(args, "early_cap_by_reach", False):
-                if stage_data is None:
-                    raise SystemExit("--early_cap_by_reach requires --stage_json")
-                cap = torch.zeros(args.num_envs, dtype=torch.long, device=device)
-                for e in range(args.num_envs):
-                    base = _base_demo(e)
-                    entry = stage_data.get(base)
-                    cap[e] = int(entry.get("t_grasp", 0)) if entry else 0
-                hi = torch.minimum(hi, cap)
             out["early"] = (lo, hi)
         if "pre_contact" in args.modes:
             lo = torch.zeros(args.num_envs, dtype=torch.long, device=device)
@@ -534,10 +446,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                 hi = (seq_lens.float() * hi_f).long().clamp(max=seq_lens - 1)
                 hi = torch.maximum(hi, lo)
                 out[f"per_stage/{s}_of_{N}"] = (lo, hi)
-        if "semantic_stage" in args.modes:
-            for stage in SEMANTIC_STAGES:
-                lo, hi = _semantic_stage_range(stage)
-                out[f"semantic:{stage}"] = (lo, hi)
         return out
 
     # ---- Run all modes ----
@@ -735,94 +643,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     print(md_text)
     print("="*68)
     print(f"[eval_policy] saved deliverable table to {out_table}")
-
-    # ---- Semantic per-stage (reach/grasp/move) breakdown + dedicated JSONs ----
-    if "semantic_stage" in args.modes:
-        sem_modes = [f"semantic:{s}" for s in SEMANTIC_STAGES]
-        sem_present = [m for m in sem_modes if m in all_records]
-
-        # Per-episode records flattened across reach/grasp/move.
-        stage_records: list[dict] = []
-        for stage in SEMANTIC_STAGES:
-            mode = f"semantic:{stage}"
-            for r in all_records.get(mode, []):
-                stage_records.append({
-                    "stage": stage,
-                    "category": _env_cat(r.env_id),
-                    "demo_idx": _env_demo(r.env_id),
-                    "init_frame": r.init_frame,
-                    "survival_len": r.survival_len,
-                    "success": bool(r.succeeded),
-                    "min_final_dist": r.min_final_dist,
-                    "end_final_dist": r.end_final_dist,
-                    "min_final_rot_deg": r.min_final_rot_deg,
-                    "end_final_rot_deg": r.end_final_rot_deg,
-                    "max_traj_pos_dist": r.max_traj_pos_dist,
-                    "mean_traj_pos_dist": r.mean_traj_pos_dist,
-                    "max_traj_rot_deg": r.max_traj_rot_deg,
-                    "mean_traj_rot_deg": r.mean_traj_rot_deg,
-                    "traj_pos_dist": r.traj_pos_dist,
-                    "traj_rot_deg": r.traj_rot_deg,
-                    "fail_causes": r.fail_causes,
-                    "obj_start": [round(float(v), 6) for v in r.obj_start],
-                    "obj_end": [round(float(v), 6) for v in r.obj_end],
-                })
-        out_stage_records = os.path.join(args.out_dir, "stage_eval_records.json")
-        with open(out_stage_records, "w", encoding="utf-8") as f:
-            _json.dump(stage_records, f, indent=2)
-
-        # Per-stage x per-category success counts/rates.
-        sem_cats = sorted({rec["category"] for rec in stage_records})
-        stage_summary: dict[str, Any] = {}
-        for stage in SEMANTIC_STAGES:
-            if f"semantic:{stage}" not in all_records:
-                continue
-            recs_s = [rec for rec in stage_records if rec["stage"] == stage]
-            n = len(recs_s)
-            s = sum(1 for rec in recs_s if rec["success"])
-            per_cat = {}
-            for c in sem_cats:
-                rc = [rec for rec in recs_s if rec["category"] == c]
-                cs = sum(1 for rec in rc if rec["success"])
-                per_cat[c] = {
-                    "success": cs, "n": len(rc),
-                    "success_pct": round(100.0 * cs / len(rc), 2) if rc else 0.0,
-                }
-            stage_summary[stage] = {
-                "overall": {
-                    "success": s, "n": n,
-                    "success_pct": round(100.0 * s / n, 2) if n else 0.0,
-                },
-                "by_category": per_cat,
-            }
-        out_stage_summary = os.path.join(args.out_dir, "stage_eval_summary.json")
-        with open(out_stage_summary, "w", encoding="utf-8") as f:
-            _json.dump(stage_summary, f, indent=2)
-
-        # Console table: per-stage x per-category success.
-        print("\n" + "="*68)
-        print("[eval_policy] SEMANTIC STAGE success (reach / grasp / move)")
-        print("="*68)
-        stages_done = [s for s in SEMANTIC_STAGES if s in stage_summary]
-        hdr = f"  {'task category':22s} | " + " | ".join(
-            f"{s:^16s}" for s in stages_done)
-        print(hdr)
-        print("  " + "-" * (len(hdr) - 2))
-        for c in sem_cats:
-            cells = []
-            for stage in stages_done:
-                x = stage_summary[stage]["by_category"][c]
-                cells.append(f"{x['success_pct']:5.1f}% ({x['success']:3d}/{x['n']:3d})")
-            print(f"  {c:22s} | " + " | ".join(f"{cell:^16s}" for cell in cells))
-        print("  " + "-" * (len(hdr) - 2))
-        ovcells = []
-        for stage in stages_done:
-            x = stage_summary[stage]["overall"]
-            ovcells.append(f"{x['success_pct']:5.1f}% ({x['success']:3d}/{x['n']:3d})")
-        print(f"  {'ALL':22s} | " + " | ".join(f"{cell:^16s}" for cell in ovcells))
-        print("="*68)
-        print(f"[eval_policy] saved per-episode stage records to {out_stage_records}")
-        print(f"[eval_policy] saved per-stage summary to {out_stage_summary}")
+    # Close the env before the app: without it simulation_app.close() hangs.
+    base_env.close()
 
 
 if __name__ == "__main__":

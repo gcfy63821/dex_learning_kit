@@ -1,78 +1,69 @@
-# Debug & calibration tools (reference)
+# Tool index
 
-The release ships the Polymetis deploy runtime (`deploy/`) **and** the camera
-calibration chain (`tools/calib/`). A few bring-up and profiling tools are not
-bundled; they are listed at the end so you know they exist.
+One line per tool; the linked lesson or doc has the procedure and the flags.
 
-## Camera extrinsic calibration — **BUNDLED in `tools/calib/`**
+## Demonstration data — [tools/dataset/README.md](../tools/dataset/README.md)
 
-The full chain ships with this release. **[tutorial/06](../tutorial/06_camera_calibration/)**
-is the step-by-step procedure; this table is the reference.
-
-| Tool | Purpose |
+| tool | purpose |
 |---|---|
-| `deploy/move_to_frame_polymetis.py` | drive the real arm to a demonstration frame so sim and real match |
-| `tools/calib/capture_multiframe_zmq.py` | accumulate N ZMQ depth+colour frames into one dense camera-frame cloud |
+| `tools/dataset/vis_sequence.py` | preview a demonstration (hand keypoints + object) in the browser |
+| `tools/dataset/rotate_task_z.py` | rotate a task's demonstrations about a world axis; `--restore` undoes |
+| `tools/dataset/view_retarget.py` | the **retargeted** robot (FK) + object + table + MANO targets in env-local, as the env loads them; frame-0 checks (`--summary_only` prints them) |
+| `tools/dataset/drop_test.py` | settle the object on the table in sim → `z_bottom_offset` |
+| `tools/dataset/adjust_*.py`, `edit_frame_range_pose.py`, `offset_editor.py` | manual hand/object/aux offset and pose fixes |
+
+## Camera calibration — [tutorial/06](../tutorial/06_camera_calibration/)
+
+| tool | purpose |
+|---|---|
+| `tools/calib/handeye_to_extrinsic.py` | step 0 (new mount): easy_handeye(2) eye-on-base result → initial 4×4 in `fr3_link0`, colour → depth frame |
+| `tools/calib/calibrate_extrinsic_live_icp.py` | recommended step 1: `capture` (depth + bridge joints) at several arm poses, `solve` joint ICP against the FK-posed sim arm → 4×4 |
+| `tools/calib/level_extrinsic_to_table.py` | recommended step 2: keep yaw/in-plane translation, re-fit height + tilt to the table plane (arm excluded by FK) |
+| `deploy/move_to_frame_polymetis.py` | drive the real arm to a retargeted demo frame so sim and real match |
+| `tools/calib/capture_multiframe_zmq.py` | accumulate N depth frames from the ZMQ publisher into one camera-frame cloud |
 | `tools/calib/gen_sim_frame_ply.py` | URDF FK at that frame → sim robot + table point cloud |
-| `tools/calib/icp_align_extrinsic.py` | Kabsch/SVD ICP, real onto sim → refined 4×4 |
-| `tools/calib/live_calibrate_extrinsic.py` | viser browser session: overlay + sliders, save to `.npy` |
-| `tools/calib/viz_cropped_overlay.py` | cropped real vs cropped sim — what the policy actually sees |
-| `tutorial/06_camera_calibration/inspect_extrinsic.py` | validate a 4×4 and report drift between two of them |
+| `tools/calib/icp_align_extrinsic.py` | Kabsch/SVD ICP of the real cloud onto sim → refined 4×4 |
+| `tools/calib/live_calibrate_extrinsic.py` | browser (viser) overlay with sliders; saves the 4×4 |
+| `tools/calib/viz_cropped_overlay.py` | cropped real vs cropped sim cloud — what the policy sees |
+| `tutorial/06_camera_calibration/inspect_extrinsic.py` | validate the shipped 4×4s and report drift between them |
 
-All of them read `dexx.deploy_config` for table height, arm-base height, crop box
-and intrinsics, so they cannot silently disagree with the trainer.
+## Dynamics system-ID — [tutorial/07](../tutorial/07_dynamics_alignment/)
 
-The camera-host depth publisher (`realsense_depth_zmq_pub.py`) is the one piece
-that lives on the camera host rather than in either repository.
-
-## Dynamics / gain system-ID — **BUNDLED in `tools/sysid/`**
-
-Replays a motion in sim and on the real arm and diffs them. **[tutorial/07](../tutorial/07_dynamics_alignment/)**
-has the procedure and how to read the numbers.
-
-| Tool | Purpose |
+| tool | purpose |
 |---|---|
-| `tools/sysid/motions/`, `motions_hand/` | pre-generated CSV+JSON motions (`chirp_sweep`, `step_per_joint`, `sin_j*`, `backlash_detection`, …) |
-| `tools/sysid/generate_motions.py` / `generate_hand_motions.py` | regenerate or add motions, with an FR3 safety check |
-| `tools/sysid/replay_motion_sim.py` | sim replay at the training gains; `--arm_kp/--arm_kd` to test a candidate |
-| `tools/sysid/replay_motion_polymetis.py` | real replay via Polymetis; `--dry_run` first |
-| `tools/sysid/replay_hand_motion_sim.py` / `_real.py` | the hand equivalents (Sharpa SDK, no ROS2) |
-| `tools/sysid/step_response_sim.py`, `analyze_step_response.py` | rise time / overshoot per joint |
-| `tools/sysid/analyze_motion.py` | sim-vs-real per-joint metrics + overlay plots → `metrics.csv`, two PNGs |
+| `tools/sysid/motions/`, `motions_hand/` | pre-generated arm / hand motions ([format](../tools/sysid/motions/README.md)) |
+| `tools/sysid/generate_motions.py`, `generate_hand_motions.py` | regenerate or add motions, with an FR3 safety check |
+| `tools/sysid/replay_motion_sim.py` | sim replay at the training gains; `--arm_kp/--arm_kd` for a candidate |
+| `tools/sysid/replay_motion_polymetis.py` | real-arm replay through the Polymetis bridge |
+| `tools/sysid/replay_motion_ros2.py`, `step_response_ros2.py` | real-arm replay / step response over ROS2 (`/teleop_joint_commands` → `/joint_states`); same pkl schema |
+| `tools/sysid/replay_hand_motion_sim.py`, `replay_hand_motion_real.py` | the hand equivalents (real side via the Sharpa SDK) |
+| `tools/sysid/step_response_sim.py`, `analyze_step_response.py` | per-joint step response: rise time, overshoot |
+| `tools/sysid/analyze_motion.py` | sim-vs-real per-joint metrics and overlay plots |
 
-The two ROS2 recorders (`replay_motion_real.py`, `step_response_real.py`) are
-deliberately not bundled: the live arm path here is Polymetis, and shipping both
-invites recording through the wrong one.
+## Assets — [assets/ASSETS.md](../assets/ASSETS.md)
 
-## Polymetis arm backend — **BUNDLED in `deploy/`**
+| tool | purpose |
+|---|---|
+| `scripts/build_merged_urdf.py` | merge the vendored FR3 + Sharpa Wave URDFs |
+| `scripts/build_robot_usd.py` | convert the merged URDF to the committed robot USD, with self-collision filters |
+| `scripts/check_asset_equivalence.py` | merged-URDF link frames vs a reference USD, no simulator |
+| `tools/calibrate_elastomer_ids.py` | find the fingertip-elastomer collision-shape indices for friction DR |
 
-The polymetis deploy path is fully included in this release:
+## Deploy runtime — [docs/DEPLOY.md](DEPLOY.md)
 
-| Tool | Where it runs | Purpose |
+| tool | runs on | purpose |
 |---|---|---|
-| `deploy/polymetis_joint_bridge.py` | **NUC** (polymetis-local env) | bridges local Polymetis server ↔ ZMQ (state :5560 / cmd :5561). Required for the polymetis deploy path. |
-| `deploy/move_to_frame_polymetis.py` | inference PC | move real arm to a pkl frame. |
-| `deploy/test_polymetis_arm.py` | inference PC | sanity-check the bridge connection / arm state. |
+| `deploy/polymetis_joint_bridge.py` | NUC | Polymetis ↔ ZMQ (state :5560, cmd :5561) |
+| `deploy/realsense_depth_zmq_pub.py` | camera host | depth-only ZMQ publisher (D455, 320×240) |
+| `deploy/test_polymetis_arm.py` | workstation | sanity-check the bridge and arm state |
+| `deploy/ros2/apply_sharpa_load.py` | robot PC (ROS2 backend) | push the Sharpa hand load to FCI (`set_load`) |
+| `deploy/ros2/wrist_state_publisher.py` | workstation (ROS2 backend) | `/joint_states` → FK → `/franka_wrist_state` @ 200 Hz; start before deploy |
+| `deploy/deploy_pc.py` | workstation | run a lean student on the robot |
+| `src/dexx/tasks/hand_imitation/deploy/polymetis_arm_client.py` | workstation | arm client used by the deploy env |
+| `src/dexx/scripts/deploy/realsense_depth_zmq_subscriber.py` | workstation | depth subscriber used by the deploy env |
+| `src/dexx/tasks/hand_imitation/deploy/ros2_arm_client.py` | workstation | ROS2 arm backend (`--arm_backend ros2`, experimental): wraps `ros2_observation_subscriber.py` + `ros2_action_publisher.py` |
+| `src/dexx/scripts/deploy/ros2_depth_subscriber.py` | workstation | ROS2 depth subscriber (`--depth_backend ros2`, experimental) |
+| `src/dexx/tasks/franka_sharpa/franka_sharpa_pointcloud_deploy_env.py` | workstation | the deploy env (and its parents) |
 
-Runtime env classes + client are under `src/dexx/`: `franka_sharpa_pointcloud_polymetis_deploy_env.py`,
-`tasks/hand_imitation/deploy/polymetis_arm_client.py`, `scripts/deploy/realsense_depth_zmq_subscriber.py`.
-See [DEPLOY.md](DEPLOY.md) for the full startup sequence.
-
-## Arm / PC debugging
-
-| Tool | Purpose |
-|---|---|
-| `tune_arm_gains.py` | sweep/set real arm joint-impedance Kq/Kqd. |
-| `analyze_arm_jitter.py` | quantify arm tracking jitter. |
-| `measure_pc_resample_jitter.py` | quantify PC subsample jitter frame-to-frame. |
-| `apply_sharpa_load.py` / `calibrate_payload.py` | set / calibrate the Sharpa hand FCI payload. |
-| `dump_real_pc_zmq.py` / `convert_real_depth_to_pc.py` | dump the real scene_pc as PLY for offline inspection. |
-| `viz_sim_vs_real_depth.py` / `viz_sim_real_align_rgb.py` | side-by-side sim vs real depth / RGB alignment. |
-
-## Notes
-
-- These tools depend on the same env / cfg code the release now has, plus (for the
-  ones that touch hardware) the `sharpa` hand SDK and Polymetis — only available on
-  the deploy machines.
-- The camera-host depth publisher (`realsense_depth_zmq_pub.py`) lives on the camera
-  host, not in either repo's tree.
+Tools that touch hardware also need Polymetis, the RealSense SDK or the Sharpa
+SDK on their respective hosts ([MANUAL_SETUP.md](../tutorial/00_setup/MANUAL_SETUP.md)).

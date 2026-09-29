@@ -1,12 +1,7 @@
 """Teacher checkpoint loading utilities.
 
-Extracted from `scripts/gym_style/collect_demos.py` so that scripts which
-need `load_teacher` (e.g. `train_dagger.py`) can import it WITHOUT pulling
-in collect_demos's module-level argparse — that argparse runs at import
-time and would consume `sys.argv`, breaking the importer's own arg parsing.
-
-Same `load_teacher` signature as before; `collect_demos.py` now re-exports
-from this module for backward compatibility.
+Free of module-level argparse, so any script that needs `load_teacher` can
+import it without this module consuming `sys.argv`.
 """
 from __future__ import annotations
 
@@ -90,7 +85,7 @@ def load_teacher(
         f"asymmetric={asymmetric}  action_dim={action_dim}"
     )
     if priv_info_dim is None:
-        priv_info_dim = 40  # final fallback (ancient pre-critic_horizon teachers)
+        priv_info_dim = 40  # final fallback (teachers without critic-horizon priv_info)
 
     if asymmetric:
         model = ActorCriticAsymmetric({

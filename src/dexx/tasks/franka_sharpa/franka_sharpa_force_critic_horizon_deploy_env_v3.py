@@ -3,18 +3,18 @@
 """V3 deploy env: replaces sim.step FK with pytorch_kinematics CPU FK.
 
 Why V3:
-  V2 was capped at ~7.5Hz on real hardware. Profiling showed the bottleneck
-  was a ~80ms PhysX pipeline per env step — fixed GPU launch / sync overhead
-  that does NOT scale down with num_envs=1 / decimation=1 / no-render. We
-  only kept sim.step around to refresh `self.hand.data.body_pos_w` because
-  the fingertip-tracking obs (delta_joints_pos / delta_joints_vel) reads it.
+  A PhysX sim.step costs ~80ms per env step on real hardware — fixed GPU
+  launch / sync overhead that does NOT scale down with num_envs=1 /
+  decimation=1 / no-render. V2 needs sim.step only to refresh
+  `self.hand.data.body_pos_w`, which the fingertip-tracking obs
+  (delta_joints_pos / delta_joints_vel) reads.
 
 What V3 does:
   Builds a pytorch_kinematics chain from the same URDF used in retargeting
   and runs FK on CPU each env step (~1-3 ms for a 29-joint chain at batch=1).
   No sim.step / scene.update / scene.write_data_to_sim. Everything else is
   inherited unchanged from FrankaSharpaForceCriticHorizonDeployEnv (which
-  itself extends V2): HandSDKWorker, ROS2 subscriber/publisher, e-stop,
+  itself extends V2): HandSDKWorker, Polymetis arm client, e-stop,
   emergency hold, debug recording, two-stage reset ramp via FR3 home pose,
   manual reset via 'r' key, etc.
 
@@ -53,6 +53,15 @@ from .franka_sharpa_force_critic_horizon_deploy_env import (
 )
 from .franka_sharpa_critic_horizon_cfg import FrankaSharpaCriticHorizonCfg
 
+# Staleness limit for the tactile stream, separate from deploy_max_sensor_age_s
+# (0.25 s, sized for the 200 Hz arm/hand state streams). Tactile frames are
+# polled non-blocking once per env step, and a channel legitimately returns
+# None on many polls (the Sharpa stream runs on its own ~130 ms cycle, not in
+# lockstep with the 30 Hz loop), so a per-channel gap of a few hundred ms is
+# normal. 1.0 s without a single good frame on some channel means that
+# channel is dead and its cached force is no longer an observation.
+TACTILE_MAX_AGE_S = 1.0
+
 
 class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDeployEnv):
     """Critic-Horizon deploy env, V3 — pytorch_kinematics FK in lieu of sim.step."""
@@ -63,8 +72,8 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         super().__init__(cfg, render_mode, **kwargs)
 
         # Cache for non-blocking tactile fetch (per-channel last good frame).
-        # See _get_tactile_info_nonblocking — V2's busy-loop polling was
-        # the main cause of 80ms steps once sim.step was removed.
+        # See get_tactile_info below — V2's blocking poll would dominate
+        # the step time.
         self._tactile_force_cache = torch.zeros(5, dtype=torch.float32, device=self.device)
         self._tactile_pos_cache = torch.zeros((5, 3), dtype=torch.float32, device=self.device)
         # Per-finger 3D force vector cache (elastomer-local frame from Sharpa F6).
@@ -76,6 +85,11 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         # (PC deploy env reads `self.last_contacts_vec3` shape (1, 5, 3)).
         self.last_contacts_vec3 = torch.zeros((1, 5, 3), dtype=torch.float32, device=self.device)
         self._prev_tactile_force_vec3 = torch.zeros((1, 5, 3), dtype=torch.float32, device=self.device)
+        # time.monotonic() of each channel's last good frame, and the start of
+        # the window the staleness check measures from (set lazily on the first
+        # check of a rollout, cleared on reset). See _sensor_ages.
+        self._tactile_last_good_t = [float("-inf")] * 5
+        self._tactile_age_t0 = None
 
         self._build_pk_chain()
         self._build_pk_joint_mapping()
@@ -106,7 +120,7 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
             "fr3_with_right_sharpa_wave.urdf" if side == "right"
             else "fr3_with_left_sharpa_wave.urdf"
         )
-        # Repo root is the cwd convention for this project (see CLAUDE.md).
+        # Repo root is the cwd convention for this project.
         urdf_path = os.path.join(
             os.getcwd(), "assets", "generated", urdf_filename
         )
@@ -166,12 +180,8 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
 
     def _read_real_arm_hand_joints_cpu(self):
         """Pull latest arm + hand joint readings, return CPU fp32 tensors.
-        Arm comes from ROS2 /joint_states; hand from the SDK worker cache."""
-        try:
-            arm_pos = self.ros2_obs_subscriber.arm_joint_positions
-            arm_pos = arm_pos.detach().cpu().to(dtype=torch.float32)
-        except Exception:
-            arm_pos = torch.zeros(7, dtype=torch.float32)
+        Arm comes from the Polymetis client; hand from the SDK worker cache."""
+        arm_pos = self.arm_client.arm_joint_positions.detach().cpu().to(dtype=torch.float32)
         if arm_pos.shape[0] < 7:
             arm_pos = torch.cat([arm_pos, torch.zeros(7 - arm_pos.shape[0], dtype=torch.float32)])
 
@@ -181,13 +191,10 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
             if hand_angles is not None:
                 self._cached_hand_angles_np = hand_angles
         if hand_angles is None:
-            try:
-                hand_angles = np.array(
-                    self.real_hand.get_states().angles, dtype=np.float32
-                )
-                self._cached_hand_angles_np = hand_angles
-            except Exception:
-                hand_angles = np.zeros(22, dtype=np.float32)
+            # No cached reading yet: read synchronously. A failure propagates —
+            # FK on made-up joint angles would feed the policy a fake hand.
+            hand_angles = np.array(self.real_hand.get_states().angles, dtype=np.float32)
+            self._cached_hand_angles_np = hand_angles
         hand_pos = torch.from_numpy(np.asarray(hand_angles, dtype=np.float32))
         return arm_pos, hand_pos
 
@@ -230,12 +237,10 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
                     f'{self._fk_to_world_offset.tolist()}'
                 )
             except Exception as e:
-                # Degenerate fall-through: assume no offset. obs will be off
-                # by a fixed amount but velocities (FD) are still correct.
-                self.get_logger().warn(
-                    f'[V3] failed to capture FK→world offset, using zero: {e}'
-                )
-                self._fk_to_world_offset = torch.zeros(3, dtype=torch.float32)
+                # No fallback: a zero offset would shift every fingertip
+                # observation by the base mount and the policy would act on it.
+                raise RuntimeError(
+                    f'[V3] failed to capture the FK->world offset: {e}') from e
 
         pos_world_minus_env_cpu = pos_chain + self._fk_to_world_offset[None, None, :]
 
@@ -287,13 +292,15 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
                 [(self._get_demo_idx() + 1 + t) % seq_len for t in range(obs_future_length)], dim=-1
             )
         else:
-            cur_idx = torch.clamp(
-                self.progress_buf + 1,
-                torch.zeros_like(self.demo_data["seq_len"]),
-                self.demo_data["seq_len"] - 1,
+            # Clamp every future step, as the training env does.
+            seq_len = self.demo_data["seq_len"]
+            future_indices = torch.stack(
+                [torch.clamp(self.progress_buf + 1 + t, torch.zeros_like(seq_len), seq_len - 1)
+                 for t in range(obs_future_length)], dim=-1
             )
-            future_indices = torch.stack([cur_idx + t for t in range(obs_future_length)], dim=-1)
-        nE, nT = self.demo_data["wrist_pos"].shape[:2]
+        # References are the retargeted robot targets (target_*), exactly what
+        # the training env reads — not the raw MANO human-hand keys.
+        nE, nT = self.demo_data["target_wrist_pos"].shape[:2]
         nF = obs_future_length
 
         def indicing(data, idx):
@@ -306,14 +313,14 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
             return torch.gather(data, 1, expanded_idx)
 
         # ---- Wrist target (unchanged) ----
-        target_wrist_pos = indicing(self.demo_data["wrist_pos"], future_indices)
+        target_wrist_pos = indicing(self.demo_data["target_wrist_pos"], future_indices)
         delta_wrist_pos = (target_wrist_pos - self.base_pos[:, None]).reshape(nE, -1)
 
-        target_wrist_vel = indicing(self.demo_data["wrist_velocity"], future_indices)
+        target_wrist_vel = indicing(self.demo_data["target_wrist_velocity"], future_indices)
         wrist_vel = target_wrist_vel.reshape(nE, -1)
         delta_wrist_vel = (target_wrist_vel - self.base_lin_vel[:, None]).reshape(nE, -1)
 
-        target_wrist_rot_raw = indicing(self.demo_data["wrist_rot"], future_indices)
+        target_wrist_rot_raw = indicing(self.demo_data["target_wrist_rot"], future_indices)
         if target_wrist_rot_raw.ndim > 3:
             target_wrist_rot_raw = target_wrist_rot_raw[:, :, 0, :]
         target_wrist_quat = aa_to_quat(target_wrist_rot_raw.reshape(nE * nF, -1))
@@ -323,23 +330,23 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         ).reshape(nE, -1)
         wrist_quat = target_wrist_quat.reshape(nE, -1)
 
-        target_wrist_ang_vel_raw = indicing(self.demo_data["wrist_angular_velocity"], future_indices)
+        target_wrist_ang_vel_raw = indicing(self.demo_data["target_wrist_angular_velocity"], future_indices)
         if target_wrist_ang_vel_raw.ndim > 3:
             target_wrist_ang_vel_raw = target_wrist_ang_vel_raw[:, :, 0, :]
         wrist_ang_vel = target_wrist_ang_vel_raw.reshape(nE, -1)
         delta_wrist_ang_vel = (target_wrist_ang_vel_raw - self.base_ang_vel[:, None]).reshape(nE, -1)
 
         # ---- Joints target — FK buffers replace sim body_pos_w / body_lin_vel_w ----
-        target_joints_pos = indicing(self.demo_data["mano_joints"], future_indices).reshape(nE, nF, -1, 3)
-        # V2 line 132 was:
+        target_joints_pos = indicing(self.demo_data["target_joints_pos"], future_indices).reshape(nE, nF, -1, 3)
+        # The sim env reads:
         #   cur_joint_pos = self.hand.data.body_pos_w[:, self.hand_body_indices[1:]] - self.scene.env_origins.unsqueeze(1)
         # V3 reads from pk FK output. self._fk_body_pos_minus_env is shape (1, n_hand_bodies, 3)
         # and matches "body_pos_w - env_origin" semantics exactly.
         cur_joint_pos = self._fk_body_pos_minus_env[:, 1:]
         delta_joints_pos = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
 
-        target_joints_vel = indicing(self.demo_data["mano_joints_velocity"], future_indices).reshape(nE, nF, -1, 3)
-        # V2 line 136 was:
+        target_joints_vel = indicing(self.demo_data["target_joints_velocity"], future_indices).reshape(nE, nF, -1, 3)
+        # The sim env reads:
         #   cur_joint_vel = self.hand.data.body_lin_vel_w[:, self.hand_body_indices[1:]]
         # V3 reads from FK finite-diff vel.
         cur_joint_vel = self._fk_body_lin_vel[:, 1:]
@@ -421,8 +428,8 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         integration `current + delta` reads a noisy real-arm encoder
         each step. Sim has perfect `arm_joint_pos` so training never
         exposed this — at deploy the encoder noise feeds straight into
-        the target trajectory, amplifying policy action sign-flip rate
-        from ~20% to ~45%, visible as arm shake.
+        the target trajectory, amplifying the policy's action sign-flip
+        rate, visible as arm shake.
 
         EMA on the FINAL target is the conservative choice: it doesn't
         change the integration semantics the policy was trained with, it
@@ -451,6 +458,37 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         # backward toward the pre-reset rollout's stale value.
         super()._reset_idx(env_ids)
         self._arm_des_ema = None
+        # The next rollout's tactile staleness is measured from its own start,
+        # not from frames missed while waiting at the reset prompts.
+        self._tactile_age_t0 = None
+
+    # -----------------------------------------------------------------
+    # Sensor staleness (extends V2: adds the tactile stream).
+    # -----------------------------------------------------------------
+
+    def _tactile_age(self) -> float:
+        """Max over the 5 channels of seconds since its last good frame,
+        counted from the first staleness check of the current rollout."""
+        now = time.monotonic()
+        if self._tactile_age_t0 is None:
+            self._tactile_age_t0 = now
+        return max(now - max(t, self._tactile_age_t0) for t in self._tactile_last_good_t)
+
+    def _sensor_ages(self) -> dict:
+        ages = super()._sensor_ages()
+        # Tactile is only fetched every env step during a rollout (the hand
+        # worker is enabled then); reset does not poll it. With
+        # enable_tactile=False every tactile reading is zeroed anyway.
+        hand_io = getattr(self, "_hand_io", None)
+        if (hand_io is not None and hand_io.is_enabled()
+                and getattr(self.cfg, "enable_tactile", True)):
+            ages["tactile"] = self._tactile_age()
+        return ages
+
+    def _stale_sensors(self) -> dict:
+        limit = float(getattr(self.cfg, "deploy_max_sensor_age_s", 0.25))
+        return {k: a for k, a in self._sensor_ages().items()
+                if a > (TACTILE_MAX_AGE_S if k == "tactile" else limit)}
 
     # -----------------------------------------------------------------
     # Non-blocking tactile fetch (override of V2's busy-loop polling).
@@ -458,12 +496,11 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
 
     def get_tactile_info(self):
         """Drop-in replacement for V2.get_tactile_info that does NOT block
-        until every channel has a fresh frame. With sim.step gone, V2's
-        busy-loop became the dominant cost (~80ms / step) because it kept
-        re-polling channels with `timeout=0.1s` per RPC until all 5 had
-        returned a frame. Sharpa tactile streams asynchronously; on a
-        130ms cycle some channels never push during one polling pass and
-        the loop runs forever waiting for them.
+        until every channel has a fresh frame. V2's loop re-polls channels
+        with `timeout=0.1s` per RPC until all 5 have returned a frame; Sharpa
+        tactile streams asynchronously on a ~130ms cycle, so some channels
+        never push during one polling pass and that loop dominates the step
+        time (~80ms / step).
 
         Strategy here:
           - Try-fetch each of the 5 channels with timeout=0 (truly non-blocking).
@@ -488,10 +525,11 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
             try:
                 deform_data = ret["content"].get("DEFORM")
                 f6_data = torch.tensor(ret["content"].get("F6"))
-                # Scalar magnitude (legacy path, used by proprio-force obs).
+                # Scalar magnitude (used by proprio-force obs).
                 force_raw[ch] = torch.norm(f6_data[:3])
                 # 3D force vector in elastomer-local frame (for PC vec3 path).
                 force_vec3_raw[ch] = f6_data[:3].to(self.device)
+                self._tactile_last_good_t[ch] = time.monotonic()
                 if deform_data is not None:
                     deform = deform_data.reshape(240, 240).astype(np.uint8)
                     _, binary = cv2.threshold(deform, 30, 255, cv2.THRESH_BINARY)
@@ -577,7 +615,7 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         self._pre_physics_step(action)
         t1 = time.perf_counter()
 
-        # 2. Send to real hardware (worker non-blocking) + ROS2
+        # 2. Send to real hardware (worker non-blocking) + Polymetis
         self._apply_action()
         t2 = time.perf_counter()
 
@@ -594,7 +632,7 @@ class FrankaSharpaForceCriticHorizonDeployEnvV3(FrankaSharpaForceCriticHorizonDe
         terminated, truncated = self._get_dones()
 
         # 6. Advance progress AFTER reward/done compute, matching the order
-        # in FrankaSharpaEnv.step (line 1786). Without this the policy gets
+        # in FrankaSharpaEnv.step. Without this the policy gets
         # stuck on a single demo frame for the whole rollout.
         self.progress_buf += 1
         if hasattr(self, 'running_progress_buf'):

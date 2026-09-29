@@ -11,7 +11,6 @@ Usage:
 """
 
 import argparse
-import sys
 import os
 import pickle
 
@@ -40,12 +39,15 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 # Same safe middle position as real test
 SAFE_MIDDLE_POS = np.array([0.0, 0.0, 0.0, -1.57, 0.0, 1.57, 0.0])
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+from dexx import deploy_config as _dcfg
+try:
+    from dexx.robot_constants import ARM_TUNED_KP, ARM_TUNED_KD
+except ImportError:  # fallback: the critic-horizon cfg re-exports the tuned arm set
+    from dexx.tasks.franka_sharpa.franka_sharpa_critic_horizon_cfg import ARM_TUNED_KP, ARM_TUNED_KD
 
 
 def main():
@@ -88,7 +90,7 @@ def main():
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(-0.1, 0.0, 0.415), rot=(1.0, 0.0, 0.0, 0.0),
+            pos=tuple(_dcfg.ARM_BASE_POS), rot=tuple(_dcfg.ARM_BASE_ROT),
             joint_pos={
                 "fr3_joint1": 0.0, "fr3_joint2": 0.0, "fr3_joint3": 0.0,
                 "fr3_joint4": -1.57, "fr3_joint5": 0.0, "fr3_joint6": 1.57, "fr3_joint7": 0.0,
@@ -98,17 +100,9 @@ def main():
             # Arm: per-joint gains tuned via step response comparison (round 2).
             "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=["fr3_joint.*"],
-                stiffness={
-                    "fr3_joint1": 1600.0, "fr3_joint2": 1600.0,
-                    "fr3_joint3": 1200.0, "fr3_joint4": 800.0,
-                    "fr3_joint5": 500.0, "fr3_joint6": 300.0, "fr3_joint7": 150.0,
-                },
-                damping={
-                    # 2026-04-23: j1-3 damping reduced ~40% (see env_cfg.py for rationale)
-                    "fr3_joint1": 145.0, "fr3_joint2": 135.0,
-                    "fr3_joint3": 110.0, "fr3_joint4": 100.0,
-                    "fr3_joint5": 50.0, "fr3_joint6": 30.0, "fr3_joint7": 15.0,
-                },
+                # The training set (dexx.robot_constants.ARM_TUNED_KP/KD).
+                stiffness=dict(ARM_TUNED_KP),
+                damping=dict(ARM_TUNED_KD),
             ),
             "hand_joints": ImplicitActuatorCfg(
                 joint_names_expr=["right_.*"],
@@ -308,6 +302,11 @@ def main():
         pickle.dump(all_results, f)
     print(f"\nSaved to {args_cli.output}")
 
+    # Release the simulation context first; otherwise simulation_app.close() hangs.
+    _sim = sim_utils.SimulationContext.instance()
+    if _sim is not None:
+        _sim.clear_all_callbacks()
+        _sim.clear_instance()
     simulation_app.close()
 
 

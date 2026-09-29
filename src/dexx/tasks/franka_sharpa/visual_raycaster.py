@@ -4,18 +4,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """
-VisualRaycaster: BVH-based depth replacement for `FrankaSharpaVisualEnv`.
+VisualRaycaster: BVH-based simulated depth camera for the point-cloud student.
 
-Encapsulates everything needed to replace the `TiledCamera` 256x256 depth
-output of `FrankaSharpaVisualEnv` with a `simple_raycaster.MultiMeshRaycaster`
-pass over the scene meshes.
-
-Scope (per `raycast.md`):
-    - Task: `franka-sharpa-visual` only
-    - Data: robotool_batch only (`rt/...` indices), OakInk2 deferred
-    - Hand side: right
-    - Output: `[N, H, W]` depth tensor consumed unchanged by the existing
-      `ActorCriticVisual` CNN encoder
+Renders an `[N, H, W]` depth image with a `simple_raycaster.MultiMeshRaycaster`
+pass over the scene meshes (arm, hand, table, object). Used by
+`FrankaSharpaPointCloudEnv`, which back-projects the depth into the student's
+point cloud. Supports robotool_batch data (`rt/...` indices).
 
 Indexing layout in `MultiMeshRaycaster.meshes_wp` (must stay stable):
 
@@ -43,9 +37,7 @@ from dexx.tasks.hand_imitation.dataset.factory import ManipDataFactory
 from dexx.tasks.franka_sharpa.franka_sharpa_env import rotmat_to_quat
 
 if TYPE_CHECKING:
-    # NOTE: franka_sharpa_visual_env was dropped from the dexx release package;
-    # the type hint below is only used as a forward-ref string at runtime.
-    pass
+    from dexx.tasks.franka_sharpa.franka_sharpa_env import FrankaSharpaEnv
 
 
 def _rotvec_to_quat(rv: torch.Tensor) -> torch.Tensor:
@@ -90,7 +82,7 @@ class _MeshLayout:
 
 
 class VisualRaycaster:
-    """Drop-in BVH depth replacement for `TiledCamera` in visual env."""
+    """BVH-raycast depth camera attached to a FrankaSharpa env."""
 
     # USD subtree keywords (link prims have <link>/visuals/... and /collisions/...)
     _VISUAL_KEYS = ("/visuals", "/visual")
@@ -100,18 +92,18 @@ class VisualRaycaster:
     _SKIP_NAME_SUFFIX = ("_VL",)
     _SKIP_NAME_CONTAIN = ("fingertip",)  # frames, no geometry
 
-    def __init__(self, env: "FrankaSharpaVisualEnv"):
+    def __init__(self, env: "FrankaSharpaEnv"):
         self.env = env
         self.device: str = str(env.device)
         self.num_envs: int = int(env.num_envs)
 
         cfg = env.cfg
-        # Image size for the depth tensor fed to the CNN encoder
+        # Depth image size
         self.height: int = int(getattr(cfg, "camera_height", 256))
         self.width: int = int(getattr(cfg, "camera_width", 256))
         self.n_rays: int = self.height * self.width
 
-        # Depth normalization (mirrors TiledCamera path so CNN sees same range)
+        # Depth normalization range (m)
         self.depth_min: float = float(getattr(cfg, "depth_min", 0.1))
         self.depth_max: float = float(getattr(cfg, "depth_max", 2.0))
 
@@ -129,7 +121,7 @@ class VisualRaycaster:
 
         # Camera intrinsics. Prefer explicit fx/fy/cx/cy on cfg (real-camera
         # calibration). Fall back to Isaac Sim's PinholeCameraCfg-style
-        # focal_length / horizontal_aperture (legacy, square pixels + centered).
+        # focal_length / horizontal_aperture (square pixels + centered).
         self.focal_length: float = float(getattr(cfg, "camera_focal_length", 21.77))
         self.horizontal_aperture: float = float(
             getattr(cfg, "camera_horizontal_aperture", 36.0)
@@ -330,7 +322,7 @@ class VisualRaycaster:
         )
         self._mesh_indices[:, -1] = self._env_obj_mesh_idx
 
-        # 8) Camera extrinsics (same hard-coded calib as TiledCamera path)
+        # 8) Camera extrinsics (cfg override, else the shipped calibration)
         self._cam_pos_local, self._cam_quat_local = self._build_camera_extrinsics()
 
         # 9) Pinhole ray dirs in camera local frame
@@ -366,7 +358,7 @@ class VisualRaycaster:
         if not self._is_setup:
             raise RuntimeError(
                 "VisualRaycaster.render_depth called before setup(). "
-                "Call setup() at the end of FrankaSharpaVisualEnv.__init__."
+                "Call setup() at the end of the env's __init__."
             )
 
         from isaaclab.utils.math import quat_apply, quat_mul
@@ -445,7 +437,7 @@ class VisualRaycaster:
         )
 
         # (5) Convert ray-direction euclidean distance → perpendicular z-depth
-        # to match TiledCamera's `distance_to_image_plane` AND real depth cameras.
+        # (`distance_to_image_plane`), matching real depth cameras.
         z_hat = self._ray_dirs_local[0, :, 2]  # [R]
         hit_dist = hit_dist * z_hat.unsqueeze(0)  # [N, R]
 
@@ -455,7 +447,7 @@ class VisualRaycaster:
         if noise_on:
             depth_m = self._apply_depth_noise(depth_m)
 
-        # (6) Clamp + normalize, matching TiledCamera path exactly
+        # (6) Clamp + normalize to [0, 1]
         depth = torch.clamp(depth_m, self.depth_min, self.depth_max)
         depth = (depth - self.depth_min) / (self.depth_max - self.depth_min + 1e-8)
         return depth
@@ -661,28 +653,17 @@ class VisualRaycaster:
         return obj_meshes_unique, env_to_obj_local
 
     def _build_camera_extrinsics(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Decode the hard-coded calibration matrix into (pos[3], quat[4] WXYZ).
+        """Resolve the camera extrinsic and decode it into (pos[3], quat[4] WXYZ).
 
-        Matrix = camera-in-arm-base transform (i.e. camera pose expressed in
-        the FR3 base frame). Encodes the ROS optical convention (x-right,
-        y-down, z-forward).
+        Matrix = camera-in-arm-base transform (camera pose expressed in the FR3
+        base frame), ROS optical convention (x-right, y-down, z-forward).
 
-        Calibration history:
-        - 2026-05-19: manual hand-tune via calibrate_extrinsic_viz.py.
-          → t_armbase = [1.2544, -0.1187, 0.6852]
-        - 2026-05-20: refined via viser sim↔real overlay
-          (calibrate_real_extrinsic_viser.py). Viser-saved value was
-          camera-in-env-local = [1.1374, -0.1907, 1.0902]; subtracting
-          arm_base_pos = (-0.1, 0, 0.415) gives the camera-in-armbase
-          used here. Net refinement vs 2026-05-19 is only [-1.7, -7.2,
-          -1.0] cm — mostly a y correction.
-          → t_armbase = [1.2374, -0.1907, 0.6752]
-
-        The camera has been moved and re-calibrated since; the matrix below is
-        only a fallback. Override it at runtime instead of editing this file:
+        Resolution order:
           cfg.camera_extrinsic_path   : path to a 4x4 .npy (highest priority)
           cfg.camera_extrinsic_matrix : a 4x4 array/list
-        Both are camera-in-armbase in the ROS optical convention.
+          otherwise                   : the shipped calibration,
+                                        dexx.deploy_config.default_camera_extrinsic()
+                                        (calib/camera_align/current.npy)
         """
         cfg = self.env.cfg
         override = None
@@ -721,7 +702,7 @@ class VisualRaycaster:
 
         Uses self.fx, self.fy, self.cx, self.cy directly. Resolved in __init__
         from either explicit cfg overrides (real-camera calib) or Isaac Sim's
-        focal_length / horizontal_aperture (legacy).
+        focal_length / horizontal_aperture.
         """
         H, W = self.height, self.width
         fx, fy = self.fx, self.fy

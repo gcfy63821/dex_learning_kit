@@ -11,42 +11,46 @@ transforms that live in `env_cfg`, not in the model weights:
     pc_ablate_tactile_force zero the tactile force channel
     pc_tactile_use_vec3     3D force vector instead of scalar magnitude
 
-Before this module these were **train-time CLI args only**: they were never
-written into the checkpoint and never restored at eval / play / deploy, which
-default them to `1.0 / 0.0 / "zero" / "scalar" / False`. A student trained with
+They are set by train-time CLI args, so they are written into the checkpoint
+and restored at eval / play / deploy, which would otherwise default them to
+`1.0 / 0.0 / "zero" / "scalar" / False`. Without that, a student trained with
 `--pc_force_scale 10 --pc_tactile_force_gate 0.05 --pc_tactile_gate_mode mask`
-was therefore evaluated on forces **10x larger than training** with **every**
-tactile point un-gated, and a `--pc_force_repr binary` student was fed
+would be evaluated on forces **10x larger than training** with **every**
+tactile point un-gated, and a `--pc_force_repr binary` student would be fed
 continuous magnitudes. Silent, and it moves success rate.
 
 Keeping the collect/apply pair here means trainer, eval, play and deploy read
-one definition and cannot drift apart again.
+one definition.
 
 Checkpoint layout: a single nested dict under `"pc_env_meta"` (DAgger, top
-level) or `cfg.pc_env_meta` (PPO). Checkpoints written before this module have
-neither — `read_pc_env_meta` returns `{}` and the caller falls back to the
-documented defaults, i.e. exactly the legacy behaviour.
+level) or `cfg.pc_env_meta` (PPO). For a checkpoint with neither,
+`read_pc_env_meta` returns `{}` and the caller falls back to the documented
+defaults.
 """
 from __future__ import annotations
 
+import pickle
 from typing import Any
 
 # key -> default. The default must equal the env_cfg default, so that a ckpt
-# without metadata reproduces legacy behaviour exactly.
+# without metadata is evaluated exactly as it was trained.
 #
 # `enable_contact_force` / `enable_tactile` gate the PROPRIO tactile tail
 # (5d per-finger force + 15d contact positions), which is a second tactile
 # pathway independent of the point cloud. They belong here for the same reason
-# as the pc_* keys — they change the student's input distribution and used to
-# be train-time-only. Worse, `eval_dagger_pc.py` never even defined
-# `--no_contact_force`, and because it parses with `parse_known_args()` the
-# flag was silently swallowed: the 2026-05-27 scene_force_ablation's R2/R4
-# cells trained WITHOUT proprio force but were evaluated WITH it.
+# as the pc_* keys: they change the student's input distribution, so a
+# student trained without proprio force must not be evaluated with it.
 PC_ENV_META_DEFAULTS: dict[str, Any] = {
+    # Crop box. Deliberately not deploy_config's crop: a ckpt with no record of
+    # its crop was trained under z 0.420..1.30, so that is what reproduces it.
+    # Checkpoints that record a crop carry their own values.
+    "pc_workspace_min": (0.00, -0.40, 0.420),
+    "pc_workspace_max": (0.80, 0.25, 1.30),
     "pc_force_scale": 1.0,
     "pc_tactile_force_gate": 0.0,
     "pc_tactile_gate_mode": "zero",
     "pc_force_repr": "scalar",
+    "pc_ablate_scene_pc": False,
     "pc_ablate_tactile_pc": False,
     "pc_ablate_tactile_force": False,
     "pc_tactile_use_vec3": False,
@@ -67,10 +71,77 @@ def collect_pc_env_meta(env_cfg) -> dict[str, Any]:
     }
 
 
+
+class _RenamingUnpickler(pickle.Unpickler):
+    """Resolve classes pickled by the research codebase (`rl_isaaclab.*`),
+    e.g. a DAgger checkpoint's `cfg`, to the same classes in `dexx`."""
+
+    def find_class(self, module, name):
+        if module == "rl_isaaclab" or module.startswith("rl_isaaclab."):
+            module = "dexx" + module[len("rl_isaaclab"):]
+        return super().find_class(module, name)
+
+
+class _renaming_pickle:  # passed to torch.load(pickle_module=...)
+    Unpickler = _RenamingUnpickler
+    __name__ = "dexx_renaming_pickle"
+
+    @staticmethod
+    def load(f, **kwargs):
+        return _RenamingUnpickler(f, **kwargs).load()
+
+
+def load_checkpoint(path: str, map_location="cpu") -> dict:
+    """torch.load for student checkpoints, including research-era ones."""
+    import torch
+
+    return torch.load(path, map_location=map_location, weights_only=False,
+                      pickle_module=_renaming_pickle)
+
+
+def is_dagger_student_ckpt(ckpt: dict) -> bool:
+    """True for a DAgger `PointCloudStudent` checkpoint (the deployable kind).
+
+    A DAgger ckpt keeps its layout top-level (`proprio_dim`, ...) and its MLP
+    under `mlp.*`; a PPO `ActorCriticPointCloud` ckpt nests the layout under
+    `cfg` and names its MLP `actor_mlp.*`.
+    """
+    keys = list((ckpt.get("model") or {}).keys())
+    return ("proprio_dim" in ckpt
+            and any(k.startswith("mlp.") for k in keys)
+            and not any(k.startswith("actor_mlp.") for k in keys))
+
+
+def lean_student_refusal(ckpt: dict) -> str | None:
+    """Why a DAgger ckpt cannot warm-start `train_ppo_pc.py`, or None if it can.
+
+    A lean student (`--student_drop_slots`) reads a sliced proprio vector
+    (`student_keep_idx`); the PPO actor is built on the env's full observation,
+    so its first layer would not match and the warm start would silently fail
+    to load it.
+    """
+    keep = list(ckpt.get("student_keep_idx", []) or [])
+    drop = list(ckpt.get("student_drop_slots", []) or [])
+    if not keep and not drop:
+        return None
+    return (f"this is a lean student (student_drop_slots={drop}, "
+            f"{len(keep)} kept proprio dims); PPO fine-tune (train_ppo_pc.py) builds "
+            f"the actor on the full env observation and cannot load it. PPO "
+            f"fine-tune is optional; deploy/eval the DAgger "
+            f"checkpoint directly.")
+
+
+def _ckpt_tactile_feat_dim(ckpt: dict):
+    """Encoder tactile width: top level (DAgger) or under cfg (PPO)."""
+    fdim = ckpt.get("tactile_feat_dim")
+    if fdim is None and "cfg" in ckpt:
+        fdim = getattr(ckpt["cfg"], "tactile_feat_dim", None)
+    return fdim
+
 def read_pc_env_meta(ckpt: dict) -> dict[str, Any]:
     """Pull the metadata out of a DAgger or PPO checkpoint.
 
-    Returns `{}` for legacy checkpoints that predate this module.
+    Returns `{}` for checkpoints that carry no metadata.
     """
     meta = ckpt.get("pc_env_meta", None)
     if meta is None and "cfg" in ckpt:
@@ -111,6 +182,9 @@ def apply_pc_env_meta(
             value, source = overrides[key], "cli"
         elif key in meta:
             value, source = meta[key], "ckpt"
+        elif key == "pc_tactile_use_vec3" and _ckpt_tactile_feat_dim(ckpt) == 3:
+            # Pre-`pc_env_meta` ckpts only record the encoder's tactile width.
+            value, source = True, "ckpt tactile_feat_dim"
         else:
             value, source = default, "default"
         resolved[key] = value
@@ -165,10 +239,8 @@ def align_pc_dims_to_ckpt(env_cfg, ckpt: dict, tag: str = "PC") -> None:
     """Make the env emit exactly the point counts / tactile width the student was trained with.
 
     Call this BEFORE `gym.make`, and before/alongside `apply_pc_env_meta`. Every
-    entry point that loads a PointCloud student needs it -- `eval.py` and
-    `play.py` each grew their own copy of this logic, drifted, and `play.py`
-    ended up unable to run any checkpoint whose hand-point count differed from
-    the env default.
+    entry point that loads a PointCloud student needs it, so it lives here
+    once rather than in each script.
     """
     # PPO ckpts nest the dims under .cfg; DAgger ckpts keep them top-level.
     dim_src = ckpt
@@ -188,11 +260,8 @@ def align_pc_dims_to_ckpt(env_cfg, ckpt: dict, tag: str = "PC") -> None:
                 print(f"[{tag}] aligning env.{k_env}: {v_env} -> {v_ckpt} (from ckpt)", flush=True)
                 setattr(env_cfg, k_env, v_ckpt)
 
-    # Legacy fallback: pre-`pc_env_meta` ckpts only record tactile_feat_dim.
-    fdim = ckpt.get("tactile_feat_dim")
-    if fdim is None and "cfg" in ckpt:
-        fdim = getattr(ckpt["cfg"], "tactile_feat_dim", None)
-    if fdim == 3 and not getattr(env_cfg, "pc_tactile_use_vec3", False):
+    # Fallback for ckpts without `pc_env_meta`: they only record tactile_feat_dim.
+    if _ckpt_tactile_feat_dim(ckpt) == 3 and not getattr(env_cfg, "pc_tactile_use_vec3", False):
         env_cfg.pc_tactile_use_vec3 = True
         env_cfg.pc_tactile_feature_dim = 3
         print(f"[{tag}] ckpt has tactile_feat_dim=3 -> auto-enable pc_tactile_use_vec3", flush=True)

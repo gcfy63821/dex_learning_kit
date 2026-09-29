@@ -5,8 +5,6 @@ recording.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-
 from isaaclab.utils import configclass
 
 from .franka_sharpa_pointcloud_env_cfg import FrankaSharpaPointCloudEnvCfg
@@ -33,10 +31,10 @@ class RecordCameraCfg:
     # default CameraCfg.offset with `camera.set_world_poses_from_view`
     # right after init, so we only need pos + target — no manual quaternion.
     #
-    # Default = match the policy's depth raycaster pose (eye-on-base D455
-    # calibration in `visual_raycaster._build_camera_extrinsics`):
+    # Default = roughly the policy's depth-camera pose (a D455 eye-on-base
+    # calibration; the live one is calib/camera_align/current.npy):
     #   cam_pos_in_arm_base = (1.230, -0.147, 0.637)
-    #   arm_base_world      = (-0.1, 0, 0.415)  (see franka_sharpa_env_cfg.py:259)
+    #   arm_base_world      = (-0.1, 0, 0.415)  (dexx.deploy_config.ARM_BASE_POS)
     #   → cam_pos_world ≈ (1.13, -0.147, 1.05)
     # Look-at = manipulation region center on the table (z=table_top + 5mm).
     pos: tuple = (1.13, -0.147, 1.05)

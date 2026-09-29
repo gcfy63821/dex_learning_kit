@@ -5,27 +5,19 @@ what the student is and is not given.
 
 ## Run it
 
-```bash
-python scripts/train_dagger_pc.py \
-  --task franka-sharpa-pointcloud \
-  --teacher_ckpt checkpoints/teacher_poseobs.pth \
-  --side right \
-  --data_idx '["rt/0416_grasp/cube_small_1","rt/0416_grasp/cube_small_2",
-               "rt/0420_manip/squeegee_1","rt/0420_manip/squeegee_2"]' \
-  --num_envs 128 --dagger_iters 30 --rollout_steps 4096 \
-  --beta_init 1.0 --beta_decay 0.85 \
-  --train_epochs 8 --batch_size 512 --lr 5e-5 --max_buffer 200000 \
-  --hand_body_subset minimal6 \
-  --student_drop_slots obj_bps,tips_distance,obj_pose_tail \
-  --camera_extrinsic calib/camera_align/current.npy \
-  --seed 42 --out_dir logs/my_student --headless
-```
+Run the canonical command in [DISTILLATION.md](../../docs/DISTILLATION.md) §Step A
+with `--out_dir logs/my_student`; later lessons read from there. It uses the four
+shipped demos and the shipped teacher.
 
-About 30 minutes on one GPU. Loss should fall by roughly a factor of 40 across the
-run while β decays 1.0 → 0.009.
+Loss should fall steadily across the run while β decays from 1.0 to about
+0.009 (×0.85 per iteration over 30 iterations). Do not read `roll_succ` in the
+per-iteration log as a success rate: it only counts episodes that end inside the
+32-step rollout window, so it stays low and flat even at iteration 1, when the
+rollout policy is the teacher. The loss curve and `eval.py` are what you check.
 
-**`--camera_extrinsic` is not optional.** Lesson 06 explains what happens without
-it.
+**Pass `--camera_extrinsic` explicitly.** Omitting it falls back to
+`current.npy`, which is right today and silently wrong after the next
+recalibration. Lesson 06 explains why.
 
 ## DAgger, precisely
 
@@ -76,7 +68,7 @@ The checkpoint records its own layout. After training:
 
 ```python
 c = torch.load("logs/my_student/dagger_final.pth", weights_only=False)
-print(c["cfg"].proprio_dim, c["student_drop_slots"], c["student_obs_slots"])
+print(c["proprio_dim"], c["student_drop_slots"], c["student_obs_slots"])
 # 417  ['obj_bps','tips_distance','obj_pose_tail']  {'proprioception': (0,79), ...}
 ```
 
@@ -85,15 +77,11 @@ slot map disagrees with the saved one.
 
 ## What about `scripts/train_ppo_pc.py`?
 
-It fine-tunes the distilled student with asymmetric PPO, warm-started from the
-DAgger checkpoint. **It is not part of the default pipeline.** On the 20-demo
-strict3 evaluation the best PPO configuration *regressed* about 5.8 pp against
-the DAgger student it started from, so the DAgger checkpoint is the deliverable.
-
-It ships because the capability is occasionally useful and the evaluation and
-deploy scripts already auto-detect either architecture from the checkpoint. If
-you reach for it, `docs/DISTILLATION.md` §Step B has the flags — `--init_logstd
--4` is the one that matters.
+It fine-tunes a distilled student with asymmetric PPO, warm-started from the DAgger
+checkpoint. **It is not part of the pipeline, and it refuses lean students** —
+the only kind that can be deployed. It ships for experiments on full-observation
+students;
+[DISTILLATION.md](../../docs/DISTILLATION.md) §Step B has the flags.
 
 ## Porting
 

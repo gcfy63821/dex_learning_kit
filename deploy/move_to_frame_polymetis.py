@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Move the real FR3 (via Polymetis on the NUC) to the SAME joint pose as one
 frame of a robotool_batch retarget pkl — i.e. the exact pose rendered by
-`calib/camera_align/gen_sim_frame_ply.py` for camera-extrinsic alignment.
+`tools/calib/gen_sim_frame_ply.py` for camera-extrinsic alignment.
 
 The arm target is `opt_arm_joint_pos[frame]` (fr3_joint1..7, radians). Joint
-angles are base-frame-invariant, so the +1.7cm base offset in sim does NOT
+angles are base-frame-invariant, so the arm-base placement in sim does NOT
 change the commanded joint config — the real arm lands in the identical
 configuration. Only the 7 arm joints move; the hand is left untouched.
 
@@ -13,12 +13,12 @@ RobotInterface joint impedance), identical transport to
 `replay_motion_polymetis.py`.
 
 Prereqs (NUC, polymetis-local env):
-    conda activate polymetis-local && python ~/controller/polymetis_joint_bridge.py
+    conda activate polymetis-local && python deploy/polymetis_joint_bridge.py
     # and make sure NO other controller policy is running.
 
 Usage (training PC, dexmanip env):
     python deploy/move_to_frame_polymetis.py \
-        --ip 101.6.90.111 \
+        --ip <NUC_IP> \
         --pkl data/retargeting/robotool_batch/mano2sharpa_rh/0416_grasp/cube_small_2@0.pkl \
         --frame 0 \
         --approach_time 6.0 --hold
@@ -30,7 +30,6 @@ import json
 import pickle
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 from dexx import deploy_config as _dcfg
@@ -73,7 +72,7 @@ def check_limits(q: np.ndarray) -> list[str]:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ip", required=True, help="NUC bridge IP (e.g. 101.6.90.111)")
+    p.add_argument("--ip", required=True, help="NUC bridge IP (the Polymetis joint bridge host).")
     p.add_argument("--state_port", type=int, default=_dcfg.POLYMETIS_STATE_PORT)
     p.add_argument("--cmd_port", type=int, default=_dcfg.POLYMETIS_CMD_PORT)
     p.add_argument("--pkl", required=True, type=str)

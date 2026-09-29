@@ -12,19 +12,17 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .franka_sharpa_env_cfg import FrankaSharpaEnvCfg
-else:
-    from .franka_sharpa_env_cfg import update_cfg_for_hand_side
 
 from .franka_sharpa_env import FrankaSharpaEnv, rotmat_to_quat, transform_between_frames
 from dexx.tasks.hand_imitation.dataset.transform import aa_to_quat
-from isaaclab.utils.math import quat_conjugate, quat_mul, quat_inv
+from isaaclab.utils.math import quat_conjugate, quat_mul
 
 
 class FrankaSharpaForceEnv(FrankaSharpaEnv):
     """FrankaSharpaEnv with smooth contact forces for fingertip force calculation.
     
     This environment inherits from FrankaSharpaEnv but uses smooth_contact_forces
-    (similar to SharpaWaveInhandRotateEnv) instead of raw net_forces_w for 
+    instead of raw net_forces_w for 
     fingertip force calculation in reward computation.
     """
     cfg: "FrankaSharpaEnvCfg"
@@ -128,7 +126,7 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         last_K_transf = obj_traj[env_idx[:, None], last_K_idx]           # [N, K, 4, 4]
         target_state["final_K_obj_pos"] = last_K_transf[..., :3, 3]     # [N, K, 3]
 
-        # Compute smooth contact forces (similar to sharpa_wave_env.py)
+        # Compute smooth contact forces
         # Get contact force history
         net_contact_forces_history = torch.cat([
             self._contact_sensor[id].data.net_forces_w_history[:, :, 0, :].unsqueeze(2) 
@@ -258,7 +256,7 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
             target_state,
             max_length_tensor,
             scale_factor,
-            self.dexhand_weight_idx,   # by-name resolved (cohabits with legacy weight_idx)
+            self.dexhand_weight_idx,   # by-name resolved (same content as the positional weight_idx)
             self._use_wrist_tracking,
             self._use_abs_hand_tracking,
             self._use_rel_hand_tracking,
@@ -365,23 +363,6 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
 
         return self.reward_execute
 
-    def set_planner_targets(self, targets: dict | None) -> None:
-        """Set external K=1 target overrides for the next compute_observations() call.
-
-        Used by goal-conditioned policy at eval/deploy: the planner produces target
-        wrist/joints/etc. each step, replacing the demo trajectory in [0:410] of obs.
-
-        Args:
-            targets: dict with optional keys (each value (nE, F=1, ...) tensor):
-                "wrist_pos" (3), "wrist_vel" (3), "wrist_rot" (3 axis-angle),
-                "wrist_ang_vel" (3), "joints_pos" (n_joints, 3), "joints_vel".
-            None: clear override (revert to demo data).
-
-        The override is consumed by the next `compute_observations()` and lives
-        on the env until set again. Pass None to clear.
-        """
-        self._planner_targets = targets
-
     def compute_observations(self):
         """Compute observations including proprioception, target states, and contact positions."""
         self._refresh_lab()
@@ -424,19 +405,11 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
             return torch.gather(data, 1, expanded_idx)
         
         # Get target wrist states
-        # Planner-override hook: if self._planner_targets is set (dict), use it
-        # instead of demo_data lookups for the K=1 obs slots. Used by goal-
-        # conditioned policy (planner replaces demo trajectory entirely).
-        _plt = getattr(self, "_planner_targets", None)
         target_wrist_pos = indicing(self.demo_data["target_wrist_pos"], future_indices)  # [B, K, 3]
-        if _plt is not None and "wrist_pos" in _plt:
-            target_wrist_pos = _plt["wrist_pos"].reshape(nE, nF, 3)
         cur_wrist_pos = self.base_pos  # [B, 3]
         delta_wrist_pos = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
 
         target_wrist_vel = indicing(self.demo_data["target_wrist_velocity"], future_indices)
-        if _plt is not None and "wrist_vel" in _plt:
-            target_wrist_vel = _plt["wrist_vel"].reshape(nE, nF, 3)
         cur_wrist_vel = self.base_lin_vel
         wrist_vel = target_wrist_vel.reshape(nE, -1)
         delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
@@ -446,8 +419,6 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         if target_wrist_rot_raw.ndim > 3:
             target_wrist_rot_raw = target_wrist_rot_raw[:, :, 0, :]
         target_wrist_rot = target_wrist_rot_raw
-        if _plt is not None and "wrist_rot" in _plt:
-            target_wrist_rot = _plt["wrist_rot"].reshape(nE, nF, 3)  # axis-angle
         target_wrist_quat = aa_to_quat(target_wrist_rot.reshape(nE * nF, -1))  # Convert to (w,x,y,z)
         delta_wrist_quat = quat_mul(
             self.base_quat[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
@@ -459,24 +430,17 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         if target_wrist_ang_vel_raw.ndim > 3:
             target_wrist_ang_vel_raw = target_wrist_ang_vel_raw[:, :, 0, :]
         target_wrist_ang_vel = target_wrist_ang_vel_raw
-        if _plt is not None and "wrist_ang_vel" in _plt:
-            target_wrist_ang_vel = _plt["wrist_ang_vel"].reshape(nE, nF, 3)
         cur_wrist_ang_vel = self.base_ang_vel
         wrist_ang_vel = target_wrist_ang_vel.reshape(nE, -1)
         delta_wrist_ang_vel = (target_wrist_ang_vel - cur_wrist_ang_vel[:, None]).reshape(nE, -1)
 
         # Get target joint states
         target_joints_pos = indicing(self.demo_data["target_joints_pos"], future_indices).reshape(nE, nF, -1, 3)
-        n_joints = target_joints_pos.shape[2]
-        if _plt is not None and "joints_pos" in _plt:
-            target_joints_pos = _plt["joints_pos"].reshape(nE, nF, n_joints, 3)
 
         cur_joint_pos = self.hand.data.body_pos_w[:, self.hand_body_indices[1:]] - self.scene.env_origins.unsqueeze(1)
         delta_joints_pos = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
 
         target_joints_vel = indicing(self.demo_data["target_joints_velocity"], future_indices).reshape(nE, nF, -1, 3)
-        if _plt is not None and "joints_vel" in _plt:
-            target_joints_vel = _plt["joints_vel"].reshape(nE, nF, n_joints, 3)
         cur_joint_vel = self.hand.data.body_lin_vel_w[:, self.hand_body_indices[1:]]
         joints_vel = target_joints_vel.reshape(self.num_envs, -1)
         delta_joints_vel = (target_joints_vel - cur_joint_vel[:, None]).reshape(self.num_envs, -1)
@@ -589,7 +553,7 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
                                           torch.ones_like(sensed_contacts),
                                           torch.zeros_like(sensed_contacts))
 
-        # Add contact positions (similar to sharpa_wave_env.py)
+        # Add contact positions
         # Get tactile frame pose (elastomer body poses)
         tactile_frame_pose = self.hand.data.body_link_state_w[:, self.elastomer_ids, :7]
         tactile_frame_pos = tactile_frame_pose[..., :3]
@@ -689,7 +653,7 @@ class FrankaSharpaForceEnv(FrankaSharpaEnv):
         priv_obs_values = [self.object_pos, self.object_rot, self.object_velocities]
         self.priv_info_buf[:, 27:40] = torch.cat(priv_obs_values, dim=-1)
 
-        # 在 return obs_buf 之前添加
+        # One-time observation-dimension check.
         if not hasattr(self, '_obs_dim_checked'):
             actual_dim = obs_buf.shape[-1]
             expected_dim = self.cfg.observation_space

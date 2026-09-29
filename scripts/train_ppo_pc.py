@@ -2,6 +2,10 @@
 
 Loads the DAgger ckpt into `ActorCriticPointCloud`, then runs standard PPO
 on top in the same `franka-sharpa-pointcloud` env.
+
+Only full-observation students are supported: a lean student
+(`--student_drop_slots`) is refused. The resulting PPO checkpoint is for sim
+evaluation only; `deploy/deploy_pc.py` deploys DAgger students.
 """
 import argparse
 import sys
@@ -17,7 +21,10 @@ parser.add_argument("--dagger_ckpt", type=str, required=True,
 parser.add_argument("--side", type=str, default="right")
 parser.add_argument("--data_idx", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=64)
-parser.add_argument("--cache", type=str, default=None)
+parser.add_argument("--camera_extrinsic", type=str, default=None,
+                    help="Path to a 4x4 .npy camera-in-armbase extrinsic (ROS optical). "
+                         "Must match what the DAgger student was trained with. Omit to "
+                         "use the env default (calib/camera_align/current.npy).")
 
 # PPO knobs
 parser.add_argument("--max_iters", type=int, default=200)
@@ -55,14 +62,15 @@ simulation_app = app_launcher.app
 import os
 import importlib
 
-import torch
 import gymnasium as gym
 from omegaconf import OmegaConf
 
 import dexx.tasks.franka_sharpa  # noqa: F401
 
 from dexx.algo.ppo.ppo_pointcloud import PPOPointCloud, PPOPointCloudConfig
-from dexx.algo.dagger.pc_env_meta import apply_pc_env_meta
+from dexx.algo.dagger.pc_env_meta import (
+    align_pc_dims_to_ckpt, apply_pc_env_meta, lean_student_refusal, load_checkpoint,
+)
 
 
 def parse_entry_point(entry_point: str):
@@ -85,47 +93,25 @@ def main():
         env_cfg.sim.device = args_cli.device
     if args_cli.side:
         env_cfg.hand_side = args_cli.side
-    if args_cli.cache:
-        env_cfg.grasp_cache_path = args_cli.cache
     if args_cli.data_idx:
         try:
             di = json.loads(args_cli.data_idx)
         except json.JSONDecodeError:
             di = ast.literal_eval(args_cli.data_idx)
         env_cfg.data_indices = di
+    if args_cli.camera_extrinsic:
+        if not os.path.exists(args_cli.camera_extrinsic):
+            raise SystemExit(f"--camera_extrinsic not found: {args_cli.camera_extrinsic}")
+        env_cfg.camera_extrinsic_path = os.path.abspath(args_cli.camera_extrinsic)
+        print(f"[PPOPC] sim camera extrinsic <- {env_cfg.camera_extrinsic_path}", flush=True)
 
-    # Pre-peek DAgger ckpt: if it was trained with a non-default n_hand /
-    # n_scene / n_tactile (e.g. --hand_body_subset minimal6 -> n_hand=6),
-    # the env must produce the same number of PC points so the encoder
-    # weights load. Mirror eval_dagger_pc.py's alignment.
-    _ckpt_peek = torch.load(args_cli.dagger_ckpt, map_location="cpu", weights_only=False)
-    for _k_ckpt, _k_env in [("n_scene", "pc_num_scene_points"),
-                            ("n_hand", "pc_num_hand_points"),
-                            ("n_tactile", "pc_num_tactile_points")]:
-        if _k_ckpt in _ckpt_peek and hasattr(env_cfg, _k_env):
-            _v_ckpt = int(_ckpt_peek[_k_ckpt])
-            if _v_ckpt != int(getattr(env_cfg, _k_env)):
-                print(f"[PPOPC] aligning env.{_k_env}: "
-                      f"{getattr(env_cfg, _k_env)} -> {_v_ckpt} (from DAgger ckpt)")
-                setattr(env_cfg, _k_env, _v_ckpt)
-    _n_hand = int(getattr(env_cfg, "pc_num_hand_points", 11))
-    _subsets_by_size = {
-        5: ["thumb_fingertip", "index_fingertip", "middle_fingertip",
-            "ring_fingertip", "pinky_fingertip"],
-        6: ["hand_C_MC", "thumb_fingertip", "index_fingertip", "middle_fingertip",
-            "ring_fingertip", "pinky_fingertip"],
-        11: ["hand_C_MC", "thumb_CMC_VL", "index_MCP_VL", "middle_MCP_VL",
-             "ring_MCP_VL", "pinky_MCP_VL", "thumb_fingertip", "index_fingertip",
-             "middle_fingertip", "ring_fingertip", "pinky_fingertip"],
-        22: ["hand_C_MC", "thumb_CMC_VL", "index_MCP_VL", "middle_MCP_VL",
-             "ring_MCP_VL", "pinky_MCP_VL", "thumb_MCP_VL", "index_PP", "middle_PP",
-             "ring_PP", "pinky_PP", "thumb_MC", "index_MP", "middle_MP", "ring_MP",
-             "pinky_MP", "thumb_fingertip", "index_fingertip", "middle_fingertip",
-             "ring_fingertip", "pinky_fingertip", "thumb_IP"],
-    }
-    if _n_hand in _subsets_by_size:
-        env_cfg.pc_hand_body_names = _subsets_by_size[_n_hand]
-        print(f"[PPOPC] pc_hand_body_names set to {_n_hand}-body subset")
+    # The DAgger student fixes the point counts / hand bodies / tactile width
+    # the env must produce so its encoder weights load.
+    _ckpt_peek = load_checkpoint(args_cli.dagger_ckpt)
+    _why = lean_student_refusal(_ckpt_peek)
+    if _why:
+        raise SystemExit(f"[PPOPC] {args_cli.dagger_ckpt}: {_why}")
+    align_pc_dims_to_ckpt(env_cfg, _ckpt_peek, tag="PPOPC")
 
     # Inherit the env-side PC transforms (force scale / gate / repr / ablations)
     # from the DAgger ckpt, so the fine-tune sees the same input distribution
@@ -152,7 +138,7 @@ def main():
 
     # Read DAgger student layout from ckpt so PPO's actor MLP matches and
     # the warm-start weights actually load.
-    dagger_ckpt = torch.load(args_cli.dagger_ckpt, map_location="cpu", weights_only=False)
+    dagger_ckpt = _ckpt_peek
     student_hidden = tuple(dagger_ckpt.get("student_hidden", (512, 256)))
     print(f"[PPOPC] reading student_hidden={student_hidden} from DAgger ckpt")
 

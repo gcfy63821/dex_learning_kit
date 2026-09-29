@@ -6,7 +6,7 @@ with --real_pc_npz accum.npz (color-aware). Overlaying N frames of a held-still
 scene fills gaps and shows sensor jitter.
 
   python tools/calib/capture_multiframe_zmq.py \
-      --addr tcp://101.6.90.122:5562 --n_frames 10 --out_dir logs/real_calib_multi
+      --addr tcp://<CAM_HOST>:5562 --n_frames 10 --out_dir logs/real_calib_multi
 """
 import argparse
 import os
@@ -18,7 +18,9 @@ from dexx import deploy_config as _dcfg
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--addr", default="tcp://101.6.90.122:5562")
+    p.add_argument("--addr", required=True,
+                   help="ZMQ address of the camera-host color publisher, "
+                        "e.g. tcp://<CAM_HOST>:5562")
     p.add_argument("--n_frames", type=int, default=10)
     p.add_argument("--gap", type=float, default=0.15, help="seconds between grabbed frames")
     p.add_argument("--out_dir", default="logs/real_calib_multi")
@@ -30,7 +32,7 @@ def main():
     import msgpack
     import msgpack_numpy as mnp
     mnp.patch()
-    from dexx.scripts.deploy.ros2_depth_subscriber import SIM_INTRINSICS
+    from dexx.deploy_config import SIM_INTRINSICS
     from dexx.tasks.franka_sharpa.pointcloud.depth_to_pointcloud import DepthToPointCloud
 
     d2pc = DepthToPointCloud(

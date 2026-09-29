@@ -3,8 +3,6 @@
 `depth_to_pointcloud`: GPU depth → fixed-size point cloud (per-batch subsample).
 `pointcloud_encoder`:  PointNet backbone + 3 fusion strategies for the policy.
 `pointcloud_augmentation`: train-time jitter / dropout / force noise.
-
-See `POINTCLOUD_ENV_PLAN.md` for the design rationale.
 """
 
 from .depth_to_pointcloud import DepthToPointCloud

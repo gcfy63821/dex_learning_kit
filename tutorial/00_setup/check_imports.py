@@ -2,7 +2,6 @@
 
     python tutorial/00_setup/check_imports.py
     python tutorial/00_setup/check_imports.py --include-deploy
-    python tutorial/00_setup/check_imports.py --include-rsl-rl
 
 Hardware SDKs and Isaac Sim runtime imports are reported separately. A passing
 static check does not verify the simulator, CUDA operators, or training; run
@@ -25,22 +24,14 @@ SKIP_DIRS = {"__pycache__", ".git"}
 FIRST_PARTY = {"dexx"}
 # These tools acquire data from live hardware, rather than process saved data.
 DEPLOY_TOOLS = {"tools/calib/capture_multiframe_zmq.py", "tools/calib/live_calibrate_extrinsic.py"}
-HARDWARE_ONLY = {
-    "polymetis", "rclpy", "sensor_msgs", "geometry_msgs", "std_msgs",
-    "visualization_msgs", "cv_bridge", "rosgraph_msgs", "builtin_interfaces",
-    "tf2_ros", "tf2_geometry_msgs", "tf2_py", "ament_index_python",
-    "rclpy_message_converter", "nav_msgs", "trajectory_msgs",
-    "pyrealsense2", "sharpa", "sharpa_sdk",
-}
+# ROS2 (the optional deploy backend) comes from a system install, not pip.
+HARDWARE_ONLY = {"polymetis", "pyrealsense2", "sharpa",
+                 "rclpy", "sensor_msgs", "geometry_msgs", "std_msgs", "franka_msgs"}
 SIM_RUNTIME = {"omni", "pxr", "isaacsim", "carb", "usdrt"}
 LAB_PACKAGES = {"isaaclab", "isaaclab_tasks", "isaaclab_rl"}
 LAB_RUNTIME = {"isaaclab.app", "isaaclab.assets", "isaaclab.actuators", "isaaclab.controllers",
                "isaaclab.envs", "isaaclab.managers", "isaaclab.scene", "isaaclab.sensors",
                "isaaclab.sim", "isaaclab_tasks"}
-OPTIONAL_RSL_CONFIGS = {
-    "src/dexx/tasks/franka_sharpa/agents/rsl_rl_ppo_cfg.py",
-    "src/dexx/tasks/hand_imitation/agents/rsl_rl_ppo_cfg.py",
-}
 PIP_NAME = {
     "warp": "warp-lang",
     "simple_raycaster": "the pinned simple-raycaster in requirements.txt",
@@ -52,7 +43,7 @@ PIP_NAME = {
 }
 
 
-def source_imports(include_deploy: bool = False, include_rsl_rl: bool = False) -> dict[str, set[str]]:
+def source_imports(include_deploy: bool = False) -> dict[str, set[str]]:
     """Actual module names, including submodules, mapped to their callers."""
     found: dict[str, set[str]] = {}
     for rel in SCAN:
@@ -67,8 +58,6 @@ def source_imports(include_deploy: bool = False, include_rsl_rl: bool = False) -
                     continue
                 path = os.path.join(dirpath, filename)
                 caller = os.path.relpath(path, ROOT)
-                if not include_rsl_rl and caller in OPTIONAL_RSL_CONFIGS:
-                    continue
                 if not include_deploy and ("deploy" in filename or caller in DEPLOY_TOOLS):
                     continue
                 with open(path, encoding="utf-8") as source:
@@ -100,12 +89,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--include-deploy", action="store_true",
                         help="also check deployment and live-camera Python dependencies")
-    parser.add_argument("--include-rsl-rl", action="store_true",
-                        help="also check optional RSL-RL example configurations")
     args = parser.parse_args(argv)
     stdlib = getattr(sys, "stdlib_module_names", set())
     third_party = {
-        name: files for name, files in source_imports(args.include_deploy, args.include_rsl_rl).items()
+        name: files for name, files in source_imports(args.include_deploy).items()
         if name.split(".")[0] not in stdlib | FIRST_PARTY and not name.startswith("_")
     }
     if any(name.split(".")[0] == "pytorch3d" for name in third_party):
@@ -149,8 +136,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"=== {len(third_party)} third-party module imports")
     print(f"  {len(ok)} importable, {len(hardware)} hardware SDK imports skipped, "
           f"{len(runtime)} require runtime verification, {len(failed)} failed")
-    if not args.include_rsl_rl:
-        print("  Optional RSL-RL example configurations excluded (use --include-rsl-rl).")
     if hardware:
         print("\nHardware SDK imports not checked: " + ", ".join(hardware))
     if runtime:

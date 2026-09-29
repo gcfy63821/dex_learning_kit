@@ -22,7 +22,8 @@ python scripts/train_teacher.py --task franka-sharpa-force-poseobs --side right 
 
 - **Input:** retargeted pkl(s) named by `--data_idx`.
 - **Output:** teacher checkpoint (`.pth`). A pretrained one ships at
-  `checkpoints/teacher_poseobs.pth`.
+  `checkpoints/teacher_poseobs.pth` (training conditions in
+  [checkpoints/README.md](../checkpoints/README.md)).
 
 ## Key flags
 
@@ -39,7 +40,8 @@ python scripts/train_teacher.py --task franka-sharpa-force-poseobs --side right 
 | `--env_cfg` | `[]` | Override env_cfg fields, e.g. `--env_cfg force_reward_weight=0.0`. |
 | `--no_contact_force` | off | Ablation: disable the 5d scalar contact force in the obs. |
 | `--video`, `--video_length`, `--video_interval` | | Record training videos. |
-| `--wandb-project-name`, `--wandb-entity`, `--wandb-name` | | wandb logging. |
+| `--wandb-project-name`, `--wandb-entity`, `--wandb-name` | `dex`, none, `dexmanip` | wandb logging. |
+| `--no-wandb` | off | Train without wandb (no login needed). |
 
 `--data_idx` accepts JSON (double quotes) or a Python-literal list.
 
@@ -48,7 +50,7 @@ python scripts/train_teacher.py --task franka-sharpa-force-poseobs --side right 
 The progress line and TensorBoard carry **two** episode success rates:
 
 ```
-Mean Rewards: 642.88 | Success: 81.9% | Strict: 73.4% | Current Best: 642.88
+Mean Rewards: <reward> | Success: <survival>% | Strict: <strict>% | Current Best: <best reward>
 ```
 
 | | meaning | TensorBoard |
@@ -73,15 +75,7 @@ over a global float. Evaluation's strict3 always uses 3 cm; `--success_dist`
 changes only the evaluation's closest-approach threshold.
 
 Reward and success do not move together, and neither do the two success rates.
-Three consecutive epochs resuming from the shipped teacher:
-
-```
-reward 269.79 -> 642.88 -> 753.92
-Survival 69.8% -> 81.9% -> 77.5%
-Strict   56.9% -> 73.4% -> 68.7%
-```
-
-The last epoch bought 111 points of reward while **both** success rates fell.
+An epoch can gain a large amount of reward while **both** success rates fall.
 Watching only the reward hides that completely.
 
 ### Why it is computed the way it is
@@ -108,15 +102,20 @@ names — do not read them as rates.
 actually runs. Adding an extras key to the base class alone does nothing and
 fails silently; PPO prints a one-shot warning if the key never arrives.
 
-## Demo-ordering gotcha (14-key ordering)
+## Mixing demos with different metadata
 
-The env's data builder (`env._build_data`) expects the per-demo metadata keys to
-be consistent across the demos in `--data_idx`. A demo that **lacks the
-`obj_scale` field** (older retargeted pkls) must appear **first** in the
-`--data_idx` list. If such a demo is not first, `env._build_data` raises a
-`KeyError` while assembling the batched data tensors, because the first demo seeds
-the key schema for the rest.
+`env._build_data` takes its key schema from the **first** demo in `--data_idx`.
+For every key that demo has, a later demo lacking the key silently receives the
+first demo's value; a key the first demo lacks is dropped for every demo. There is
+no `KeyError` either way.
 
-Rule of thumb: put any legacy / minimal-metadata demo at index 0 of `--data_idx`,
-or re-retarget it so it carries `obj_scale` (retarget writes `obj_scale` into new
-pkls). See [RETARGET.md](RETARGET.md) for the `--obj_scale` flag.
+That matters for `obj_scale`, which `scripts/retarget.py --obj_scale` writes into
+the pkl and the loader passes through. Older pkls do not carry it:
+
+- legacy demo **first**: `obj_scale` disappears for all demos, and every object
+  mesh is used at scale 1.0, including demos retargeted at another scale;
+- legacy demo **later**: it inherits the first demo's scale.
+
+Both are harmless when every scale is 1.0 (the shipped demos). Otherwise
+re-retarget the legacy demo so every pkl carries `obj_scale`
+([RETARGET.md](RETARGET.md)).

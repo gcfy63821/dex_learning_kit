@@ -17,7 +17,6 @@ on the env and read via `get_record_camera_outputs()`.
 """
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch

@@ -1,150 +1,153 @@
-"""ROS2 depth subscriber for RealSense D455 — deploy-side scene-PC source.
+"""ROS2 RealSense depth subscriber — runs ON THE INFERENCE PC (optional backend).
 
-Reads `/camera/depth/image_rect_raw` (16UC1, depth in millimeters by default)
-or `/camera/aligned_depth_to_color/image_raw` if you're using color-aligned
-depth. Stores the latest depth frame as fp32 meters torch tensor on the
-configured device (cpu or cuda).
+Drop-in alternative to ``RealSenseDepthZmqSubscriber`` (same ``get_latest()``,
+``age()``, ``n_received``, ``n_rejected``, ``shutdown()``) for a camera driven
+by the stock ``realsense2_camera`` ROS2 driver instead of
+``deploy/realsense_depth_zmq_pub.py``.
 
-Usage:
-    from dexx.scripts.deploy.ros2_depth_subscriber import RealSenseDepthSubscriber
-    sub = RealSenseDepthSubscriber(
-        node_name='realsense_depth_sub',
-        topic='/camera/aligned_depth_to_color/image_raw',
-        height=240, width=320, device='cuda', namespace='',
-    )
-    rclpy.spin_until_future_complete(...)  # or run a separate executor
-    depth_m = sub.get_latest()  # fp32 (H, W) torch on device; or None if no frame yet
+The driver must deliver the same image the ZMQ publisher does: D455 depth at
+640x480, x2 decimation -> 320x240, not aligned to color (docs/DEPLOY.md, "ROS2
+backend"). Frames of any other size are REJECTED rather than resized: a
+different resolution means different intrinsics, and the deploy back-projects
+with the 320x240 sim intrinsics.
 
-Note: real depth pipeline outside this file (back-project → workspace crop →
-subsample) is in `dexx/tasks/franka_sharpa/pointcloud/depth_to_pointcloud.py`
-and `dexx/scripts/deploy/convert_real_depth_to_pc.py` (offline).
+Accepts 16UC1 (millimetres) and 32FC1 (metres). Spins its own node on a daemon
+thread; call ``shutdown()`` when done.
 """
 from __future__ import annotations
 
 import threading
+import time
 from typing import Optional
 
 import numpy as np
 import torch
 
-import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
+DEFAULT_DEPTH_TOPIC = "/camera/camera/depth/image_rect_raw"
 
 
-# Sim camera intrinsics — single source of truth: dexx.deploy_config.
-# REAL intrinsics must match these for sim2real PC alignment.
-from dexx import deploy_config as _dcfg
-SIM_INTRINSICS = {
-    **_dcfg.SIM_INTRINSICS,
-    "height": _dcfg.DEPTH_H, "width": _dcfg.DEPTH_W,
-}
-
-# Camera mount extrinsic (D455 in arm-base frame).
-#
-# Source of truth = `VisualRaycaster._build_camera_extrinsics()` in
-# `dexx/tasks/franka_sharpa/visual_raycaster.py` (the actual matrix
-# the sim renders with). User confirmed (2026-05-24) the real camera mount
-# matches sim, so this is the single calibrated extrinsic.
-#
-# Calibration history (per visual_raycaster.py):
-#  - 2026-05-19: manual hand-tune via calibrate_extrinsic_viz.py
-#  - 2026-05-20: refined via viser sim↔real overlay (calibrate_real_extrinsic_viser.py)
-# The shipped calibration, loaded from calib/camera_align/ — not a literal.
-# This module used to carry its own copy of a 2026-05-20 matrix, identical to a
-# second copy in visual_raycaster.py. Both went stale when the camera moved.
-DEFAULT_T_CAM_IN_ARMBASE = _dcfg.default_camera_extrinsic()
-
-# arm_base in env-local frame. Read from deploy_config, never copied: this line
-# held a literal 0.415 while ARM_BASE_Z went 0.415 -> 0.432 -> 0.415, and was
-# correct again only by coincidence.
-ARM_BASE_POS_IN_ENV_LOCAL = _dcfg.arm_base_pos_np()
-
-
-class RealSenseDepthSubscriber(Node):
-    """ROS2 subscriber for RealSense depth topic.
-
-    Stores the latest depth frame thread-safely. Call `get_latest()` to read.
-
-    Depth msg format expected:
-      - encoding: 16UC1 (raw depth in mm) — converted to fp32 meters
-      - OR encoding: 32FC1 (already meters)
-    """
-
+class RealSenseDepthRos2Subscriber:
     def __init__(
         self,
-        node_name: str = 'realsense_depth_sub',
-        topic: str = '/camera/aligned_depth_to_color/image_raw',
+        topic: str = DEFAULT_DEPTH_TOPIC,
         height: int = 240,
         width: int = 320,
-        device: str = 'cpu',
-        namespace: str = '',
-        depth_unit_to_m: float = 1.0e-3,  # 16UC1 → meters
+        device: str = "cpu",
     ):
-        super().__init__(node_name, namespace=namespace)
+        try:
+            import rclpy
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from sensor_msgs.msg import Image
+        except ImportError as exc:
+            raise ImportError(
+                "the ROS2 depth backend needs rclpy and sensor_msgs: "
+                "`source /opt/ros/humble/setup.bash` before running.\n  %r" % (exc,)
+            )
         self._topic = topic
         self._H = int(height)
         self._W = int(width)
         self._device = torch.device(device)
-        self._unit_to_m = float(depth_unit_to_m)
-
-        self._lock = threading.Lock()
         self._latest: Optional[torch.Tensor] = None
         self._latest_stamp: Optional[float] = None
+        self._latest_rx: Optional[float] = None   # local time.monotonic() of receipt
         self._n_received = 0
+        self._n_rejected = 0
+        self._last_warn = float("-inf")
+        self._rejected_since_warn = 0
+        self._lock = threading.Lock()
 
-        # RealSense depth is typically BestEffort + small depth queue.
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-        self._sub = self.create_subscription(Image, topic, self._cb, qos)
-        self.get_logger().info(
-            f'[depth_sub] subscribing {topic} → ({height}x{width}) on {device}'
-        )
+        if not rclpy.ok():
+            rclpy.init()
+            self._owns_rclpy = True
+        else:
+            self._owns_rclpy = False
+        self._rclpy = rclpy
+        self._node = rclpy.create_node("dexx_depth_sub")
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=1)
+        self._node.create_subscription(Image, topic, self._cb, qos)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._spin, daemon=True)
+        self._thr.start()
+        print(f"[depth-ros2-sub] subscribing {topic} -> ({self._H}x{self._W}) on {device}", flush=True)
 
-    def _cb(self, msg: Image):
+    def _spin(self):
+        while not self._stop.is_set():
+            try:
+                self._executor.spin_once(timeout_sec=0.1)
+            except Exception as exc:  # noqa: BLE001
+                if not self._stop.is_set():
+                    print(f"[depth-ros2-sub] executor error: {exc!r}", flush=True)
+
+    def _cb(self, msg):
         try:
-            arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, -1)
-            if msg.encoding == '16UC1':
-                # 2 bytes per pixel
-                depth_raw = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
-                depth_m = depth_raw.astype(np.float32) * self._unit_to_m
-            elif msg.encoding == '32FC1':
-                depth_m = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+            if msg.encoding == "16UC1":
+                depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
+                depth = depth.astype(np.float32) * 1e-3
+            elif msg.encoding == "32FC1":
+                depth = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width).copy()
             else:
-                self.get_logger().warn(f'[depth_sub] unsupported encoding: {msg.encoding}')
+                self._warn(f"unsupported encoding {msg.encoding!r}; expected 16UC1 or 32FC1")
                 return
-
-            # Crude resize if camera output ≠ expected. Use nearest to keep
-            # depth values sharp. Production: replace with a proper resizer.
-            if depth_m.shape != (self._H, self._W):
-                # Center-crop or zero-pad to expected size. Cheap version: nearest indexing.
-                import cv2
-                depth_m = cv2.resize(depth_m, (self._W, self._H), interpolation=cv2.INTER_NEAREST)
-
-            depth_t = torch.from_numpy(depth_m).to(self._device, dtype=torch.float32)
-            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-
+            if depth.shape != (self._H, self._W):
+                self._n_rejected += 1
+                self._rejected_since_warn += 1
+                self._warn(f"rejected {self._rejected_since_warn} depth frame(s) of shape "
+                           f"{depth.shape}; expected ({self._H}, {self._W}). Configure the driver "
+                           f"for 640x480 depth with x2 decimation.", reset=True)
+                return
+            t = torch.from_numpy(depth).to(self._device, dtype=torch.float32)
             with self._lock:
-                self._latest = depth_t
-                self._latest_stamp = stamp
+                self._latest = t
+                self._latest_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                self._latest_rx = time.monotonic()
                 self._n_received += 1
-        except Exception as e:
-            self.get_logger().error(f'[depth_sub] cb error: {e}')
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"decode error: {exc!r}")
+
+    def _warn(self, text: str, reset: bool = False):
+        now = time.monotonic()
+        if now - self._last_warn >= 1.0:
+            print(f"[depth-ros2-sub] WARNING: {text}", flush=True)
+            self._last_warn = now
+            if reset:
+                self._rejected_since_warn = 0
 
     def get_latest(self) -> Optional[torch.Tensor]:
-        """Return latest depth frame as fp32 (H, W) on configured device.
-        None if no frame received yet."""
         with self._lock:
             return self._latest
 
-    def get_latest_with_stamp(self) -> tuple[Optional[torch.Tensor], Optional[float]]:
+    def get_latest_with_stamp(self):
         with self._lock:
             return self._latest, self._latest_stamp
+
+    def age(self) -> float:
+        """Seconds since the newest frame arrived here (inf before the first)."""
+        with self._lock:
+            rx = self._latest_rx
+        return float("inf") if rx is None else time.monotonic() - rx
 
     @property
     def n_received(self) -> int:
         return self._n_received
+
+    @property
+    def n_rejected(self) -> int:
+        return self._n_rejected
+
+    def shutdown(self):
+        self._stop.set()
+        self._thr.join(timeout=1.0)
+        try:
+            self._executor.remove_node(self._node)
+            self._node.destroy_node()
+        except Exception:
+            pass
+        if self._owns_rclpy:
+            try:
+                self._rclpy.shutdown()
+            except Exception:
+                pass

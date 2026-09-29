@@ -10,10 +10,8 @@ arm joint pos/vel, hand joint pos/vel (both sorted-USD order and cfg/Sharpa
 order), wrist pose + velocities, object pose + velocities, action, demo frame
 progress, demo idx. Episodes shorter than --min_length are dropped.
 
-Companion to `replay_rollout.py` (kinematic playback).
-
 Example:
-    python scripts/record_rollout.py \\
+    python scripts/collect_reference_rollouts.py \\
         --task franka-sharpa-force-critic-horizon-simteacher \\
         --num_envs 32 \\
         --load_path logs/.../best.pth \\
@@ -38,7 +36,6 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--task", type=str, required=True)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--load_path", type=str, required=True, help="Policy ckpt.")
-parser.add_argument("--algorithm", type=str, default=None)
 parser.add_argument("--side", type=str, default=None)
 parser.add_argument("--data_idx", type=str, default=None,
                     help="JSON/Python list, e.g. '[\"rt/foo/bar\"]'")
@@ -47,15 +44,6 @@ parser.add_argument("--num_rollouts", type=int, default=16,
                     help="Stop once this many rollouts of length>=min_length are saved.")
 parser.add_argument("--min_length", type=int, default=100,
                     help="Minimum episode length (frames) to keep. Shorter are discarded.")
-parser.add_argument("--aug_xy_range", type=float, default=0.0,
-                    help="Online consistent xy augmentation (variant B): at reset, shift the "
-                         "object + wrist/joint references by a per-env uniform(-r,+r) Δxy, ONLY "
-                         "when the object is on the table (gated). 0=off, e.g. 0.05=±5cm. The "
-                         "teacher tracks the shifted (consistent) refs -> succeeds -> the rollout "
-                         "captures the object at the shifted position for reference bootstrapping.")
-parser.add_argument("--aug_gate_tips", type=float, default=0.05,
-                    help="Object-on-table gate: only shift when min reference fingertip-to-object "
-                         "distance > this (m). Skips pre-grasped/in-hand frames (preserves grasp).")
 parser.add_argument("--env_filter", type=str, default=None,
                     help="Comma-separated env indices to record from (e.g. '0' for env-0 "
                          "only, or '0,1,2'). When set, episodes from any other env are "
@@ -65,7 +53,6 @@ parser.add_argument("--max_steps", type=int, default=10000,
                     help="Hard cap on total env-steps (safety stop).")
 parser.add_argument("--out_dir", type=str, default=None,
                     help="Output dir. Default: data/recordings/{task}_{timestamp}/")
-parser.add_argument("--cache", type=str, default=None)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -79,17 +66,11 @@ import torch  # noqa: E402
 
 from isaaclab.envs import DirectRLEnvCfg  # noqa: E402
 
-import dexx.tasks.sharpa_VBTS  # noqa: F401, E402
-import dexx.tasks.hand_imitation  # noqa: F401, E402
 import dexx.tasks.franka_sharpa  # noqa: F401, E402
 
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
-from dexx.algo.ppo.ppo import PPO  # noqa: F401, E402
-try:
-    from dexx.algo.padapt.padapt import ProprioAdapt  # noqa: F401  (absent in release; PPO teachers dont need it)
-except Exception:
-    ProprioAdapt = None
+from dexx.algo.ppo.ppo import PPO  # noqa: E402
 from dexx.wrapper.config_wrapper import ConfigWrapper  # noqa: E402
 from dexx.wrapper.sharpa_wave_env_wrapper import GymStyleEnvWrapper  # noqa: E402
 
@@ -115,7 +96,7 @@ def _grab_state_per_env(env_unwrapped):
         "wrist_ang_vel":    e.base_ang_vel.detach().cpu(),        # [N, 3]
         "arm_joint_pos":    e.arm_joint_pos.detach().cpu(),       # [N, 7]
         "arm_joint_vel":    e.arm_joint_vel.detach().cpu(),       # [N, 7]
-        # Hand DOFs in two orderings (see CLAUDE.md: USD/sorted vs cfg/Sharpa)
+        # Hand DOFs in two orderings (USD/sorted vs cfg/Sharpa; see docs/JOINT_ORDERING.md)
         "hand_dof_pos_sorted":  e.hand_dof_pos.detach().cpu(),    # [N, 22] policy frame
         "hand_dof_vel_sorted":  e.hand_dof_vel.detach().cpu(),    # [N, 22]
         "hand_dof_pos_cfg":     e.real_hand_dof_pos.detach().cpu(),  # [N, 22] Sharpa
@@ -161,21 +142,16 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     env_cfg.seed = agent_cfg["seed"]
     env_cfg.sim.device = args_cli.device if args_cli.device else env_cfg.sim.device
     agent_cfg["device"] = args_cli.device if args_cli.device else agent_cfg["device"]
-    agent_cfg["algo"] = args_cli.algorithm if args_cli.algorithm else agent_cfg["algo"]
     agent_cfg["load_path"] = args_cli.load_path
     agent_cfg["algorithm"]["num_actors"] = args_cli.num_envs
     agent_cfg["algorithm"]["minibatch_size"] = min([args_cli.num_envs * 8, 32768])
 
     # Same eval-time toggles as play.py
-    env_cfg.reset_random_quat = False
     env_cfg.randomize_pd_gains = False
     env_cfg.randomize_friction = True
     env_cfg.randomize_com = False
     env_cfg.randomize_mass = False
     env_cfg.sim.gravity = (0, 0, -9.81)
-    env_cfg.gravity_curriculum = False
-    if args_cli.cache and hasattr(env_cfg, "grasp_cache_path"):
-        env_cfg.grasp_cache_path = args_cli.cache
 
     if args_cli.side and hasattr(env_cfg, "hand_side"):
         env_cfg.hand_side = args_cli.side
@@ -208,8 +184,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     env = GymStyleEnvWrapper(env, clip_actions=env_cfg.clip_actions)
     log_dir = os.path.join("logs", "gym_style", "_record_tmp",
                           datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
-    agent = eval(agent_cfg["algo"])(env, output_dir=log_dir, full_config=config,
-                                    create_output_dir=False)
+    _agents = {"PPO": PPO}
+    if agent_cfg["algo"] not in _agents:
+        raise SystemExit(f"unsupported algo {agent_cfg['algo']!r} in the agent cfg; "
+                         f"this release ships only {sorted(_agents)}")
+    agent = _agents[agent_cfg["algo"]](env, output_dir=log_dir, full_config=config,
+                                       create_output_dir=False)
     agent.restore_test(agent_cfg["load_path"])
     agent.set_eval()
 
@@ -294,16 +274,14 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     else:
         print("[WARN] env has no hand_body_names/indices; opt_joints_pos will be skipped.")
 
-    # ---- Online consistent xy augmentation (variant B) ----
-    if args_cli.aug_xy_range > 0.0 and hasattr(e, "set_collect_aug_xy"):
-        e.set_collect_aug_xy(args_cli.aug_xy_range, args_cli.aug_gate_tips)
-
-    # ---- Patch _get_rewards to snapshot per-env success BEFORE auto-reset ----
-    # success_buf is cleared in _reset_idx (inside step), so we capture it here.
+    # ---- Patch _get_rewards to snapshot per-env success and state BEFORE auto-reset ----
+    # step() resets finished envs after _get_rewards, so the state it returns for
+    # them is already the next episode's start; the true last frame is taken here.
     _orig_get_rewards = e._get_rewards
     def _patched_get_rewards():
         out = _orig_get_rewards()
         e._last_success_buf = e.success_buf.detach().clone()
+        e._pre_reset_state = _grab_state_per_env(e)
         return out
     e._get_rewards = _patched_get_rewards
 
@@ -318,19 +296,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
 
     while saved_count < args_cli.num_rollouts and step_idx < args_cli.max_steps:
         # ---- Policy inference ----
-        if agent_cfg["algo"] == "ProprioAdapt":
-            input_dict = {
-                "obs": agent.running_mean_std(obs_dict["obs"]),
-                "proprio_hist": agent.sa_mean_std(obs_dict["proprio_hist"].detach()),
-            }
-            mu = agent.model.act_inference(input_dict)
-        else:
-            input_dict = {
-                "obs": agent.running_mean_std(obs_dict["obs"]),
-                "priv_info": obs_dict.get("priv_info"),
-            }
-            mu = agent.model.act_inference(input_dict)
-            mu = torch.clamp(mu, -1.0, 1.0)
+        input_dict = {
+            "obs": agent.running_mean_std(obs_dict["obs"]),
+            "priv_info": obs_dict.get("priv_info"),
+        }
+        mu = agent.model.act_inference(input_dict)
+        mu = torch.clamp(mu, -1.0, 1.0)
 
         # Record action just chosen for each env
         action_cpu = mu.detach().cpu()
@@ -339,20 +310,22 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         obs_dict, r, done, info = env.step(mu)
         step_idx += 1
 
-        # Capture post-step state
+        # The frame this action led to (pre-reset), and the state after step()
+        # (for finished envs, the next episode's first frame).
+        step_state = e._pre_reset_state
         post_state = _grab_state_per_env(e)
         r_cpu = r.detach().cpu().flatten()
         # Append to each env's buffer + accumulate reward
         for i in range(num_envs):
             env_actions_buf[i].append(action_cpu[i].clone())
-            env_buffers[i].append({k: v[i].clone() for k, v in post_state.items()})
+            env_buffers[i].append({k: v[i].clone() for k, v in step_state.items()})
             env_reward_acc[i] += float(r_cpu[i])
 
         # ---- Handle resets (done==1) ----
         done_cpu = done.detach().cpu()
         for i in range(num_envs):
             if done_cpu[i].item():
-                ep_len = len(env_buffers[i]) - 1  # frames excluding the initial state
+                ep_len = len(env_buffers[i]) - 1  # steps of this episode
                 if allowed_envs is not None and i not in allowed_envs:
                     discarded_filtered += 1
                     env_buffers[i] = [{k: v[i].clone() for k, v in post_state.items()}]
@@ -360,10 +333,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                     env_reward_acc[i] = 0.0
                     continue
                 if ep_len >= args_cli.min_length:
-                    # Stack frames; drop the very last post-reset state which is already a new episode
-                    # because env auto-resets inside step. We keep all frames-then-reset (final frame is termination).
-                    ep = _stack_episode(env_buffers[i])               # [T+1, ...]
-                    actions = torch.stack(env_actions_buf[i], dim=0)  # [T, ...]
+                    ep = _stack_episode(env_buffers[i])               # [T+1, ...] initial + one per step
+                    actions = torch.stack(env_actions_buf[i], dim=0)  # [T, ...] action at frame k
                     out_path = os.path.join(out_dir, f"rollout_{saved_count:04d}.pkl")
                     with open(out_path, "wb") as f:
                         succeeded_i = (float(e._last_success_buf[i])
@@ -388,8 +359,8 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
                         break
                 else:
                     discarded_short += 1
-                # Start a fresh buffer for this env. The post_state we just appended
-                # is already the reset state (env auto-resets), so seed buffer with it.
+                # Start a fresh buffer for this env from the state after step(),
+                # which is the next episode's first frame (the env auto-resets).
                 env_buffers[i] = [{k: v[i].clone() for k, v in post_state.items()}]
                 env_actions_buf[i] = []
                 env_reward_acc[i] = 0.0

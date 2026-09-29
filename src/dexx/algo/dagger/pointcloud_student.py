@@ -3,8 +3,8 @@
 Plugs the `PointCloudEncoder` (from `tasks/franka_sharpa/pointcloud/`) under
 a simple MLP that concatenates proprio obs with the encoder feature.
 
-`act_inference` mirrors the API of `ActorCriticAsymmetricVisual.act_inference`
-so the DAgger / PPO drivers can use a unified interface.
+`act_inference` mirrors the `ActorCriticAsymmetric.act_inference` API so the
+DAgger / PPO drivers can use a unified interface.
 """
 from __future__ import annotations
 

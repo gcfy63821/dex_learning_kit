@@ -64,6 +64,10 @@ def smoothness_cost(wrist_pos: np.ndarray, arm_joint_pos: np.ndarray) -> float:
     return jerk(wrist_pos) + jerk(arm_joint_pos)
 
 
+PER_FRAME_KEYS = ("wrist_pos", "wrist_quat_wxyz", "hand_dof_pos_cfg", "arm_joint_pos",
+                  "opt_joints_pos", "object_pos", "object_quat_wxyz")
+
+
 def build_obj_traj(object_pos: np.ndarray, object_quat_wxyz: np.ndarray) -> np.ndarray:
     """(T,3)+(T,4 wxyz) -> (T,4,4) SE3 (env-local)."""
     T = object_pos.shape[0]
@@ -74,11 +78,25 @@ def build_obj_traj(object_pos: np.ndarray, object_quat_wxyz: np.ndarray) -> np.n
     return M
 
 
+def demo_frame_index(progress: np.ndarray, n_demo: int) -> np.ndarray:
+    """For each demo frame t, the rollout frame recorded at (or last before) t.
+
+    The loader requires a reference to have exactly the demo's length, and a
+    rollout is shorter (it ends on success or timeout) and may repeat a
+    progress value at its start. Frames before the first recorded one take the
+    first, frames after the last take the last."""
+    progress = np.maximum.accumulate(np.asarray(progress).reshape(-1))
+    idx = np.searchsorted(progress, np.arange(n_demo), side="right") - 1
+    return np.clip(idx, 0, len(progress) - 1)
+
+
 def convert_one(rollout: dict, orig_pkl: dict, kp_body_names) -> dict:
     ref = dict(orig_pkl)  # shallow copy of the original retarget reference
-    wp = _np(rollout["wrist_pos"])                 # (T,3)
-    wq = _np(rollout["wrist_quat_wxyz"])           # (T,4) wxyz
-    T = wp.shape[0]
+    T = len(orig_pkl["opt_wrist_pos"])             # the demo's length, which the loader requires
+    sel = demo_frame_index(_np(rollout["progress_buf"]), T)
+    rollout = {k: (_np(v)[sel] if k in PER_FRAME_KEYS else v) for k, v in rollout.items()}
+    wp = rollout["wrist_pos"]                      # (T,3)
+    wq = rollout["wrist_quat_wxyz"]                # (T,4) wxyz
 
     ref["opt_wrist_pos"] = wp
     ref["opt_wrist_rot"] = quat_to_aa(torch.from_numpy(wq)).numpy().astype(np.float32)  # (T,3) aa

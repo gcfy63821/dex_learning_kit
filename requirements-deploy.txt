@@ -4,3 +4,5 @@
 pyzmq
 msgpack
 msgpack-numpy
+# Camera host only (deploy/realsense_depth_zmq_pub.py):
+# pyrealsense2

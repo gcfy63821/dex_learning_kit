@@ -5,11 +5,10 @@ and what the 557 and 148 numbers are made of.
 
 ## Run it
 
-```bash
-python scripts/train_teacher.py --task franka-sharpa-force-poseobs \
-  --num_envs 4096 --headless \
-  --data_idx '["rt/0416_grasp/cube_small_2"]'
-```
+The command and flags are in [TRAINING.md](../../docs/TRAINING.md) — for one demo,
+`--task franka-sharpa-force-poseobs --side right --num_envs 2048` with
+`--data_idx '["rt/0416_grasp/cube_small_2"]'`. Lower `--num_envs` if it does not
+fit in memory; the script's default is 16384.
 
 A pretrained expert ships at `checkpoints/teacher_poseobs.pth`, so you can skip
 straight to lesson 05 if you only want the distillation.
@@ -61,40 +60,36 @@ the actor gets positions only.
 ## Watch the success rate, not the reward
 
 ```
-Mean Rewards: 642.88 | Success: 81.9% | Strict: 73.4% | Current Best: 642.88
+Mean Rewards: <reward> | Success: <survival>% | Strict: <strict>% | Current Best: <best reward>
 ```
 
 Two rates, both running means over the last 100 completed episodes:
 
 * **Success** — reached the trajectory's end without a failure termination. That
   is *survival*.
-* **Strict** — survival, plus the object finished within 3 cm of its demo
-  endpoint, no object-position drift, bad inits excluded. That is *task success*,
-  and it is the same quantity `eval.py` reports as strict3.
+* **Strict** — survival **and** the object finished within 3 cm of its demo
+  endpoint with no object-position drift; episodes of at most 5 steps (bad inits)
+  count as failures. It is a conservative *training proxy*, **not** the `strict3`
+  that `eval.py` reports: evaluation excludes bad inits from the denominator and
+  does not require survival. [TRAINING.md](../../docs/TRAINING.md) has the exact
+  difference.
 
-Three consecutive epochs resuming from the shipped teacher:
-
-```
-reward 269.79 -> 642.88 -> 753.92
-Survival 69.8% -> 81.9% -> 77.5%
-Strict   56.9% -> 73.4% -> 68.7%
-```
-
-The last epoch bought 111 points of reward while both success rates fell.
+Reward and the two rates do not have to move together: an epoch can gain reward
+while both success rates fall. Select checkpoints on the rates.
 
 Getting this number right is subtler than it looks. `success_buf` is 1 only on
 the step an episode ends and is cleared at reset, so averaging it over all
 environments every step gives a near-zero number that is not a success rate at
 all. It has to be sampled from the environments that just terminated — which is
-what `algo/ppo/ppo.py` now does, alongside the identical treatment reward already
-got. `docs/TRAINING.md` has the details.
+what `algo/ppo/ppo.py` does, the same way it treats the episode reward. [TRAINING.md](../../docs/TRAINING.md) has the details.
 
 ## The reward is not five weights
 
 It is a flat sum of about 25 exponential-kernel terms with individually tuned
 weights: object position at 8.0, object rotation at 6.0, wrist position at 4.0,
-per-finger tracking between 0.5 and 0.9 with per-finger temperatures, plus contact,
-approach, no-slip and smoothness terms. `franka_sharpa_env.py` holds it.
+per-finger tracking at 0.5–0.9 multiplied by the absolute-tracking weight 2.0
+(effective 1.0–1.8) with per-finger temperatures, plus contact, approach, no-slip
+and smoothness terms. `compute_imitation_reward` in `franka_sharpa_env.py` holds it.
 
 If you are porting, do not start by re-deriving this. Start by reproducing the
 tracking terms and adding shaping only where a failure mode demands it.

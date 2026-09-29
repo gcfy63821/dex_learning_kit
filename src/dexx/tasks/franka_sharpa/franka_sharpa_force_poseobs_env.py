@@ -5,19 +5,16 @@
 What this env adds vs `FrankaSharpaForceCriticHorizonEnv`:
   + 7 actor obs dims at the TAIL: obj_pos (3) + obj_quat wxyz (4)
     in world / env-local frame (same as `self.object_pos` / `self.object_rot`).
-  + A FoundationPose-emulating noise model on top of that ground-truth pose:
+  + A pose-estimator-like noise model on top of that ground-truth pose:
       - per-step Gaussian (pos + rot)
       - per-episode constant bias (re-sampled at reset)
       - latency FIFO + dropout hold-last-good
 
-Deploy counterpart: `FrankaSharpaForcePoseObsDeployEnv` consumes a ROS2
-`/foundationpose/object_pose` topic and slots the result into the same 7 obs
-positions; cfg / noise are off there (the real world *is* the noise).
+The pose is privileged information for the teacher. There is no deploy
+counterpart: deployable students drop these 7 dims (`obj_pose_tail`).
 
 Design choices (rationale):
-  - World / env-local frame, not wrist-relative: user has world-frame extrinsic
-    calibration, so deploy can publish base-frame pose directly. Removes one
-    coordinate-transform path that could be miscalibrated.
+  - World / env-local frame, not wrist-relative, like `self.object_pos`.
   - Appended at TAIL, NOT inserted into proprio_hist:
       * Keeps `proprio_hist_dim` / `obs_buf_lag_history` unchanged.
       * ProprioAdapt student is intentionally proprio-only; obj pose obs sits

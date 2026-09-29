@@ -3,7 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""ROS2 node to subscribe to Franka arm observations."""
+"""ROS2 node to subscribe to Franka arm observations.
+
+Topics (``namespace`` prefix, empty on the reference setup):
+    /joint_states                                  sensor_msgs/JointState  (fr3_joint1..7 by name)
+    /franka_wrist_state                            Float32MultiArray (13): pos, quat xyzw, lin vel, ang vel
+                                                   from deploy/ros2/wrist_state_publisher.py
+    /franka_robot_state_broadcaster/current_pose   PoseStamped fallback (no velocities, fr3_hand body)
+"""
+
+import time
 
 import torch
 from rclpy.node import Node
@@ -46,10 +55,14 @@ class ROS2ObservationSubscriber(Node):
         # and keep updating it every message.
         self.wrist_state_topic_active = False
         self.wrist_msg_count = 0
+        # Local receive times (time.monotonic) for the deploy env's stale-sensor check.
+        self.last_joint_state_rx = None
+        self.last_wrist_state_rx = None
+        self.wrist_state_snapshot = None
         
         # Build topic names with namespace
         joint_states_topic = f'{self.namespace}/joint_states'
-        wrist_state_topic = f'{self.namespace}/franka_wrist_state'  # Optional, from publish_robot_observations.py
+        wrist_state_topic = f'{self.namespace}/franka_wrist_state'  # from deploy/ros2/wrist_state_publisher.py
         wrist_pose_topic = f'{self.namespace}/franka_robot_state_broadcaster/current_pose'
         
         # Subscribers
@@ -60,7 +73,7 @@ class ROS2ObservationSubscriber(Node):
             10
         )
         
-        # Try subscribing to wrist state (if available from publish_robot_observations.py)
+        # Wrist state from deploy/ros2/wrist_state_publisher.py (preferred: has velocities)
         self.wrist_state_sub = self.create_subscription(
             Float32MultiArray,
             wrist_state_topic,
@@ -103,6 +116,7 @@ class ROS2ObservationSubscriber(Node):
                 self.arm_joint_positions = torch.tensor(arm_positions, dtype=torch.float32)
                 self.arm_joint_velocities = torch.tensor(arm_velocities, dtype=torch.float32)
                 self.arm_data_received = True
+                self.last_joint_state_rx = time.monotonic()
         except Exception as e:
             self.get_logger().error(f'Error processing joint states: {e}')
     
@@ -117,9 +131,13 @@ class ROS2ObservationSubscriber(Node):
                 self.wrist_quaternion = torch.tensor([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=torch.float32)
                 self.wrist_linear_velocity = torch.tensor(msg.data[7:10], dtype=torch.float32)
                 self.wrist_angular_velocity = torch.tensor(msg.data[10:13], dtype=torch.float32)
+                # One snapshot of all four, swapped in atomically for readers on other threads.
+                self.wrist_state_snapshot = (self.wrist_position, self.wrist_quaternion,
+                                             self.wrist_linear_velocity, self.wrist_angular_velocity)
                 self.wrist_state_topic_active = True
                 self.wrist_data_received = True
                 self.wrist_msg_count += 1
+                self.last_wrist_state_rx = time.monotonic()
         except Exception as e:
             self.get_logger().error(f'Error processing wrist state: {e}')
 

@@ -3,48 +3,40 @@
 Builds the same obs dict the sim PC env produces:
 
     {
-      "policy":        (1, 557d)         ← from parent V2 poseobs deploy
+      "policy":        (1, 550)          ← V3 proprio + tactile obs (the sim env's
+                                           557-d layout minus the obj_pose tail,
+                                           which deployable students drop)
       "priv_info":     (1, priv_dim)     ← from parent (zeroed in deploy)
       "proprio_hist":  (1, hist_len, hist_dim)  ← from parent
-      "scene_pc":      (1, n_scene, 3)   ← from RealSense depth → unproject → crop → subsample
+      "scene_pc":      (1, n_scene, 3)   ← depth → unproject → crop → subsample
       "scene_mask":    (1, n_scene) bool
       "hand_pc":       (1, n_hand, 3)    ← from pk FK on hand bodies (env-local frame)
       "tactile_pc":    (1, n_tactile, 3) ← from pk FK on elastomer links + 5 offsets each
       "tactile_force": (1, n_tactile, 1) ← Sharpa SDK F6 per-finger force replicated to 5 points
     }
 
-The parent (V2 poseobs deploy → V3 force critic-horizon deploy) already runs
-pk FK on the real Franka + Sharpa state every step, exposing
-`self._fk_body_pos_minus_env` and a per-step state read. We reuse that.
+Arm: Polymetis (V2). The parent V3 runs pk FK on the real Franka + Sharpa state
+every step, exposing `self._fk_body_pos_minus_env`; the hand and tactile points
+reuse it.
 
-REAL-DEPTH path: a ROS2 subscriber `RealSenseDepthSubscriber` (separate file)
-keeps the latest depth frame; this env pulls it each `_get_observations` call,
-back-projects with sim intrinsics, crops to `pc_workspace_min/max`, and
-subsamples to `pc_num_scene_points`. The "real PC = sim PC frame" alignment
-relies on the camera mount extrinsic `T_CAM_IN_ARMBASE` matching the real
-calibration — if you move the camera, re-calibrate and update.
+DEPTH path: deploy_pc.py hands the env a depth source (the ZMQ subscriber to
+the camera host) via `set_depth_source`. Each `_get_observations` pulls the
+newest frame, back-projects with the sim intrinsics, moves it into env-local
+with the calibrated camera-in-armbase extrinsic, crops to `pc_workspace_min/max`
+and subsamples to `pc_num_scene_points`.
 
-HAND_PC path: take `self._fk_body_pos_minus_env` (already in env-local frame,
-shape (1, n_full_hand_bodies, 3)) and index with the cfg-defined hand body subset.
-
-TACTILE_PC path: get 5 elastomer link world poses from pk FK chain (we extend
-the parent's body list to include elastomer links). Apply 5 offsets each from
-`_FINGERTIP_OFFSETS` (same as sim) → 25 surface points. Force magnitudes come
-from Sharpa SDK F6 (5 per-finger normal force scalars) replicated 5× and stored
-as the force feature column.
+TACTILE_PC path: 5 elastomer link positions from pk FK, each with the 5 offsets
+of `_FINGERTIP_OFFSETS` (same as sim) → 25 surface points. Force magnitudes come
+from Sharpa SDK F6 (5 per-finger normal force scalars) replicated 5×.
 """
 from __future__ import annotations
-
-import os
-import threading
-from typing import Optional
 
 import numpy as np
 import torch
 
-# pytorch_kinematics is loaded by parent for pk FK; we don't import here.
-from .franka_sharpa_force_poseobs_deploy_env_v2 import FrankaSharpaForcePoseObsDeployEnvV2
-from .franka_sharpa_force_poseobs_cfg import FrankaSharpaPoseObsCfg
+from .franka_sharpa_force_critic_horizon_deploy_env_v3 import (
+    FrankaSharpaForceCriticHorizonDeployEnvV3,
+)
 
 # Reuse the sim env's depth-to-PC class — identical math.
 from .pointcloud.depth_to_pointcloud import DepthToPointCloud
@@ -78,10 +70,10 @@ _DEPTH_MIN_M, _DEPTH_MAX_M = 0.1, 1.5  # match sim depth crop
 _ARM_BASE_POS_IN_ENV_LOCAL = _dcfg.arm_base_pos_np()
 
 
-class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
-    """PointCloud deploy env.
+class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForceCriticHorizonDeployEnvV3):
+    """PointCloud deploy env (task `franka-sharpa-pointcloud-polymetis-deploy`).
 
-    Inherits proprio + ROS2 + Sharpa SDK + pk-FK pipeline from V2 poseobs deploy.
+    Inherits proprio + Polymetis arm + Sharpa SDK + pk-FK pipeline from V3.
     Adds: scene/hand/tactile PC tensors and `_get_observations()` extension.
 
     Knobs the cfg must provide (copy from sim `FrankaSharpaPointCloudEnvCfg`):
@@ -91,8 +83,6 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
       pc_in_world_frame (bool) — kept True by default; matches sim
       pc_force_repr ("scalar" | "binary"), pc_ablate_tactile_pc, pc_ablate_tactile_force
     """
-
-    cfg: FrankaSharpaPoseObsCfg  # actually a PointCloud cfg at runtime; type loose for inherit
 
     def __init__(self, cfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
@@ -179,41 +169,17 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
             max_points=self._pc_n_scene,
             device=device, accepts_normalized=False,
         )
-        # Camera mount extrinsic — from runbook calibration. Default placeholder;
-        # override by setting `env.set_camera_extrinsic(T_4x4)` after init.
-        from dexx.scripts.deploy.ros2_depth_subscriber import (
-            DEFAULT_T_CAM_IN_ARMBASE,
-        )
-        self._T_cam_in_armbase = torch.from_numpy(DEFAULT_T_CAM_IN_ARMBASE).to(device)
+        # Camera mount extrinsic: set by deploy_pc.py (set_camera_extrinsic) to
+        # the one the student was trained with; the shipped file is a default.
+        _T = _dcfg.default_camera_extrinsic(required=False)
+        self._T_cam_in_armbase = None if _T is None else torch.from_numpy(_T).to(device)
         self._arm_offset = torch.from_numpy(_ARM_BASE_POS_IN_ENV_LOCAL).to(device)
-        self._ws_min = torch.tensor(
-            list(getattr(cfg, "pc_workspace_min", [-0.6, -0.6, 0.415])),
-            dtype=torch.float32, device=device,
-        )
-        self._ws_max = torch.tensor(
-            list(getattr(cfg, "pc_workspace_max", [0.6, 0.6, 1.0])),
-            dtype=torch.float32, device=device,
-        )
+        self._ws_min = torch.tensor(list(cfg.pc_workspace_min), dtype=torch.float32, device=device)
+        self._ws_max = torch.tensor(list(cfg.pc_workspace_max), dtype=torch.float32, device=device)
 
         # ---- Depth source (set externally — see deploy_pc.py)
         self._depth_source = None  # callable: () → fp32 (H, W) torch on device, or None
-
-        # ---- PC publisher for RViz overlay with /demo_initial_object marker.
-        # Publishes scene_pc (env-local frame, valid-masked) every step, with
-        # arm_base_pos subtracted to land in fr3_link0 frame (matches the
-        # demo marker's frame, the rviz fixed_frame).
-        self._pc_pub = None
-        try:
-            from sensor_msgs.msg import PointCloud2  # type: ignore
-            self._pc_pub = self.ros2_action_publisher.create_publisher(
-                PointCloud2, "/deploy/scene_pc", 10
-            )
-            self.get_logger().info(
-                f"[PCDeploy] publishing scene_pc to /deploy/scene_pc "
-                f"(frame_id={self.cfg.foundationpose_base_frame})"
-            )
-        except Exception as e:  # noqa: BLE001
-            self.get_logger().warn(f"[PCDeploy] /deploy/scene_pc disabled: {e}")
+        self._depth_age = None     # callable: () → seconds since the newest frame
 
         self.get_logger().info(
             f"[PCDeploy] init done. n_scene={self._pc_n_scene} n_hand={self._pc_n_hand} "
@@ -237,10 +203,19 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
     # ------------------------------------------------------------------
     # External hooks — call after env init from deploy_pc.py
     # ------------------------------------------------------------------
-    def set_depth_source(self, fn):
-        """fn() should return a (H, W) fp32 torch tensor (meters) on self.device,
-        or None if no frame yet. Called once per `_get_observations`."""
+    def set_depth_source(self, fn, age_fn=None):
+        """fn() returns a (H, W) fp32 torch tensor (meters) on self.device, or
+        None if no frame yet; called once per `_get_observations`. age_fn()
+        returns the seconds since the newest frame arrived: with it, a camera
+        that stops publishing trips the stale-sensor e-stop."""
         self._depth_source = fn
+        self._depth_age = age_fn
+
+    def _sensor_ages(self) -> dict:
+        ages = super()._sensor_ages()
+        if self._depth_age is not None and not getattr(self.cfg, "pc_ablate_scene_pc", False):
+            ages["depth"] = float(self._depth_age())
+        return ages
 
     def set_camera_extrinsic(self, T_4x4: np.ndarray):
         """Update the cam-in-armbase 4x4 transform. Call once during deploy init
@@ -253,8 +228,15 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
     # ------------------------------------------------------------------
     def _compute_scene_pc_real(self) -> tuple[torch.Tensor, torch.Tensor]:
         """RealSense depth → unproject → crop → subsample. Returns (1, N, 3), (1, N) bool."""
+        # Vision ablation, as in the training env: a student trained with the
+        # scene cloud zeroed must not be handed live points.
+        if getattr(self.cfg, "pc_ablate_scene_pc", False):
+            return (torch.zeros_like(self.scene_pc),
+                    torch.zeros_like(self.scene_mask))
         if self._depth_source is None:
             return self.scene_pc, self.scene_mask  # zeros, no-op
+        if self._T_cam_in_armbase is None:
+            raise RuntimeError("no camera extrinsic: call set_camera_extrinsic() first")
         depth = self._depth_source()  # (H, W) or None
         if depth is None:
             return self.scene_pc, self.scene_mask
@@ -326,7 +308,7 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
         # reads raw N from contact sensors. To match training distribution
         # for the PointNet tactile input, we UNDO V3's force_scale here, THEN
         # apply `pc_force_scale` (the PC-specific normalization divisor,
-        # mirrors sim env: franka_sharpa_pointcloud_env.py:312-314).
+        # mirrors the force-scale normalization in franka_sharpa_pointcloud_env.py).
         P = self._pc_tactile_per_finger
         use_vec3 = bool(getattr(self.cfg, "pc_tactile_use_vec3", False))
         pc_scale = float(getattr(self.cfg, "pc_force_scale", 1.0))
@@ -367,9 +349,11 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
             if pc_scale != 1.0:
                 out_force = out_force / pc_scale
             if getattr(self.cfg, "pc_force_repr", "scalar") == "binary":
-                thr = float(getattr(self.cfg, "pc_force_binary_threshold", 0.5))
-                # `out_force` is now in raw-N units / pc_force_scale; threshold
-                # is in raw-N units, so divide by pc_scale to put on same scale.
+                # Same quantity and formula as the sim env
+                # (franka_sharpa_pointcloud_env.py): threshold = cfg.contact_threshold
+                # in raw-N units; `out_force` is raw N / pc_force_scale, so the
+                # threshold is divided by pc_scale to put it on the same scale.
+                thr = float(getattr(self.cfg, "contact_threshold", 0.2))
                 out_force = (out_force > (thr / max(pc_scale, 1e-6))).float()
 
         if getattr(self.cfg, "pc_ablate_tactile_force", False):
@@ -390,8 +374,8 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
         # Ablation semantics MUST match sim env (franka_sharpa_pointcloud_env.py:
         # pc_ablate_tactile_pc ONLY zeros points; tactile_force is gated by the
         # separate `pc_ablate_tactile_force` flag, which `_compute_tactile_pc_real`
-        # already handled). Previously we zero'd force here too — that conflated
-        # the two flags and broke sub_S1 (PC tactile branch OFF + proprio-force ON).
+        # already handled). Zeroing force here too would conflate the two flags
+        # (e.g. PC tactile branch OFF + proprio-force ON).
         if getattr(self.cfg, "pc_ablate_tactile_pc", False):
             tactile_pc = torch.zeros_like(tactile_pc)
 
@@ -449,49 +433,5 @@ class FrankaSharpaPointCloudDeployEnv(FrankaSharpaForcePoseObsDeployEnvV2):
                 self.get_logger().info(msg)
             except Exception as e:
                 self.get_logger().warn(f'[PC-DBG] failed: {e}')
-
-        # ----------------------------------------------------------------
-        # Publish scene_pc as a PointCloud2 on /deploy/scene_pc for RViz.
-        # Frame: cfg.foundationpose_base_frame (= fr3_link0). scene_pc is in
-        # env-local frame — convert by subtracting arm_base_pos_in_env_local
-        # (the inverse of the +arm_offset shift _compute_scene_pc_real applies).
-        # Only emit valid-masked points to avoid (0,0,0) padding artifacts.
-        # ----------------------------------------------------------------
-        if self._pc_pub is not None:
-            try:
-                from sensor_msgs.msg import PointCloud2, PointField  # type: ignore
-                from std_msgs.msg import Header  # type: ignore
-                import struct
-
-                m = scene_mask[0].detach().cpu().numpy().astype(bool)
-                # env-local → fr3_link0 frame
-                pts_fr3 = (
-                    scene_pc[0].detach().cpu() - self._arm_offset.cpu()
-                ).numpy()[m].astype(np.float32)
-                if pts_fr3.shape[0] > 0:
-                    header = Header()
-                    header.stamp = self.ros2_action_publisher.get_clock().now().to_msg()
-                    header.frame_id = self.cfg.foundationpose_base_frame
-                    fields = [
-                        PointField(name="x", offset=0,  datatype=PointField.FLOAT32, count=1),
-                        PointField(name="y", offset=4,  datatype=PointField.FLOAT32, count=1),
-                        PointField(name="z", offset=8,  datatype=PointField.FLOAT32, count=1),
-                    ]
-                    msg = PointCloud2()
-                    msg.header = header
-                    msg.height = 1
-                    msg.width = pts_fr3.shape[0]
-                    msg.fields = fields
-                    msg.is_bigendian = False
-                    msg.point_step = 12  # 3 × float32
-                    msg.row_step = msg.point_step * msg.width
-                    msg.is_dense = True
-                    msg.data = pts_fr3.tobytes()
-                    self._pc_pub.publish(msg)
-            except Exception as e:
-                # Failure mode: missing sensor_msgs/std_msgs — log once then mute.
-                if not getattr(self, "_pc_pub_warned", False):
-                    self.get_logger().warn(f"[PCDeploy] scene_pc publish failed: {e}")
-                    self._pc_pub_warned = True
 
         return obs_dict

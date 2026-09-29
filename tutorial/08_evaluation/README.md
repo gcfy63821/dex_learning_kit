@@ -5,61 +5,60 @@ evaluator is quietly choosing for you.
 
 ## Run it
 
+Use the command in [EVAL.md](../../docs/EVAL.md) with your lesson-05 student and
+the four shipped demos:
+
 ```bash
-python scripts/eval.py \
-  --load_path logs/my_student/dagger_final.pth \
-  --out_dir logs/my_eval --side right \
-  --data_idx '["rt/0416_grasp/cube_small_1","rt/0416_grasp/cube_small_2",
-               "rt/0420_manip/squeegee_1","rt/0420_manip/squeegee_2"]' \
-  --num_envs 64 --max_episodes 200 \
+python scripts/eval.py --load_path logs/my_student/dagger_final.pth \
+  --data_idx '["rt/0416_grasp/cube_small_1","rt/0416_grasp/cube_small_2","rt/0420_manip/squeegee_1","rt/0420_manip/squeegee_2"]' \
+  --num_envs 64 --max_episodes 200 --out_dir logs/my_eval \
   --camera_extrinsic calib/camera_align/current.npy --headless
 ```
 
 The student's observation layout is restored from the checkpoint automatically,
 and the run aborts if the live slot map disagrees with the saved one.
 
-## Two defaults that used to be wrong
+## Two defaults worth understanding
 
 ### Collecting the first N episodes biases the result
 
 A successful episode ends sooner than a failing one. Collect "the first 200
 episodes to finish" and whichever demonstration finishes fastest contributes the
-most of them. Measured here, a 200-episode budget split **41 / 81 / 37 / 41**
-across four demos.
+most of them. A fixed episode budget can split very unevenly across demos, with
+one demo contributing about twice as many episodes as another.
 
 The aggregate then depends on an accident of timing. And the direction is not
-predictable: under randomization the biased estimate came out **2.5 points low**,
-because the over-represented demo happened to be the weakest one.
+predictable: the biased estimate comes out low when the over-represented demo
+happens to be a weak one, and high when it is a strong one.
 
-`--per_demo_quota` now defaults to `ceil(max_episodes / n_demos)`. The summary
-reports closest-approach `success_rate_per_demo`, a demo-averaged **macro** rate and an
-episode-weighted **micro** rate; with the quota they coincide, which is the point.
-
-Pass `--per_demo_quota 0` for the old behaviour if you need to reproduce an old
-number.
+The default stays first-to-finish (`--per_demo_quota 0`), because that is the
+reference protocol and new numbers should be comparable to numbers measured
+with it. So read the summary's closest-approach
+`success_rate_per_demo`, the demo-averaged **macro** rate and the episode-weighted
+**micro** rate together: when they disagree, the aggregate is being pulled by the
+mix of demos. For a balanced number pass `--per_demo_quota -1`
+(`ceil(max_episodes / n_demos)` per demo); macro and micro then coincide.
 
 ### A clean evaluation hides what tactile is for
 
-Physical domain randomization is disabled by default so the evaluation is
-deterministic. But that also removes the only variation contact force could help
-with: a policy cannot demonstrate a benefit from sensing grip force when every
-object weighs exactly its nominal mass.
+Physical domain randomization — object mass, friction, centre of mass, hand PD
+gains — stays on by default, as in the reference protocol.
+`--no-keep_physics_dr` holds it at nominal for a cleaner run (not fully
+deterministic: arm PD-gain and action-delay randomization stay on either way;
+[EVAL.md](../../docs/EVAL.md) lists exactly what is switched off). But the clean
+run removes the only variation contact force could help with: a policy cannot
+demonstrate a benefit from sensing grip force when every object weighs exactly
+its nominal mass.
 
 ```bash
---keep_physics_dr    # mass, friction, COM and PD gains stay randomized
+--no-keep_physics_dr    # mass, friction, COM and hand PD gains held at nominal
 ```
 
-Measured on the same checkpoint, 200 balanced episodes:
-
-| | success |
-|---|---|
-| clean | 95.5% |
-| `--keep_physics_dr` | 82.0% |
-
-Neither number is wrong. They answer different questions, and a paper that reports
+The same checkpoint can score much higher on a clean run than with physics DR
+on. Neither number is wrong. They answer different questions, and a paper that reports
 only the first is answering the easier one.
 
-## The number to report is strict3, and the script now computes it
+## The number to report is strict3, and the script computes it
 
 The env's own success flag means "reached the end of the trajectory without a
 failure termination". That is survival, not task success. The protocol metric,
@@ -72,10 +71,10 @@ came within `--success_dist` at any point in the episode. They are closest-appro
 rates, not the env's trajectory-completion flags.
 
 ```
-[EvalPC] strict success (end_final_dist < N cm, no obj_pos_drift, bad inits excluded: 1/200):
-    strict2   134/199  ( 67.3%)
-    strict3   160/199  ( 80.4%)
-    strict5   179/199  ( 89.9%)
+[EvalPC] strict success (end_final_dist < N cm, no obj_pos_drift, bad inits excluded: <b>/<n>):
+    strict2   <k2>/<n-b>  ( <p2>%)
+    strict3   <k3>/<n-b>  ( <p3>%)
+    strict5   <k5>/<n-b>  ( <p5>%)
 ```
 
 Note that strict3 deliberately excludes **only** object-position drift, not the
@@ -87,20 +86,12 @@ from the denominator. See [TRAINING.md](../../docs/TRAINING.md).
 
 ## Read the per-demo breakdown
 
-The aggregate hides the interesting part. From the same run:
-
-```
-               closest       strict3
-cube_small_1      96.0%        86.0%
-cube_small_2      92.0%        89.8%
-squeegee_1        86.0%        84.0%
-squeegee_2        98.0%        62.0%     <-- 36 points
-```
-
-`squeegee_2` frequently approaches the target but has lower endpoint accuracy.
-An aggregate, on either metric alone, hides that distinction. These historical
-numbers illustrate the breakdown; rerun evaluation after metric fixes for
-release results.
+The aggregate hides the interesting part. Put each demo's closest-approach rate
+next to its strict3 rate. Per-demo rates can differ by tens of points between the
+two: a demo that frequently approaches the target but finishes with poor endpoint
+accuracy scores high on one and low on the other. An aggregate, on either metric
+alone, hides that distinction. The commands that evaluate the shipped checkpoints
+are in [checkpoints/README.md](../../checkpoints/README.md).
 
 ## Check
 

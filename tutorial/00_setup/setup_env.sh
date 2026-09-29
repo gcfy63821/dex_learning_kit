@@ -200,7 +200,8 @@ python tutorial/00_setup/check_portable.py || ok=1
 python tutorial/00_setup/check_imports.py  || ok=1
 python tutorial/01_frames_and_constants/check_frames.py || ok=1
 python tutorial/00_setup/check_versions.py || ok=1
-python -m pip check || ok=1
+# A binary Sim puts its own bundled packages on PYTHONPATH; check this env.
+PYTHONPATH= python -m pip check || ok=1
 
 echo
 if [ "$ok" -eq 0 ]; then

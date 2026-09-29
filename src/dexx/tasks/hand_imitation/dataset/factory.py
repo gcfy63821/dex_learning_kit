@@ -17,14 +17,10 @@ class ManipDataFactory:
         """Create a data instance by type.
         
         Args:
-            manipdata_type: Type of dataset (e.g., "robotool", "oakink2", "grabdemo")
+            manipdata_type: Type of dataset (e.g., "robotool_batch")
             side: "left" or "right"
             *args: Positional arguments passed to dataset constructor
             **kwargs: Keyword arguments passed to dataset constructor
-                For robotool dataset, you can pass:
-                - tool_obj_file_path: Path to the tool object mesh file (.obj)
-                - data_dir: Directory containing robotool data (default: "data/robotool")
-                - mano_joints_file: Name of mano joints pkl file (default: "mano_joints.pkl")
         
         Returns:
             ManipData instance
@@ -37,36 +33,6 @@ class ManipDataFactory:
             )
         return cls._registry[manipdata_type](*args, **kwargs)
     
-    @classmethod
-    def create_robotool_data(
-        cls,
-        side: str,
-        tool_obj_file_path: str,
-        data_dir: str = "data/robotool",
-        mano_joints_file: str = "mano_joints.pkl",
-        **kwargs
-    ) -> ManipData:
-        """Convenience method to create robotool dataset.
-        
-        Args:
-            side: "left" or "right"
-            tool_obj_file_path: Path to the tool object mesh file (.obj)
-            data_dir: Directory containing robotool data (default: "data/robotool")
-            mano_joints_file: Name of mano joints pkl file (default: "mano_joints.pkl")
-            **kwargs: Additional arguments passed to dataset constructor
-        
-        Returns:
-            RobotoolDatasetDexHand instance
-        """
-        return cls.create_data(
-            manipdata_type="robotool",
-            side=side,
-            tool_obj_file_path=tool_obj_file_path,
-            data_dir=data_dir,
-            mano_joints_file=mano_joints_file,
-            **kwargs
-        )
-
     @classmethod
     def auto_register_data(cls, directory: str, base_package: str):
         """Automatically import all data modules in the directory."""

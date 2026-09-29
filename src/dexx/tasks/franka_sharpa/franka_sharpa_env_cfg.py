@@ -1,5 +1,5 @@
-# Copyleft (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All lefts reserved.
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
@@ -10,36 +10,16 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.actuators.actuator_cfg import IdealPDActuatorCfg, ImplicitActuatorCfg
 
-from dexx.robot_constants import ARM_ARMATURE, ARM_FRICTION, hand_gain_dicts as _hand_gain_dicts
+from dexx.robot_constants import (
+    ARM_ARMATURE, ARM_FRICTION, ARM_TUNED_KD, ARM_TUNED_KP, hand_gain_dicts as _hand_gain_dicts,
+)
 from isaaclab.envs import DirectRLEnvCfg
-from isaaclab.managers import EventTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.utils import configclass
 
-from dexx.utils.modified_events import randomize_rigid_body_scale
 from dexx.tasks.hand_imitation.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_obj_mass
-
-from dexx.tasks.sharpa_VBTS.sensor_cfg.ray_caster_surface import SharpaVBTSCfg, SharpaVBTS
-# dummy pattern (not used, but the base class needs it)
-from isaaclab.sensors.ray_caster import patterns
-
-# NOTE: dummy placeholder, never spawned — the real object is set at runtime from
-# the demo dataset's `obj_urdf_path`. Paths point at the shipped example object so
-# there is no dependency on any external/absolute path.
-OBJECT_CFG_LIST = [
-                sim_utils.UrdfFileCfg(
-                    asset_path="data/robotool_batch/models/cube_small/cleaned_mesh_10000.urdf",
-                    fix_base = False,
-                    joint_drive=None,
-                ),
-                sim_utils.UrdfFileCfg(
-                    asset_path="data/robotool_batch/models/cube_small/cleaned_mesh_10000.urdf",
-                    fix_base = False,
-                    joint_drive=None,
-                ),
-]
 
 def get_workspace_root():
     """Get the workspace root directory (the dexx_release repo root).
@@ -77,12 +57,10 @@ def franka_sharpa_urdf(side: str = "right") -> str:
 # pairs is in contact at rest; with self-collision on and no filter the fingers
 # cannot close against the palm at all.
 #
-# This is not cosmetic. The legacy pre-converted robot USD authored exactly these
-# (8 prims / 14 directed entries). URDF cannot express collision filtering and
-# Isaac Lab's UrdfConverterCfg has no field for it, so they are re-applied to the
-# converted USD here. Measured on the shipped teacher, cube_small @5cm:
-# filtered 94.9% vs unfiltered 37.9% -- the failures are silent (no NaN, no
-# warning), the hand simply never closes and the object is never moved.
+# This is not cosmetic. URDF cannot express collision filtering and Isaac Lab's
+# UrdfConverterCfg has no field for it, so they are applied to the converted USD
+# here. Without them the failures are silent (no NaN, no warning): the hand
+# simply never closes and the object is never moved.
 SELF_COLLISION_FILTER_PAIRS = (
     ("hand_C_MC", "index_PP"),
     ("hand_C_MC", "middle_PP"),
@@ -109,7 +87,7 @@ def _apply_self_collision_filters(usd_path: str, side: str) -> int:
                 f"self-collision filter pair not found in {usd_path}: "
                 f"{side}_{a_suf} <-> {side}_{b_suf}"
             )
-        # Author both directions, as the legacy asset did.
+        # Author both directions.
         for src, dst in ((a, b), (b, a)):
             UsdPhysics.FilteredPairsAPI.Apply(src)
             rel = src.GetRelationship("physics:filteredPairs")
@@ -236,7 +214,6 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     prop_hist_len = 30  # Required for ProprioAdapt: Conv1d needs at least 30 steps
     priv_info_dim = 40
     state_space = 0
-    asymmetric_obs = True
 
     # Whether to include object BPS (128d static shape encoding) in actor obs.
     # Honored by FrankaSharpaForceEnv / FrankaSharpaForceCriticHorizonEnv
@@ -250,8 +227,6 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     hand_side: str = "right"
     robot_asset_override: str = None  # optional: path (abs or repo-relative) to a custom robot URDF (default is assets/generated/fr3_with_{side}_sharpa_wave.urdf)
     material_elastomer_ids: list = None  # collision-shape indices of the 5 fingertip elastomers for friction DR; None -> [27,28,30,32,33] (stock asset, 34 shapes). Re-calibrate after any asset change with tools/calibrate_elastomer_ids.py -- out-of-range ids are dropped silently.
-    hand_file_name: str = "Right"  # Will be updated by update_cfg_for_hand_side()
-    hand_name: str = "right"  # Will be updated by update_cfg_for_hand_side()
     
     # Keypoint tracking parameters
     obs_future_length: int = 1  # Number of future steps for target observations
@@ -262,7 +237,7 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     arm_actions_moving_average: float = 0.15  # Separate (more aggressive) EMA for arm joint_pos_des to match real Franka impedance ~50ms LP bandwidth; sim2real arm-shake mitigation
     use_joint_pos_control: bool = False  # Whether to use absolute joint position control for arm (action: joint_pos(7) dims)
     use_joint_delta_control: bool = True  # Whether to use joint delta control for arm (action: joint_delta(7) dims, recommended for sim2real)
-    joint_delta_scale: float = 0.2  # was 0.1 @60Hz, doubled for 30Hz to maintain same arm speed
+    joint_delta_scale: float = 0.2  # Scale for arm joint-delta actions (rad per step at 30Hz)
     freeze_arm: bool = False  # Freeze arm at reset position, action space = hand only (22)
 
     # Tracking reward mode: controls which reward terms are active
@@ -279,7 +254,6 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     #   "auto"     — prefer retargeted `opt_*` when present in demo, fall back to MANO
     #   "retarget" — strict: require `opt_*`, raise if missing
     #   "mano"     — force raw MANO (`wrist_pos` / `mano_joints`), ignore `opt_*`
-    # Default "auto" reproduces the collaborator's post-refactor behavior.
     reference_source: str = "auto"
     # Optional override for RoboToolBatch retarget pkl root. Empty keeps the
     # dataset default: data/retargeting/robotool_batch/mano2{dexhand}.
@@ -304,41 +278,34 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     obs_wrist_rot_noise: float = 0.017  # Noise std for wrist rotation (rad, ~1°)
 
     # Action delay for sim2real (simulates communication latency)
-    action_delay_steps: int = 2  # Number of steps to delay actions (0=disabled, 2 steps @60Hz ≈ 33ms latency)
+    action_delay_steps: int = 2  # Number of steps to delay actions (0=disabled, 2 steps @30Hz ≈ 67ms latency)
     # Action-delay Domain Randomization (sim2real). When randomize_action_delay=True,
     # each env gets its own delay sampled uniformly in [min, max] at reset time. The
-    # FIFO buffer is always sized to `max` (upper bound). This covers the observation
-    # that real-hardware lag varies 0-100ms across joints, so DR over the delay range
-    # makes the policy robust to the actual per-run latency.
+    # FIFO buffer is always sized to `max` (upper bound). Real-hardware lag varies
+    # 0-100ms across joints, so DR over the delay range makes the policy robust to
+    # the actual per-run latency.
     randomize_action_delay: bool = True
     action_delay_min: int = 0          # inclusive, 0 = no delay for this env
     action_delay_max: int = 3          # inclusive, 3 steps @30Hz = 100ms
 
     # Tightening parameters (curriculum learning)
     tighten_method: str = "exp_decay"  # "None", "const", "linear_decay", "exp_decay", "cos"
-    tighten_factor: float = 0.7  # Tightening factor (was 0.7, relaxed to let arm learn first)
-    tighten_steps: int = 3000  # Number of steps for tightening (was 1000, slower ramp)
+    tighten_factor: float = 0.7  # Tightening factor
+    tighten_steps: int = 3000  # Number of steps for tightening
     
     # Reset parameters 
     random_state_init: bool = True  # Whether to randomly initialize state
-    # When random_state_init is False, default is demo frame 0. Set this to start every reset at a fixed demo index (clamped per-env to seq_len-1). Used by dump_obs_sim / debug deploy start frame.
+    # When random_state_init is False, default is demo frame 0. Set this to start every reset at a fixed demo index (clamped per-env to seq_len-1). Used for debugging a deploy start frame.
     fixed_reset_demo_frame: int | None = None
-    rollout_state_init: bool = True  # Whether to initialize from rollout
     loop_trajectory: bool = False  # Whether to loop reference trajectory (reset only on max_episode_length or terminate)
 
     # Reverse curriculum on initialization: start from near-grasp frames, gradually expand to full trajectory.
-    # Defaults tuned 2026-05-19 from V1 ablation (RECENT_CHANGES.md Week 13 §6):
-    #   `start=0.3 + steps=15000` is the winning combo when combined with V1 reward boost.
-    #   Together with `success_pos_weight=30, alpha_pos=15, window=10` (also retuned 2026-05-19),
-    #   gives frame-0 reach success 56% (vs 34% at default curriculum).
-    # Anti-patterns (from V2/V3 ablation):
-    #   - `enabled=False` (uniform full demo) alone: no-op, reach success unchanged.
-    #   - `enabled=False` + reward boost together: WORSE than baseline (reach 26.6% vs 34.4% F).
+    # Tuned together with the success-reward settings below.
     init_curriculum_enabled: bool = True
     init_curriculum_method: str = "linear"  # "linear", "exp", "cos"
-    init_curriculum_start: float = 0.3   # 2026-05-19: 0.0 → 0.3 (V1 ablation; sample from 30%+ initially)
+    init_curriculum_start: float = 0.3   # early training: sample from 30%+ of the demo
     init_curriculum_end: float = 0.0     # Late training: sample from 0%+ (full approach)
-    init_curriculum_steps: int = 15000   # 2026-05-19: 2000 → 15000 (V1 ablation; gentler ramp)
+    init_curriculum_steps: int = 15000   # ramp length (steps)
 
     # Adaptive initialization from rollout state buffer
     adaptive_init_enabled: bool = False  # Master switch
@@ -388,15 +355,11 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # window. Best practice for early training stability.
     adaptive_sampling_compose_with_curriculum: bool = True
 
-    # Approach reward shaping: guide hand toward object when far away
-    approach_reward_weight: float = 2.0  # Weight for approach reward (active when hand far from object)
-    approach_reward_scale: float = 5.0  # Exponential decay scale for distance
-
     # ------------------------------------------------------------------
-    # Raycaster-based depth (FrankaSharpaVisualEnv)
+    # Raycaster-based depth (visual_raycaster.VisualRaycaster)
     # ------------------------------------------------------------------
-    # FrankaSharpaVisualEnv uses simple_raycaster.MultiMeshRaycaster to produce
-    # its [N, H, W] depth tensor (z-depth, matching real-world depth cameras).
+    # The point-cloud env renders its [N, H, W] depth with
+    # simple_raycaster.MultiMeshRaycaster (z-depth, like real depth cameras).
     # Hit clamps fed to MultiMeshRaycaster.raycast_fused.
     raycaster_min_dist: float = 0.01
     raycaster_max_dist: float = 5.0
@@ -415,10 +378,8 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # Dexhand configuration
     dexhand: str = "sharpa"  # Hand type (used by DexHandFactory)
     # control
-    decimation = 4  # was 2. Policy freq = 120/4 = 30Hz, matching demo data 30fps and deploy
-    clip_obs = 5.0
+    decimation = 4  # Policy freq = 120/4 = 30Hz, matching demo data 30fps and deploy
     clip_actions = 1.0
-    action_scale = 1
     torque_control = False
     # simulation
     sim: SimulationCfg = SimulationCfg(
@@ -435,10 +396,8 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
             enable_ccd=True
         ),
     )
-     # Place base at table edge: x=0.0 (left side), y=0.0 (center). z raised +1.7cm
-     # from 0.415 -> 0.432 on 2026-07-16, then back to 0.415 on 2026-09-01 when the
-     # robot was remounted level with the table. Matches the real arm-base height above
-     # table. Keep in sync with retarget_arm_2stage_aug.py and pointcloud_deploy_env.py.
+    # Arm base pose (matches the real arm-base height above the table). Single
+    # source: dexx.deploy_config, shared with retargeting and deploy.
     arm_base_pos = _dcfg.ARM_BASE_POS   # (-0.1, 0.0, 0.415) — edit in dexx/deploy_config.py
     arm_base_rot = _dcfg.ARM_BASE_ROT   # identity quaternion
     arm_init_joint_pos: list = [0.24435, 0.17453, -0.13963, -2.14675, -1.78024, 1.83260, -0.05236]  # Will be updated by update_cfg_for_hand_side()
@@ -492,62 +451,15 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
             # and replaced by manual PD + gravity + coriolis torques (mimics real Franka).
             # Gains are higher than real (K*3~4x) to compensate for sim's lower control
             # bandwidth (120Hz PD vs real Franka's 1kHz torque loop).
-            # Real DexhandJointImpedanceController: K=[200,200,200,200,100,100,50], D=[20,20,20,20,10,10,5]
+            # Real joint-impedance controller: K=[200,200,200,200,100,100,50], D=[20,20,20,20,10,10,5]
             "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=["fr3_joint.*"],
-            #     # ==== ACTIVE: uniform K=400 D=80 test set (2026-05-06) ====
-            #     # Switched from per-joint tuned set (see BACKUP below) to a flat
-            #     # K=400 D=80 baseline to evaluate training effect of a softer arm.
-            
-                # stiffness={
-                #     "fr3_joint1": 400.0,
-                #     "fr3_joint2": 400.0,
-                #     "fr3_joint3": 400.0,
-                #     "fr3_joint4": 400.0,
-                #     "fr3_joint5": 400.0,
-                #     "fr3_joint6": 400.0,
-                #     "fr3_joint7": 400.0,
-                # },
-                # damping={
-                #     "fr3_joint1": 80.0,
-                #     "fr3_joint2": 80.0,
-                #     "fr3_joint3": 80.0,
-                #     "fr3_joint4": 80.0,
-                #     "fr3_joint5": 80.0,
-                #     "fr3_joint6": 80.0,
-                #     "fr3_joint7": 80.0,
-                # },
-                # ==== BACKUP: per-joint tuned set (was active before 2026-05-06) ====
-                # Tuned via step response comparison (system_id, 2026-03-31)
-                # With gravity compensation ON. All joints @200ms within ±10% of real.
-                
-                # 2026-04-23 update: single-joint sin_j1/j2/j3 (motion-file) tests showed
-                # sim LAGS real by ~40-50ms on proximal joints — symptom of sim being
-                # over-damped (ζ≈1.34) relative to real (ζ≈0.3). Reduced j1-3 damping by
-                # ~40% (targeting ζ≈0.8) to close the gap. j4-7 were already matching well
-                # (lag 0-10ms, corr >0.998) and are left untouched.
-                
-                stiffness={
-                    "fr3_joint1": 1600.0,
-                    "fr3_joint2": 1600.0,
-                    "fr3_joint3": 1200.0,
-                    "fr3_joint4": 800.0,
-                    "fr3_joint5": 500.0,
-                    "fr3_joint6": 300.0,
-                    "fr3_joint7": 150.0,
-                },
-                damping={
-                    "fr3_joint1": 145.0,    # was 240  (ζ 1.34→0.81)
-                    "fr3_joint2": 135.0,    # was 220  (ζ 1.37→0.84)
-                    "fr3_joint3": 110.0,    # was 180  (ζ 1.50→0.92)
-                    "fr3_joint4": 100.0,    # unchanged — j4 already matches
-                    "fr3_joint5": 50.0,     # unchanged
-                    "fr3_joint6": 30.0,     # unchanged
-                    "fr3_joint7": 15.0,     # unchanged
-                },
-                # Rotor inertia / joint friction. Previously inherited from the
-                # pre-converted USD; the URDF cannot express them, so they are
-                # restored explicitly here. See dexx.robot_constants.
+                # Per-joint step-response-tuned gains (gravity compensation ON);
+                # see dexx.robot_constants.
+                stiffness=dict(ARM_TUNED_KP),
+                damping=dict(ARM_TUNED_KD),
+                # Rotor inertia / joint friction. The URDF cannot express them,
+                # so they are set explicitly here. See dexx.robot_constants.
                 armature=ARM_ARMATURE,
                 friction=ARM_FRICTION,
             ),
@@ -571,8 +483,8 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
 
     # table
     # Table dimensions:
-    # - size: x=1.5, y=2.4, z=0.03  (was 1.0 x 1.6, enlarged 1.5x for more workspace)
-    # - position: x=0.1, y=0, z=0.4 (unchanged; top surface still at z=0.415)
+    # - size: x=1.5, y=2.4, z=0.03
+    # - position: x=0.1, y=0, z=0.4 (top surface at z=0.415)
     # - fix_base_link = True -> kinematic_enabled=True
     table_cfg: RigidObjectCfg = RigidObjectCfg(
         prim_path="/World/envs/env_.*/table",
@@ -596,56 +508,21 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
             mass_props=sim_utils.MassPropertiesCfg(mass=0.0),  # Mass doesn't matter for kinematic objects
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.1, 0.0, 0.4),  # x=-0.1, y=0, z=0.4
+            pos=(0.1, 0.0, _dcfg.TABLE_SURFACE_Z - 0.015),  # box centre: top at TABLE_SURFACE_Z, 0.03 thick
             rot=(1.0, 0.0, 0.0, 0.0)  # Identity quaternion
         ),
     )
 
 
-    # POINTS_NPY_4F=os.path.join(get_workspace_root(), "dexx", "tasks", "sharpa_VBTS", "sensor_cfg", "ray_caster_surface", "ray_caster_surface_npy", "tactileSensor_map_4F_point.npy")
-    # NORMALS_NPY_4F=os.path.join(get_workspace_root(), "dexx", "tasks", "sharpa_VBTS", "sensor_cfg", "ray_caster_surface", "ray_caster_surface_npy", "tactileSensor_map_4F_normal.npy")
-    # POINTS_NPY_TH=os.path.join(get_workspace_root(), "dexx", "tasks", "sharpa_VBTS", "sensor_cfg", "ray_caster_surface", "ray_caster_surface_npy", "tactileSensor_map_TH_point.npy")
-    # NORMALS_NPY_TH=os.path.join(get_workspace_root(), "dexx", "tasks", "sharpa_VBTS", "sensor_cfg", "ray_caster_surface", "ray_caster_surface_npy", "tactileSensor_map_TH_normal.npy")
-    # # VBTS
-    # vbts_sensor = [
-    #     SharpaVBTSCfg(
-    #         prim_path=f"/World/envs/env_.*/Robot/{hand_side}_thumb_elastomer",
-    #         # mesh_prim_paths=["/World/envs/env_.*/object"], currently not support
-    #         # get the mesh from env_0, and corresponding position in usd stage
-    #         # mesh_prim_paths=["/World/envs/env_0/object"],
-    #         # target_rigid_expr = "/World/envs/env_.*/object",
-    #         mesh_prim_paths=["/World/envs/env_0/object/scan"],  # explicit ok for single env
-    #         target_rigid_expr="/World/envs/env_.*/object/scan",
-    #         # ------------------------------------------------------------
-    #         update_period=0.0,  # set 0.0 if want every sim step
-    #         # dummy pattern (not used by surface sensor, but base class requires it)
-    #         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=(0.1, 0.1)),
-    #         offset=SharpaVBTSCfg.OffsetCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
-    #         data_types=["distance_along_normal"],
-    #         points_npy=POINTS_NPY_TH,
-    #         normals_npy=NORMALS_NPY_TH,
-    #         max_distance=0.02,
-    #         # debug_vis=True,
-    #         debug_vis=False,
-    #         correction_scale=1e-3,
-    #     ),
-    # ]
-
-
-    # maniptrans object:
+    # Object spawn template. The env points `asset_path` at the demo dataset's
+    # object (`obj_urdf_path`) at runtime and keeps the physics/mass props below;
+    # the OakInk path here is only a placeholder and is never loaded.
     obj_id = "O02@0015@00019"
     obj_scale = oakink2_obj_scale.get(obj_id, 1.0)
-    obj_mass = oakink2_obj_mass.get(obj_id, 0.02)
-    # obj_scale = 1.0
-
-    if obj_id in oakink2_obj_mass:
-        obj_mass = oakink2_obj_mass[obj_id]
-    else:
-        obj_mass = 0.05
+    obj_mass = oakink2_obj_mass.get(obj_id, 0.05)
 
     object_cfg: RigidObjectCfg = RigidObjectCfg(
             prim_path="/World/envs/env_.*/object",
-            # spawn=sim_utils.UsdFileCfg(
             spawn=sim_utils.UrdfFileCfg(
                 asset_path=os.path.join(get_workspace_root(), "data", "OakInk-v2", "coacd_object_preview", "align_ds", obj_id, "scan.urdf"),
                 fix_base = False,
@@ -672,119 +549,21 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
                     pos=(0.0, 0.0, 0.0),
                     rot=(1.0, 0.0, 0.0, 0.0),
                 ),
-            # spawn=sim_utils.MultiAssetSpawnerCfg(
-            #     assets_cfg=OBJECT_CFG_LIST,
-            #     random_choice=False,
-            #     rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            #         kinematic_enabled=False,
-            #         disable_gravity=False,
-            #         enable_gyroscopic_forces=True,
-            #     ),
-            #     mass_props=sim_utils.MassPropertiesCfg(mass=obj_mass),
-            #     collision_props=sim_utils.CollisionPropertiesCfg(
-            #         collision_enabled=True,
-            #         contact_offset=0.002, 
-            #         rest_offset=0.0
-            #     ),
-            # ),
-            # init_state=RigidObjectCfg.InitialStateCfg(
-            #         pos=(0.0, 0.0, 0.0),
-            #         rot=(1.0, 0.0, 0.0, 0.0),
-            #     ),
         )
-    
-    
 
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=1.2, replicate_physics=False)
-    # event
-    # events: EventCfg = EventCfg()
-    # dataset_path
-    # dataset_path = os.path.join(get_workspace_root(), "data", "imitation_left_sharpa.pkl")
     data_indices = ["925aa@1"]
-    # reset
-    reset_height_lower = 0.63
-    reset_height_upper = 0.67
-    reset_angle_diff = 45 / 180 * math.pi
-    reset_random_quat = True
-    # reward
-    # primary reward
-    rot_axis = (0, 0, 1)
-    angvel_clip_min = -0.5
-    angvel_clip_max = 0.5
-    rotate_reward_scale = 2.5
-    object_linvel_penalty_scale = -0.3
-    pos_diff_penalty_scale = -0.4
-    torque_penalty_scale = -0.1
-    work_penalty_scale = -0.5
-    # auxiliary reward
-    rot_diff_clip_min = -0.025
-    rot_diff_clip_max = 0.025
-    object_pos_reward_scale = 0.001
-    fingertip_mimic_penalty_scale = -0.0
-    # fingertip_mimic_traj = 'cache/recorded_traj_50hz.npy'
-    mimic_traj_step = 1 # to match env control freq (20Hz)
-    mimic_traj_start_scope = [0, 200]
-    contact_reward_scale = 0.2
-    # grasp cache
-    grasp_cache_path = 'cache/sharpa_grasp_linspace'
-    # noise
-    joint_noise_scale = 0.02
     # contact
     enable_tactile = True
     enable_contact_force = True   # 5d scalar contact force in obs
-    binary_contact = False        # was True (deploy-only); False = continuous force for training
+    binary_contact = False        # False = continuous force for training
     enable_contact_pos = False
     disable_tactile_ids = []
     contact_smooth = 0.5
     contact_threshold = 0.2
     contact_latency = 0.005
-    contact_sensor_noise = 0.01
-    # Axis 2 ablation: force representation (see ablation_force/franka_sharpa_force_repr_env.py)
-    contact_force_repr: str = "continuous"  # continuous|binary|log|normalized|binned|3dvec
-    contact_force_max: float = 5.0          # divisor for 'normalized' repr
-    contact_force_bins: tuple = (0.2, 1.0, 3.0)  # edges for 'binned' (→ 4 bins / finger)
-    # Axis 3+4 ablation: temporal + spatial force encodings
-    # (see ablation_force/franka_sharpa_force_encoding_env.py)
-    force_encoding: str = "none"            # none|fft_mag|fft_mag_lowk|derivative|stacked_hist|
-                                            # ema_multiscale|onset_event|force_at_tip|
-                                            # weighted_tip_pos|force_vec_handframe|wrench_at_tip|
-                                            # bilinear_fuse
-    force_hist_len: int = 32                # FFT / history window (must be power of 2 ideally)
-    fft_lowk: int = 4                       # # FFT bins kept for 'fft_mag_lowk'
-    stack_k: int = 8                        # # frames for 'stacked_hist'
-    ema_alphas: tuple = (0.1, 0.5, 0.9)     # EMA time-constants for 'ema_multiscale'
-    onset_threshold: float = 0.2            # force threshold for 'onset_event'
-    force_ref: float = 2.0                  # saturation point for 'weighted_tip_pos' sigmoid
-    bilinear_proj_dim: int = 16             # output dim for 'bilinear_fuse'
-    bilinear_seed: int = 0                  # seed for fixed random projection
-    # Fingertip tactile ablations
-    # (see ablation_force/franka_sharpa_fingertip_ablation_env.py)
-    fingertip_tactile_mode: str = "baseline"       # baseline|binary|force5d|force3d
-    fingertip_include_contact_center: bool = False # append 15d contact center position
-    # Default False: center ablations expose the raw contact_center signal.
-    # Set True via --env_cfg to run the masked-center control where 1b/2b/3b
-    # all apply the same force-threshold mask to contact_center.
-    fingertip_mask_contact_center_by_threshold: bool = False
-    # Negative means reuse contact_threshold (default 0.2). Set to e.g. 0.05,
-    # 0.5 from --env_cfg to sweep center-mask threshold independently later.
-    fingertip_contact_center_mask_threshold: float = -1.0
-    # Taxel-level tactile ablations
-    # (see ablation_force/franka_sharpa_taxel_ablation_env.py)
-    taxel_source: str = "vbts"               # vbts only
-    taxel_tactile_mode: str = "abs"          # abs|force3d
-    taxel_include_position: bool = True      # append taxel positions in hand frame
-    taxel_count_per_finger: int = 64         # sampled taxels per fingertip mesh
-    taxel_position_scale: float = 1.0e-3     # tactile OBJ vertices are stored in mm
-    taxel_vbts_update_interval: int = 0      # VBTS stride in policy steps; 0 = legacy every sim substep
-    taxel_thumb_obj_path: str = os.path.join(get_workspace_root(), "tactile_ha4_map", "tactileSensor_TH.obj")
-    taxel_4f_obj_path: str = os.path.join(get_workspace_root(), "tactile_ha4_map", "tactileSensor_4F.obj")
-    taxel_vbts_cache_dir: str = os.path.join(get_workspace_root(), "tactile_ha4_map", "vbts_cache")
-    taxel_vbts_mesh_prim_path: str = "/World/envs/env_0/object/base"
-    taxel_vbts_target_rigid_expr: str = "/World/envs/env_.*/object/base"
-    taxel_vbts_max_distance: float = 0.02
-    taxel_vbts_debug_vis: bool = False
     bind_multiasset_object_root_link: bool = False
     multiasset_object_root_link_name: str = "base"
     # contact domain randomization for sim2real
@@ -793,26 +572,22 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     contact_dropout_prob: float = 0.05      # Per-finger probability of dropping tactile signal
     # align real
     dof_limits_scale = 0.9
-    # Tighten hand joint limits to Sharpa HA4 real-hand measured reachable
-    # range (cfg/Sharpa order). Needed for sim-real alignment of ring/pinky
+    # Tighten hand joint limits to the real-hand reachable range (measured on
+    # the Sharpa HA4 hand; cfg/Sharpa order). Needed for sim-real alignment of ring/pinky
     # MCP_AA etc. that have inter-finger mechanical coupling.
     use_real_hand_limits: bool = True
-    current_coef = 0.7
     # randomize
-    scale_range = [0.6, 0.9, 16]
-    # events.rand_params(scale_range)
     randomize_pd_gains = True
     randomize_p_gain_scale_lower = 0.5
     randomize_p_gain_scale_upper = 2
     randomize_d_gain_scale_lower = 0.5
     randomize_d_gain_scale_upper = 2
     # Arm PD gain Domain Randomization (separate from hand's randomize_pd_gains,
-    # which only touches hand joints). Single-joint sin_j1-j3 tests showed PD is
-    # already well-matched after 2026-04-23 damping tuning; this DR handles
-    # residual multi-joint coupling gap (~±5pp of chirp correlation) and real
-    # hardware variability. ±20% is tight because per-joint PD is already close.
+    # which only touches hand joints). Per-joint PD already matches the real arm
+    # closely; this DR covers residual multi-joint coupling and real hardware
+    # variability, so ±20% is enough.
     randomize_arm_pd_gains: bool = True
-    randomize_arm_p_scale_lower: float = 0.80   # widened ±10% → ±20% for sim2real shake mitigation
+    randomize_arm_p_scale_lower: float = 0.80   # ±20%, sim2real shake mitigation
     randomize_arm_p_scale_upper: float = 1.20
     randomize_arm_d_scale_lower: float = 0.80
     randomize_arm_d_scale_upper: float = 1.20
@@ -822,11 +597,9 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     elastomer_base_friction = 0.8
     metal_base_friction = 0.1
     object_base_friction = 0.5
-    randomize_com = True  # was False
-    randomize_com_lower = -0.02  # was -0.01
-    randomize_com_upper = 0.02   # was 0.01
-    # Training-time object xy displacement, metres (uniform +-). Eval can widen
-    # it per-run via env.set_eval_perturb_obj_xy; the env takes the larger.
+    randomize_com = True
+    randomize_com_lower = -0.02
+    randomize_com_upper = 0.02
     # ---- Polymetis arm backend (deploy) ----------------------------------
     # The real arm runs a joint-impedance controller; these are the gains it is
     # started with. Leave kq/kqd None to use the Polymetis defaults. Sim's
@@ -838,19 +611,24 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     polymetis_cmd_port: int = _dcfg.POLYMETIS_CMD_PORT
     polymetis_kq: tuple | None = None
     polymetis_kqd: tuple | None = None
+    # ---- Arm backend selection (deploy) ----------------------------------
+    # "polymetis" (the reference backend) or "ros2" (experimental: a ros2_control
+    # joint-impedance controller whose gains live in its YAML on the robot PC,
+    # wrist from deploy/ros2/wrist_state_publisher.py; see docs/DEPLOY.md).
+    arm_backend: str = "polymetis"
+    ros2_namespace: str = ""
 
+    # Training-time object xy displacement, metres (uniform +-). Eval can widen
+    # it per-run via env._eval_perturb_obj_xy (scripts/eval.py --perturb_obj_xy);
+    # the env takes the larger.
     randomize_obj_xy: float = 0.0
-    randomize_mass = True  # was False
+    randomize_mass = True
     randomize_mass_lower = 0.01
-    randomize_mass_upper = 0.15  # was 0.05, increased for robustness
-    # random forces applied to the object
+    randomize_mass_upper = 0.15
+    # Deploy-only gain on the real tactile force reading (read by the deploy envs
+    # via getattr(cfg, "force_scale", 1.0)); not used in simulation.
     force_scale = 2
-    random_force_prob_scalar = 0.25
-    force_decay = 0.9
-    force_decay_interval = 0.08
-    # curriculum
-    gravity_curriculum = True
-    # Gravity scheduler parameters
+    # Gravity scheduler (curriculum) parameters
     gravity_scheduler_enabled: bool = False  # Whether to enable gravity scheduler
     gravity_scheduler_method: str = "linear"  # "None", "linear", "exp", "cos"
     gravity_initial: float = 0.1  # Initial gravity magnitude (positive value, will be negated for z-axis)
@@ -869,10 +647,6 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # debug visualize
     debug_draw = True
 
-    # recorder
-    recorder_enabled = True
-    recorder_save_dir = './recorded_trajectories'
-
     # deploy params
     speed_coef = 0.5
     current_coef = 0.3
@@ -881,10 +655,8 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # Emergency stop safety limits (deploy only)
     emergency_stop_enabled: bool = True
     # 2.5 rad/s leaves a buffer above the policy's natural peak (~2.0 rad/s
-    # at proper 30Hz). At 2.0 the policy sometimes brushes the limit on
-    # snappy motions and gets a false e-stop, especially with the V3 pkfk
-    # path running at the trained 30Hz cadence. FR3 hardware limit is 2.62
-    # rad/s; 2.5 still leaves a safety margin to that.
+    # at 30Hz); a 2.0 limit would trip false e-stops on snappy motions.
+    # FR3 hardware limit is 2.62 rad/s; 2.5 still leaves a safety margin to that.
     arm_joint_vel_limit: float = 2.5       # rad/s, max arm joint velocity before e-stop
     arm_joint_delta_limit: float = 0.3     # rad, max single-step arm joint change before e-stop
     # 1.5 rad covers thumb_IP demo-target vs real-current gap right after reset
@@ -895,21 +667,28 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     # reach yet" detector, not an instantaneous step-jump cap. 1.5 leaves
     # the loud-mistake band (>2 rad) intact while tolerating reset slop.
     hand_joint_delta_limit: float = 1.5    # rad, max single-step hand joint change before e-stop
+    # Reset route to the demo start. After a rollout the arm is already on the
+    # demo trajectory, so the via-home detour is a slow round trip; going
+    # straight to the next init frame is the normal case. It is not always safe
+    # — from an awkward pose a straight joint interpolation can sweep the hand
+    # across the table — so the operator is asked each reset (Enter = direct).
+    deploy_prompt_home_route: bool = True
+    # Consulted only when the prompt is disabled, e.g. an unattended script.
+    deploy_direct_init_move: bool = True
+    # E-stop when the newest arm state, hand state (during a rollout) or depth
+    # frame is older than this: the policy would otherwise act on stale input.
+    deploy_max_sensor_age_s: float = 0.25
     # Deploy debug recording
     deploy_debug_record: bool = True
     deploy_debug_record_steps: int = 100
     deploy_debug_record_dir: str = "logs/deploy_debug"
-    # Wrist calibration offsets (Exp 0)
-    # Root cause: sim uses right_hand_C_MC (Sharpa base link) as EE.
-    # ROS2 /franka_wrist_state publishes fr3_hand/fr3_EE (different body → different pos+quat).
-    # Measure these once via compare_obs.py --frame 10, then set here.
-    #   wrist_pos_offset: translation [x,y,z] to ADD to ros2_wrist_position to match sim EE
-    #   wrist_quat_offset: quaternion [w,x,y,z] to PREMULTIPLY ros2_wrist_quat (R_offset * R_ros2)
-    wrist_pos_offset: tuple = _dcfg.WRIST_POS_OFFSET  # (-0.1,0,0.415) — edit in dexx/deploy_config.py
+    # Wrist offsets (deploy): the arm clients report right_hand_C_MC (sim's EE)
+    # in the arm-base frame, by FK of the measured joints.
+    #   wrist_pos_offset: translation [x,y,z] ADDED to it (arm base -> env-local)
+    #   wrist_quat_offset: quaternion [w,x,y,z] PREMULTIPLYING its rotation
+    #                      (R_offset * R_arm); identity, as the base is unrotated
+    wrist_pos_offset: tuple = _dcfg.ARM_BASE_POS  # the FK wrist is in the arm-base frame
     wrist_quat_offset: tuple = (1.0, 0.0, 0.0, 0.0)
-    clip_obs = 5.0
-    clip_actions = 1.0
-    action_scale = 1 / 24
 
     # ============================================================
     # Final-frame "success" shaping
@@ -921,37 +700,30 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     #   reward_final_rot      = exp(-α_rot · |Δrot|)
     #   reward_final_approach = exp(-α_pos · min_k ||cur_obj − last_K[k]||)
     #
-    # Defaults below were retuned 2026-05-19 from V1 ablation (see
-    # RECENT_CHANGES.md Week 13 §6). Old defaults (`pos_weight=10, alpha=30,
-    # window=5`) gave frame-0 reach success 34% (F baseline); new defaults
-    # (`pos_weight=30, alpha=15, window=10`) → 56% reach (+22pp), 75% random
-    # (+16pp) on `franka-sharpa-force-poseobs`. Trade-off: −11pp on mid-grasp
-    # stage 2 (84.4%→73.4%) — policy becomes more goal-fixated.
     # Larger weight + slower α-decay + wider window combine to give a
-    # denser final-pose signal that propagates back through the trajectory.
-    # If you observe regression on grasp/manipulation tasks, dial pos_weight
-    # back to 20 first, or shrink window to 7.
-    success_pos_weight: float = 30.0    # 2026-05-19: 10.0 → 30.0 (V1 ablation)
+    # denser final-pose signal that propagates back through the trajectory,
+    # at some cost on mid-grasp stages (the policy becomes more goal-fixated).
+    # If grasp/manipulation tasks suffer, dial pos_weight back to 20 first,
+    # or shrink window to 7.
+    success_pos_weight: float = 30.0
     success_rot_weight: float = 5.0
     success_approach_weight: float = 1.0
-    success_alpha_pos: float = 15.0     # 2026-05-19: 30.0 → 15.0 (V1 ablation)
-                                         # exp decay on position dist (m)
+    success_alpha_pos: float = 15.0     # exp decay on position dist (m)
     success_alpha_rot: float = 3.0      # exp decay on rotation angle (rad)
-    success_reward_window: int = 10     # 2026-05-19: 5 → 10 (V1 ablation)
-                                         # K = how many trailing frames count for "approach"
+    success_reward_window: int = 10     # K = how many trailing frames count for "approach"
     success_reward_ramp: bool = True    # ramp from 0→1 over progress ∈ [max_length−K, max_length]
                                          # prevents policy from "shortcutting" to endpoint early
 
-    # ---- In-hand manipulation reward (2026-06-06 tweak) ----
+    # ---- In-hand manipulation reward ----
     # Penalize fingertip-object relative velocity when in contact, so the policy
     # learns to hold the object STILL inside the grasp (matching demo trajectories
     # for rotate / spin / pour) rather than getting away with friction-only grip.
-    # 0.0 = disabled (old behavior); 0.5 = modest, below fingertip-force weight 3.0.
+    # 0.0 = disabled; 0.5 = modest, below fingertip-force weight 3.0.
     no_slip_weight: float = 0.5
 
     # ---- Premature-contact failure (gates frame-0 reaching) -----------
-    # Original behavior: episode fails if any fingertip <0.005m from object
-    # AND demo target says no-contact AND running_progress >= 50. This kills
+    # When enabled, an episode fails if any fingertip <0.005m from object
+    # AND demo target says no-contact AND running_progress >= 50. This can kill
     # frame-0 reaching episodes because the policy approaches faster than
     # demo and triggers fingertip-touch before demo's expected contact frame.
     # Knobs:
@@ -963,7 +735,7 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
     premature_contact_progress_threshold: int = 50
 
     # ---- Eval infra: disable ALL terminations for full-rollout eval ------
-    # When True, every `fail/*` cause is computed and LOGGED as before but
+    # When True, every `fail/*` cause is computed and LOGGED but
     # the aggregated `failed_execute` is zeroed → episodes run to
     # `episode_length_buf >= max_length` (i.e., natural time-out at seq_len-1).
     # Useful for diagnostic eval: see what the policy actually does when not
@@ -975,18 +747,6 @@ class FrankaSharpaEnvCfg(DirectRLEnvCfg):
 
 
 
-@configclass
-class EventCfg:
-    def rand_params(self, scale_range: list[float, float, int]):
-        self.randomize_scale = EventTermCfg(
-            func=randomize_rigid_body_scale,
-            mode="prestartup",
-            params={
-                "scale_range": scale_range,
-                "asset_cfg": SceneEntityCfg("object"),
-            },
-        )
-
 def update_cfg_for_hand_side(cfg: "FrankaSharpaEnvCfg", hand_side: str):
     """Update all configuration parameters that depend on hand_side.
     
@@ -995,8 +755,6 @@ def update_cfg_for_hand_side(cfg: "FrankaSharpaEnvCfg", hand_side: str):
         hand_side: Either "left" or "right"
     """
     cfg.hand_side = hand_side
-    cfg.hand_file_name = "Right" if hand_side == "right" else "Left"
-    cfg.hand_name = hand_side
     
     # Update arm initial joint positions based on hand side
     cfg.arm_init_joint_pos = (
@@ -1156,104 +914,3 @@ def update_cfg_for_hand_side(cfg: "FrankaSharpaEnvCfg", hand_side: str):
         f"{hand_side}_ring_fingertip",
         f"{hand_side}_pinky_fingertip",
     ]
-
-
-# =============================================================================
-# Experiment-specific cfg subclasses
-#
-# Strategy: keep `FrankaSharpaEnvCfg` as the canonical deploy-friendly default
-# (DR on, joint_delta control, modest reset randomization). Define narrow
-# subclasses below that flip just the fields that matter for a given experiment.
-# Each subclass inherits everything else, so you only see the *deltas* and don't
-# have to grep for what's different vs base.
-#
-# Add a new subclass when starting a new experiment family. Keep the diff small
-# (5-15 lines max). If you find yourself copy-pasting > 20 fields, that's a
-# sign the base default is wrong, not that you need a fatter subclass.
-# =============================================================================
-
-
-@configclass
-class FrankaSharpaDeployCfg(FrankaSharpaEnvCfg):
-    """Deploy / sim2real-friendly defaults — explicit name for the policy that
-    eventually runs on the real Franka + Sharpa.
-
-    Inherits the canonical base. Listed here only for naming clarity and as a
-    single grep-able anchor for the "deploy stack" — when you change deploy
-    behavior, change this class so other experiments don't accidentally pick
-    it up.
-
-    Concrete deploy/training entry-points should reference this class (not
-    FrankaSharpaEnvCfg directly) so the intent is documented.
-    """
-    pass
-
-
-@configclass
-class FrankaSharpaSimTeacherCfg(FrankaSharpaEnvCfg):
-    """Fastest-path sim teacher cfg — for getting a high success-rate policy
-    inside Isaac Lab as quickly as possible, no sim2real concern.
-
-    Differences vs deploy default (and *why* each one matters in sim):
-
-      Controller:
-        OSC instead of joint_delta. OSC's action space is Cartesian
-        (pos_error / rot_error_6d / hand 22), so the policy doesn't need to
-        implicitly learn 7-DoF arm IK. Standalone tracking test gave
-        pos_mean=15mm / rot_mean=9° — close to perfect — so reward gradients
-        flow back along a much shorter path than they do through joint_delta.
-
-      Reset curriculum:
-        Enabled with start=0.7 → end=0.0 over 2000 steps. Early training only
-        samples reset frames in the last 30% of the trajectory (close to /
-        post-grasp). Avoids the cold-start where every env starts pre-approach
-        and has to learn the entire pipeline at once.
-
-      Adaptive sampling:
-        Off by default — base behaviour with curriculum is already strong;
-        adaptive only helps once you have a baseline. Flip on later if some
-        bins of the trajectory turn out to be persistently hard.
-
-      All domain randomization:
-        Off. DR is non-negotiable for real transfer but it costs sample
-        efficiency. A teacher that never sees DR will overfit to nominal
-        dynamics, which is fine — we'll BC/DAgger distil to a deploy student
-        with DR on later.
-
-      Observation noise:
-        Zero. Same logic as DR.
-
-    Use via task ID 'franka-sharpa-force-critic-horizon-simteacher' (register
-    in tasks/franka_sharpa/__init__.py with this cfg).
-    """
-
-    # ---- Controller: OSC (sim-only fast path) ----
-    use_osc_control: bool = True
-    use_pid_control: bool = False
-    use_joint_pos_control: bool = False
-    use_joint_delta_control: bool = False
-
-    # ---- Reset / curriculum: easy-first ----
-    random_state_init: bool = True
-    init_curriculum_enabled: bool = True
-    init_curriculum_method: str = "linear"
-    init_curriculum_start: float = 0.7
-    init_curriculum_end: float = 0.0
-    init_curriculum_steps: int = 2000
-
-    # Adaptive sampling stays off; turn on by overriding in a deeper subclass
-    # once baseline works. If you do enable, keep compose_with_curriculum=True.
-    adaptive_sampling_enabled: bool = False
-
-    # ---- Domain randomization: ALL OFF (sim teacher only) ----
-    randomize_pd_gains: bool = False
-    randomize_arm_pd_gains: bool = False
-    randomize_action_delay: bool = False
-    randomize_friction: bool = False
-    randomize_mass: bool = False
-    randomize_com: bool = False
-
-    # ---- Observation noise: zero ----
-    obs_joint_pos_noise: float = 0.0
-    obs_wrist_pos_noise: float = 0.0
-    obs_wrist_rot_noise: float = 0.0

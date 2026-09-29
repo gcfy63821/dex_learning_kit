@@ -26,14 +26,13 @@ parser = argparse.ArgumentParser(description="Train an RL agent.")
 parser.add_argument("--num_envs", type=int, default=16384, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
-parser.add_argument("--cache", type=str, default=None, help="Cache path.")
 parser.add_argument("--load_path", type=str, default=None, help="Checkpoint path.")
 parser.add_argument("--max_agent_steps", type=int, default=None, help="RL Policy training iterations.")
-parser.add_argument("--algorithm", type=str, default=None, help="Run training with multiple GPUs or nodes.")
 parser.add_argument("--resume", action="store_true", default=False, help="Resume training from checkpoint.")
 parser.add_argument("--wandb-project-name", type=str, default="dex", help="the wandb's project name")
 parser.add_argument("--wandb-entity", type=str, default=None, help="the entity (team) of wandb's project")
 parser.add_argument("--wandb-name", type=str, default="dexmanip", help="the name of wandb's run")
+parser.add_argument("--no-wandb", action="store_true", help="do not log to Weights & Biases")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument("--video_interval", type=int, default=10000, help="Interval between video recordings (in agent steps).")
@@ -66,24 +65,11 @@ import torch
 from datetime import datetime
 
 from dexx.algo.ppo.ppo import PPO
-# PPOVisual / ProprioAdapt are legacy distillation backends not shipped in this
-# release (the release pipeline uses PointCloud DAgger). Import optionally so the
-# PPO-teacher path loads cleanly; passing --algorithm ProprioAdapt is unsupported here.
-try:
-    from dexx.algo.ppo.ppo_visual import PPO as PPOVisual
-except ImportError:
-    PPOVisual = None
-try:
-    from dexx.algo.padapt.padapt import ProprioAdapt
-except ImportError:
-    ProprioAdapt = None
 from dexx.wrapper.sharpa_wave_env_wrapper import GymStyleEnvWrapper
 from dexx.wrapper.config_wrapper import ConfigWrapper
 
 from isaaclab.envs import DirectRLEnvCfg
 
-import dexx.tasks.sharpa_VBTS
-import dexx.tasks.hand_imitation  # noqa: F401
 import dexx.tasks.franka_sharpa  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -112,16 +98,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     env_cfg.seed = agent_cfg["seed"]
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     agent_cfg["device"] = args_cli.device if args_cli.device is not None else agent_cfg["device"]
-    agent_cfg["algo"] = args_cli.algorithm if args_cli.algorithm is not None else agent_cfg["algo"]
     agent_cfg["load_path"] = args_cli.load_path if args_cli.load_path is not None else agent_cfg["load_path"]
-    env_cfg.grasp_cache_path = args_cli.cache if args_cli.cache is not None else env_cfg.grasp_cache_path
     if args_cli.robot_asset is not None and hasattr(env_cfg, "robot_asset_override"):
         env_cfg.robot_asset_override = args_cli.robot_asset
     if args_cli.material_elastomer_ids is not None and hasattr(env_cfg, "material_elastomer_ids"):
         env_cfg.material_elastomer_ids = json.loads(args_cli.material_elastomer_ids)
     agent_cfg["algorithm"]['minibatch_size'] = min([args_cli.num_envs * 8, 32768])
-    if agent_cfg["algo"] == "ProprioAdapt":
-        env_cfg.gravity_curriculum = False
 
     # Set data_indices if provided
     if args_cli.data_idx is not None:
@@ -178,10 +160,6 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     run_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_label).strip("_") or "run"
     log_dir = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')}_{run_label}"
     log_dir = os.path.join(log_root_path, log_dir)
-    if agent_cfg["algo"] == "ProprioAdapt":
-        load_path_split = agent_cfg["load_path"].split("/")
-        if "gym_style" in load_path_split:
-            log_dir = '/' + os.path.join(*(load_path_split[:-2]))
     print(f"Exact experiment name requested from command line: {log_dir}")
     if args_cli.side is not None:
         if hasattr(env_cfg, 'hand_side'):
@@ -209,7 +187,11 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         }
     else:
         agent_cfg["video"] = {"enabled": False}
-    agent = eval(agent_cfg["algo"])(env, output_dir=log_dir, full_config=config)
+    _agents = {"PPO": PPO}
+    if agent_cfg["algo"] not in _agents:
+        raise SystemExit(f"unsupported algo {agent_cfg['algo']!r} in the agent cfg; "
+                         f"this release ships only {sorted(_agents)}")
+    agent = _agents[agent_cfg["algo"]](env, output_dir=log_dir, full_config=config)
     
     spec = gym.spec(args_cli.task)
     # Resolve cfg source files via the actual package location (works under the
@@ -241,13 +223,12 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
     print(f"[INFO] Saved runtime config to {os.path.join(log_dir, 'runtime_config.yaml')}")
 
     # load the checkpoint
-    if args_cli.load_path is not None and not args_cli.resume \
-            and agent_cfg["algo"] != "ProprioAdapt":
+    if args_cli.load_path is not None and not args_cli.resume:
         print("[WARN] --load_path was given without --resume, so the checkpoint "
               "is NOT loaded and training starts from scratch. Add --resume to "
               "actually restore it.", flush=True)
 
-    if args_cli.resume or agent_cfg["algo"] == "ProprioAdapt":
+    if args_cli.resume:
         resume_path = agent_cfg["load_path"]
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
@@ -259,7 +240,7 @@ def main(env_cfg: DirectRLEnvCfg, agent_cfg: dict):
         or torch.distributed.get_rank() == 0
     )
 
-    if is_main_process:
+    if is_main_process and not args_cli.no_wandb:
         run_name = f"{args_cli.wandb_name}_{os.path.basename(log_dir)}"
 
         wandb.init(

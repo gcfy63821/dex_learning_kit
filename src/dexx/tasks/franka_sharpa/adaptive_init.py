@@ -183,7 +183,7 @@ class AdaptiveStateBuffer:
         joint_vel[buf_positions] = self._all_joint_vel[sample_idx]
         obj_state[buf_positions] = self._obj_root_state[sample_idx]
 
-        # Fix object position: buffer stores world-frame obj state with the
+        # Re-base object position: buffer stores world-frame obj state with the
         # original env's scene origin baked in. We need to re-base it to the
         # target env's origin.
         buf_origin = self._env_origin[sample_idx]           # origin of source env

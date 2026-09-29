@@ -90,7 +90,7 @@ class FrankaSharpaPointCloudEnv(FrankaSharpaForcePoseObsEnv):
         # ---- Hand body indices (11 by default, configurable) ----
         self._pc_hand_indices = self._build_hand_pc_indices()
         if len(self._pc_hand_indices) != int(cfg.pc_num_hand_points):
-            # Plan says we want exactly pc_num_hand_points; truncate / pad as needed.
+            # We want exactly pc_num_hand_points; truncate / pad as needed.
             # Truncate is enough; we never expect to pad above the body count.
             self._pc_hand_indices = self._pc_hand_indices[: int(cfg.pc_num_hand_points)]
             assert len(self._pc_hand_indices) == int(cfg.pc_num_hand_points), (
@@ -242,7 +242,7 @@ class FrankaSharpaPointCloudEnv(FrankaSharpaForcePoseObsEnv):
     def _compute_tactile_pc(self) -> tuple[torch.Tensor, torch.Tensor]:
         """(N, 25, 3) per-finger surface points + (N, 25, F) per-point force.
 
-        F = 1 when cfg.pc_tactile_use_vec3 is False (legacy scalar magnitude).
+        F = 1 when cfg.pc_tactile_use_vec3 is False (scalar magnitude).
         F = 3 when cfg.pc_tactile_use_vec3 is True (elastomer-local 3D vec).
         """
         # 5 elastomer link poses
@@ -267,7 +267,7 @@ class FrankaSharpaPointCloudEnv(FrankaSharpaForcePoseObsEnv):
 
         use_vec3 = bool(getattr(self.cfg, "pc_tactile_use_vec3", False))
         if not use_vec3:
-            # Legacy scalar magnitude path
+            # Scalar magnitude path
             forces = self.last_contacts.unsqueeze(-1).expand(-1, -1, P)  # (N, F, P)
             forces = forces.reshape(N, F * P, 1)
             return tac_pts_local, forces
@@ -361,7 +361,7 @@ class FrankaSharpaPointCloudEnv(FrankaSharpaForcePoseObsEnv):
                 tactile_force.shape[:2], dtype=torch.bool, device=tactile_force.device
             )
 
-        # Mirror to env attrs (per the plan; useful for debug / external access).
+        # Mirror to env attrs (useful for debug / external access).
         self.scene_pc = scene_pc
         self.scene_mask = scene_mask
         self.hand_pc = hand_pc

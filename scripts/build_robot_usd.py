@@ -4,8 +4,7 @@ Isaac Lab can convert the URDF at spawn time, but the conversion is not the whol
 story: the hand's self-collision filter pairs cannot be expressed in URDF and are
 authored onto the converted stage afterwards (see
 `franka_sharpa_env_cfg.SELF_COLLISION_FILTER_PAIRS`). Reconstructing that on every
-run means any code path that spawns the URDF directly silently loses it -- which
-has already happened once, in `scripts/retarget.py`.
+run means any code path that spawns the URDF directly silently loses it.
 
 So we build the USD once, apply the filters, and commit the result. Runtime then
 just loads an asset that already carries the right physics.
@@ -22,7 +21,6 @@ and warns when the two have drifted.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 import shutil
 import sys

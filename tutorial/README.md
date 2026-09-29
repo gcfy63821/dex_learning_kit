@@ -43,17 +43,17 @@ section lists exactly which values move.
 
 ## The three ideas worth taking away
 
-Whatever you port, these are the parts that cost the most to learn the hard way.
+Whatever you port, these are the parts that matter most.
 
 **A frame convention is a contract, not a comment.** The table height, the arm
 base height and the workspace crop appear in the retargeter, the simulator, the
 point-cloud crop and the deploy client. When one copy drifts, nothing raises an
 error — the object simply lands somewhere else. Lesson 01.
 
-**A calibration is an input, not a constant.** The camera extrinsic was once
-hard-coded in the renderer. When the camera moved, the hard-coded value stayed,
-and the policy trained on a viewpoint 19 cm from the real one without a single
-warning. Lesson 06.
+**A calibration is an input, not a constant.** The camera extrinsic describes
+how the camera is mounted. If any stage reads a hard-coded or default value, a
+moved camera silently changes the viewpoint the policy trains on, and nothing
+warns you. Pass the calibration file explicitly at every stage. Lesson 06.
 
 **Sim and real must describe the same plant.** The policy learns against whatever
 stiffness, damping, latency and filtering the simulator gives it. If the real
@@ -62,7 +62,7 @@ trained on. Lesson 07.
 
 ## Where the code lives
 
-A per-file index with line numbers is in **[CODE_MAP.md](CODE_MAP.md)**.
+An index by file and symbol name is in **[CODE_MAP.md](CODE_MAP.md)**.
 
 The lessons teach the pipeline; the implementation stays where it is.
 
@@ -77,8 +77,12 @@ calib/camera_align/           shipped camera extrinsics (lesson 06)
 docs/                         reference pages the lessons link into
 ```
 
-The reference documentation under `docs/` stays authoritative for details; the
-tutorial is the path through it.
+The lessons explain; the reference pages hold the canonical commands and flags —
+[RETARGET](../docs/RETARGET.md), [TRAINING](../docs/TRAINING.md),
+[DISTILLATION](../docs/DISTILLATION.md), [EVAL](../docs/EVAL.md),
+[DEPLOY](../docs/DEPLOY.md), [JOINT_ORDERING](../docs/JOINT_ORDERING.md),
+[tool index](../docs/DEBUG_TOOLS.md). What the shipped checkpoints were trained
+with is in [checkpoints/README.md](../checkpoints/README.md).
 
 ## Verifying your changes
 
@@ -86,6 +90,7 @@ tutorial is the path through it.
 bash tutorial/run_acceptance.sh
 ```
 
-Six minutes, end to end: static checks, a short distillation, an evaluation with
-domain randomization on, and assertions on what came out. Run it before and after
+Minutes, end to end (runtime depends on the GPU and first-run caches): static
+checks, a runtime preflight, a three-iteration distillation, an evaluation with
+physics randomization on, and assertions on what came out. Run it before and after
 touching `src/`.

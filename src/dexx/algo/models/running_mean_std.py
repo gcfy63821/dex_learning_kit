@@ -12,7 +12,6 @@
 
 import torch
 import torch.nn as nn
-import numpy as np
 
 class RunningMeanStd(nn.Module):
     def __init__(self, insize, epsilon=1e-05, per_channel=False, norm_only=False):

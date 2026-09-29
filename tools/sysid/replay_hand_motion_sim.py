@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import pickle
 import sys
 from pathlib import Path
@@ -85,14 +84,19 @@ import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
 from isaaclab.assets import Articulation, ArticulationCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim import PhysxCfg, SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+from dexx import deploy_config as _dcfg
+from dexx.robot_constants import ARM_ARMATURE, ARM_FRICTION, hand_gain_dicts
+try:
+    from dexx.robot_constants import ARM_TUNED_KP, ARM_TUNED_KD
+except ImportError:  # fallback: the critic-horizon cfg re-exports the tuned arm set
+    from dexx.tasks.franka_sharpa.franka_sharpa_critic_horizon_cfg import ARM_TUNED_KP, ARM_TUNED_KD
 
 
 def main():
@@ -112,11 +116,11 @@ def main():
     scene = InteractiveScene(SceneCfg())
     spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
-    # Robot USD depends on side
-    usd_name = "Right_final.usda" if args_cli.side == "right" else "Left_final.usda"
+    # Resolve the robot exactly as the training env does (per-side merged-URDF USD).
     from dexx.tasks.franka_sharpa.franka_sharpa_env_cfg import franka_sharpa_robot_usd
-    usd_path = franka_sharpa_robot_usd("right")
-    hand_prefix = args_cli.side  # e.g. "right_" pattern in joint_names_expr
+    usd_path = franka_sharpa_robot_usd(args_cli.side)
+    hand_prefix = args_cli.side  # hand joints are named "<side>_<suffix>"
+    hand_gains = hand_gain_dicts(args_cli.side)
 
     robot_cfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
@@ -132,7 +136,7 @@ def main():
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=(-0.1, 0.0, 0.415), rot=(1.0, 0.0, 0.0, 0.0),
+            pos=tuple(_dcfg.ARM_BASE_POS), rot=tuple(_dcfg.ARM_BASE_ROT),
             joint_pos={
                 "fr3_joint1": 0.0, "fr3_joint2": 0.0, "fr3_joint3": 0.0,
                 "fr3_joint4": -1.57, "fr3_joint5": 0.0, "fr3_joint6": 1.57, "fr3_joint7": 0.0,
@@ -143,21 +147,16 @@ def main():
             # hand tests don't care about arm precision, just that it doesn't fall).
             "arm_joints": ImplicitActuatorCfg(
                 joint_names_expr=["fr3_joint.*"],
-                stiffness={
-                    "fr3_joint1": 1600.0, "fr3_joint2": 1600.0,
-                    "fr3_joint3": 1200.0, "fr3_joint4": 800.0,
-                    "fr3_joint5": 500.0, "fr3_joint6": 300.0, "fr3_joint7": 150.0,
-                },
-                damping={
-                    "fr3_joint1": 145.0, "fr3_joint2": 135.0,
-                    "fr3_joint3": 110.0, "fr3_joint4": 100.0,
-                    "fr3_joint5": 50.0, "fr3_joint6": 30.0, "fr3_joint7": 15.0,
-                },
+                stiffness=dict(ARM_TUNED_KP),
+                damping=dict(ARM_TUNED_KD),
+                armature=ARM_ARMATURE,
+                friction=ARM_FRICTION,
             ),
-            # Hand — must match franka_sharpa_env_cfg training values
-            "hand_joints": ImplicitActuatorCfg(
+            # Hand: the same actuator class, gains, armature and friction as the
+            # training env (franka_sharpa_env_cfg.py "hand_joints").
+            "hand_joints": IdealPDActuatorCfg(
                 joint_names_expr=[f"{hand_prefix}_.*"],
-                stiffness=500.0, damping=30.0,
+                **hand_gains,
             ),
         },
     )
@@ -244,8 +243,9 @@ def main():
         "actuals": np.asarray(rec_actuals),
         "velocities": np.asarray(rec_vels),
         "sim_config": {
-            "hand_K": 500.0,
-            "hand_D": 30.0,
+            "hand_actuator": "IdealPD (training gains, dexx.robot_constants.HAND_GAINS)",
+            "hand_K": [hand_gains["stiffness"][f"{hand_prefix}_{s}"] for s in HAND_JOINT_SUFFIXES],
+            "hand_D": [hand_gains["damping"][f"{hand_prefix}_{s}"] for s in HAND_JOINT_SUFFIXES],
             "side": args_cli.side,
         },
     }
@@ -253,6 +253,11 @@ def main():
         pickle.dump(data, f)
     print(f"[OK] Saved {out_path}")
 
+    # Release the simulation context first; otherwise simulation_app.close() hangs.
+    _sim = sim_utils.SimulationContext.instance()
+    if _sim is not None:
+        _sim.clear_all_callbacks()
+        _sim.clear_instance()
     simulation_app.close()
 
 

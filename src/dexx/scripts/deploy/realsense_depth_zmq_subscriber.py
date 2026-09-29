@@ -1,16 +1,21 @@
 """ZMQ RealSense depth subscriber — runs ON THE INFERENCE PC.
 
-Duck-types `RealSenseDepthSubscriber` (the ROS2 one) so the PointCloud deploy
-env can consume it unchanged: same `get_latest()` (fp32 (H,W) torch on the
-configured device, or None) and `n_received` property. Instead of a ROS2 topic,
-it SUBs depth frames from `realsense_depth_zmq_pub.py` running on the camera host.
+SUBs depth frames from `deploy/realsense_depth_zmq_pub.py` on the camera host
+and keeps the newest one for the PointCloud deploy env: `get_latest()` returns
+it as fp32 (H,W) metres on the configured device (or None), `age()` the seconds
+since it arrived.
 
-    sub = RealSenseDepthZmqSubscriber(addr="tcp://101.6.90.122:5562", device="cuda")
+    sub = RealSenseDepthZmqSubscriber(addr="tcp://<CAM_HOST>:5562", device="cuda")
     ...
     depth_m = sub.get_latest()   # fp32 (240,320) meters torch on device, or None
 
 A background thread polls the ZMQ SUB (CONFLATE=1 keeps only the newest frame),
 mirroring the PolymetisArmClient state poller.
+
+Frames whose size is not (height, width) are REJECTED (counted in
+`n_rejected`, warned about at most once per second): a different resolution
+means different intrinsics, and unprojecting it with this size's intrinsics
+would put every point in the wrong place.
 """
 from __future__ import annotations
 
@@ -36,7 +41,11 @@ class RealSenseDepthZmqSubscriber:
         self._device = torch.device(device)
         self._latest: Optional[torch.Tensor] = None
         self._latest_stamp: Optional[float] = None
+        self._latest_rx: Optional[float] = None   # local time.monotonic() of receipt
         self._n_received = 0
+        self._n_rejected = 0
+        self._last_reject_warn = float("-inf")
+        self._rejected_since_warn = 0
         self._lock = threading.Lock()
 
         try:
@@ -77,18 +86,28 @@ class RealSenseDepthZmqSubscriber:
                 msg = self._msgpack.unpackb(raw, raw=False)
                 depth = np.array(msg["depth"], dtype=np.float32)  # copy: msgpack buffer is read-only
                 if depth.shape != (self._H, self._W):
-                    # tolerate size drift: crop/pad to (H,W)
-                    out = np.zeros((self._H, self._W), dtype=np.float32)
-                    hh, ww = min(depth.shape[0], self._H), min(depth.shape[1], self._W)
-                    out[:hh, :ww] = depth[:hh, :ww]
-                    depth = out
+                    self._reject(depth.shape)
+                    continue
                 t = torch.from_numpy(depth).to(self._device, dtype=torch.float32)
                 with self._lock:
                     self._latest = t
                     self._latest_stamp = float(msg.get("t", time.time()))
+                    self._latest_rx = time.monotonic()
                     self._n_received += 1
             except Exception as exc:  # noqa: BLE001
                 print(f"[depth-zmq-sub] decode error: {exc!r}", flush=True)
+
+    def _reject(self, shape):
+        self._n_rejected += 1
+        self._rejected_since_warn += 1
+        now = time.monotonic()
+        if now - self._last_reject_warn >= 1.0:
+            print(f"[depth-zmq-sub] WARNING: rejected {self._rejected_since_warn} depth "
+                  f"frame(s) of shape {tuple(shape)}; expected ({self._H}, {self._W}). "
+                  f"Publisher and subscriber resolutions (intrinsics) disagree.",
+                  flush=True)
+            self._last_reject_warn = now
+            self._rejected_since_warn = 0
 
     def get_latest(self) -> Optional[torch.Tensor]:
         with self._lock:
@@ -98,17 +117,27 @@ class RealSenseDepthZmqSubscriber:
         with self._lock:
             return self._latest, self._latest_stamp
 
+    def age(self) -> float:
+        """Seconds since the newest frame arrived here (inf before the first).
+        Local receive time: the publisher's own stamp is another host's clock."""
+        with self._lock:
+            rx = self._latest_rx
+        return float("inf") if rx is None else time.monotonic() - rx
+
     @property
     def n_received(self) -> int:
         return self._n_received
 
+    @property
+    def n_rejected(self) -> int:
+        """Frames dropped because their size did not match (height, width)."""
+        return self._n_rejected
+
     def shutdown(self):
+        # Stop the poller before closing: ZMQ sockets are not thread-safe.
         self._stop.set()
+        self._thr.join(timeout=1.0)
         try:
             self._sub.close(0)
         except Exception:
             pass
-
-    # ROS2-compat no-ops (deploy_pc treats it like a node)
-    def destroy_node(self):
-        self.shutdown()

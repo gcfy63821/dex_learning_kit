@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Replay a canonical motion CSV on the real Franka via POLYMETIS and record
-target/actual — the Polymetis recorder. (A ROS2 equivalent existed upstream and is not shipped here.)
+target/actual — the Polymetis recorder. (The ROS2 equivalent is `replay_motion_ros2.py`.)
 
 Uses PolymetisArmClient (ZMQ -> NUC polymetis_joint_bridge.py -> RobotInterface
 joint impedance). Output pkl schema is IDENTICAL to replay_motion_sim.py, so
@@ -8,12 +8,12 @@ joint impedance). Output pkl schema is IDENTICAL to replay_motion_sim.py, so
 
 Prereqs:
     # NUC (polymetis env): server on :50051 + bridge:
-    conda activate polymetis-local && python ~/controller/polymetis_joint_bridge.py
-    # and STOP any other controller (e.g. nuc_ros1_bridge.py) — single policy.
+    conda activate polymetis-local && python deploy/polymetis_joint_bridge.py
+    # and STOP any other controller on the NUC — Polymetis runs a single policy.
 
 Usage (training PC, dexmanip env):
     python tools/sysid/replay_motion_polymetis.py \
-        --ip 192.168.1.100 \
+        --ip <NUC_IP> \
         --motion tools/sysid/motions/chirp_sweep.csv \
         --output logs/system_id/polymetis/chirp_sweep_real.pkl
 """
@@ -90,7 +90,7 @@ def load_motion(motion_path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--ip", required=True, help="NUC bridge IP (e.g. 192.168.1.100)")
+    p.add_argument("--ip", required=True, help="NUC bridge IP (e.g. 192.168.1.10)")
     p.add_argument("--state_port", type=int, default=_dcfg.POLYMETIS_STATE_PORT)
     p.add_argument("--cmd_port", type=int, default=_dcfg.POLYMETIS_CMD_PORT)
     p.add_argument("--motion", required=True, type=str)

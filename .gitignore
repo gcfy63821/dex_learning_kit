@@ -15,3 +15,15 @@ dumps/
 # Vendored upstream assets are kept verbatim; never ignore anything under them.
 !assets/franka_fr3/**
 !assets/sharpa_wave/**
+
+# backups written by tools/dataset/ editors (restore with the tool, never commit)
+*.bak
+*.rotbak
+
+# uv virtual environment (tutorial/00_setup/setup_uv.sh)
+.venv/
+.pytest_cache/
+
+# Claude Code local state (.claude/skills stays tracked)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

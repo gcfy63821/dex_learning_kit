@@ -1,13 +1,18 @@
 """Overlay CROPPED real PC vs CROPPED sim frame in env-local (what the policy sees).
 
 Both clouds get the SAME workspace bbox crop (deploy = sim = pc_workspace_min/max),
-so the table (below z=0.420) is removed from both. Confirms real object/hand
+so the table (below the crop floor, z=0.417) is removed from both. Confirms real object/hand
 points that survive the crop line up with sim.
 
+  # from a capture_multiframe_zmq.py accumulation (camera frame) + an extrinsic:
   python tools/calib/viz_cropped_overlay.py \
-      --real_ply logs/real_pc_zmq_sq1/dump_XXXX/cropped_env_local.ply \
-      --sim_link0_ply calib/camera_align/sim_frame_squeegee1_link0.ply \
-      --port 8081
+      --real_npz logs/real_calib_multi/accum.npz \
+      --extrinsic calib/camera_align/current.npy \
+      --sim_link0_ply logs/calib_sim_frame.ply --port 8081
+
+  # or from a cloud that is already env-local and cropped:
+  python tools/calib/viz_cropped_overlay.py --real_ply cropped_env_local.ply \
+      --sim_link0_ply logs/calib_sim_frame.ply --port 8081
 """
 import argparse
 import numpy as np
@@ -27,12 +32,18 @@ def read_ply(path):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--real_ply", required=True, help="cropped_env_local.ply (already cropped)")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--real_ply", help="real cloud, already env-local and cropped (ASCII .ply)")
+    src.add_argument("--real_npz", help="capture_multiframe_zmq.py accum.npz (camera frame); "
+                                         "transformed with --extrinsic and cropped here")
+    p.add_argument("--extrinsic", help="camera-in-armbase 4x4 .npy (with --real_npz)")
     p.add_argument("--sim_link0_ply", required=True, help="gen_sim_frame_ply link0 output")
     p.add_argument("--arm_base", type=str,
                    default=",".join(str(x) for x in _dcfg.ARM_BASE_POS))
-    p.add_argument("--ws_min", type=str, default="0.0,-0.4,0.42")
-    p.add_argument("--ws_max", type=str, default="0.8,0.25,1.3")
+    p.add_argument("--ws_min", type=str,
+                   default=",".join(str(x) for x in _dcfg.PC_WORKSPACE_MIN))
+    p.add_argument("--ws_max", type=str,
+                   default=",".join(str(x) for x in _dcfg.PC_WORKSPACE_MAX))
     p.add_argument("--port", type=int, default=8081)
     args = p.parse_args()
 
@@ -40,7 +51,15 @@ def main():
     wmin = np.array([float(x) for x in args.ws_min.split(",")], dtype=np.float32)
     wmax = np.array([float(x) for x in args.ws_max.split(",")], dtype=np.float32)
 
-    real = read_ply(args.real_ply)  # already env-local + cropped
+    if args.real_ply:
+        real = read_ply(args.real_ply)  # already env-local + cropped
+    else:
+        if not args.extrinsic:
+            p.error("--real_npz needs --extrinsic")
+        T = np.load(args.extrinsic).astype(np.float32)
+        cam = np.load(args.real_npz)["points"].astype(np.float32)
+        real = cam @ T[:3, :3].T + T[:3, 3] + arm  # camera -> fr3_link0 -> env-local
+        real = real[np.all((real >= wmin) & (real <= wmax), axis=1)]
     sim0 = read_ply(args.sim_link0_ply)  # link0 frame
     sim = sim0 + arm  # -> env-local
     # apply the SAME crop to sim

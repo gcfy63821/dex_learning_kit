@@ -11,9 +11,10 @@ mismatch just makes the robot shake, and everyone blames the policy.
 
 ### 1. Arm impedance
 
-The real Franka runs a joint-impedance controller. Polymetis is started with a
-gain vector; the simulator's `ImplicitActuator` is configured with the matching
-per-joint stiffness and damping.
+Sim and real use two different controllers with two different gain sets. The
+simulator's `ImplicitActuator` has per-joint stiffness and damping fitted so the
+simulated arm responds like the real one; the real Franka runs Polymetis joint
+impedance with its own gains. The two sets are never copied into each other.
 
 | joint | sim stiffness (`kp`) | sim damping (`kd`) |
 |---|---|---|
@@ -25,20 +26,21 @@ per-joint stiffness and damping.
 | fr3_joint6 | 300 | 30 |
 | fr3_joint7 | 150 | 15 |
 
-Set in `FrankaSharpaCriticHorizonCfg.__post_init__`; step-response tuned, and what
-every shipped checkpoint was trained against. Do not change them casually — a
-checkpoint is only valid for the plant it was fitted to.
+These are `ARM_TUNED_KP` / `ARM_TUNED_KD` in `src/dexx/robot_constants.py`,
+applied in `FrankaSharpaCriticHorizonCfg.__post_init__`: simulator actuator gains
+fitted with the replay comparison below so the simulated arm's response matches
+the real arm's. Every shipped checkpoint is trained against them. Do not change
+them casually — a checkpoint is only valid for the plant it was fitted to.
 
-The real side takes the same numbers:
-
-```bash
-# cfg fields, settable from the CLI
---env_cfg polymetis_kq='[1600,1600,1200,800,500,300,150]' \
-          polymetis_kqd='[145,135,110,100,50,30,15]'
-```
-
-Leave them `None` to accept the Polymetis defaults — which is a decision, not a
-neutral option, and should be a deliberate one.
+The real arm runs Polymetis joint impedance with its own defaults,
+`default_Kq = [40, 30, 50, 25, 35, 25, 10]` and
+`default_Kqd = [4, 6, 5, 5, 3, 2, 1]` ([DEPLOY.md](../../docs/DEPLOY.md#polymetis-parameters)).
+Deploy with no gain flags. `--polymetis_kq/--polymetis_kqd` on `deploy_pc.py`
+(and `--kq/--kqd` on `move_to_frame_polymetis.py`, `test_polymetis_arm.py` and
+`replay_motion_polymetis.py`) exist only to deliberately change the real
+controller; never pass the sim gains there. Any change to the real gains
+changes the plant the sim gains were fitted to, so re-run the replay comparison
+below and refit the sim gains if the responses no longer match.
 
 The stiffness profile is steeply decreasing from base to wrist. That is not
 arbitrary: the proximal joints carry the whole arm's inertia, the distal ones
@@ -71,14 +73,14 @@ exists to match a real delay.
 |---|---|---|
 | action clip | ±1.0 | |
 | **action delay** | 0–3 steps, sampled per environment | ≈100 ms at 30 Hz, end to end |
-| arm: delta scale | 0.2 | was 0.1 at 60 Hz; doubled for 30 Hz to keep arm speed |
+| arm: delta scale | 0.2 | sized for the 30 Hz control rate (scale it with the rate to keep arm speed) |
 | **arm EMA** | α = 0.15 | the real Franka impedance loop's ~50 ms low-pass |
 | **hand EMA** | α = 0.4 | |
 | saturate to joint limits | | |
 
 Two separate filters, deliberately. The arm is filtered harder because its
-controller is slower and because sim2real arm shake was traced to high-frequency
-policy jitter getting through.
+controller is slower and because high-frequency policy jitter that reaches the
+real arm shows up as shake.
 
 Order matters: the delay is applied to the **raw 29-d action before** it is split
 into arm and hand, and before either filter. Getting that order wrong changes the
@@ -118,13 +120,15 @@ the velocity and acceleration spec.
 |---|---|
 | **`chirp_sweep`** | linear 0.2 → 3 Hz sweep, 0.15 rad amplitude, 7 joints phase-shifted, 36.6 s. Excites the whole bandwidth in one run — the default choice |
 | `step_per_joint` | rise time and overshoot, one joint at a time |
-| `sin_j1` … `sin_j6` | single-joint damping ratio, cleanest signal per joint |
+| `sin_j1`–`sin_j4`, `sin_j6` | single-joint damping ratio, cleanest signal per joint |
 | `backlash_detection` | direction reversals, for gearbox slop |
 | `coupled_joints`, `diagonal_sweep`, `circular_wrist` | multi-joint coupling the single-axis PD cannot fix |
 
 `motions_hand/` has the hand equivalents (`hand_chirp_all`, `hand_grasp_cycle`, …).
 
-Regenerate or add motions with `generate_motions.py` / `generate_hand_motions.py`.
+Regenerate or add motions with `generate_motions.py` / `generate_hand_motions.py`;
+the file format and safety envelope are in
+[motions/README.md](../../tools/sysid/motions/README.md).
 
 ### Run it
 
@@ -132,7 +136,7 @@ Regenerate or add motions with `generate_motions.py` / `generate_hand_motions.py
 # 1. simulation — uses the TRAINING gains by default
 python tools/sysid/replay_motion_sim.py \
     --motion tools/sysid/motions/chirp_sweep.csv \
-    --output logs/sysid/chirp_sim.pkl
+    --output logs/sysid/chirp_sim.pkl --headless
 
 # 2. the real arm, through Polymetis (bridge up, no other controller running)
 python tools/sysid/replay_motion_polymetis.py \
@@ -149,6 +153,13 @@ python tools/sysid/analyze_motion.py \
 
 Both replays write the same pkl schema, which is what lets step 3 diff them
 without caring which side is which.
+
+On a ROS2 arm backend, step 2 is `tools/sysid/replay_motion_ros2.py` (same
+`--motion/--output` flags, no `--ip`; it publishes to `/teleop_joint_commands`
+and reads `/joint_states`), and `step_response_ros2.py` is the real-side
+counterpart of `step_response_sim.py`. Their output is the same schema. On that
+path the arm impedance is set in the robot-side controller yaml, not on the
+command line — there are no `--kq/--kqd` flags.
 
 **Start with `--dry_run`** on the real replay. It prints the trajectory and the
 start-pose delta without commanding anything.
@@ -171,20 +182,15 @@ old pair months later and know what it was measuring.
 
 `replay_motion_sim.py` zeroes the implicit actuator so it can add gravity and
 Coriolis compensation, then closes the PD loop itself with explicit torques. That
-loop is only conditionally stable, and it is **not** stable at the 120 Hz this
-tool was originally written for:
-
-| physics rate | max tracking error on `chirp_sweep` |
-|---|---|
-| 120 Hz | **659 rad** against a 0.12 rad target — diverged |
-| 480 Hz | **0.095 rad** — stable |
+loop is only conditionally stable: at 120 Hz it diverges on `chirp_sweep`; at
+480 Hz it tracks stably.
 
 The failure is quiet in the worst way: the chirp tracks cleanly below about 1 Hz
 and only lets go as the sweep climbs, so the first seconds of the overlay plot
 look perfect. Downstream it produces a confident `metrics.csv` full of
 meaningless numbers.
 
-The default is now 480 Hz, and the replay refuses to save a run whose tracking
+The default is 480 Hz, and the replay refuses to save a run whose tracking
 error exceeds 1 rad. Lower `--physics_freq` only if you check the result.
 
 ### Reading `metrics.csv`
@@ -197,9 +203,10 @@ error exceeds 1 rad. Lower `--physics_freq` only if you check the result.
 | `rmse_sim_tracking` / `rmse_real_tracking` | each side against **its own** target — how well either tracks at all |
 | `active` | false when a joint barely moves in this motion; its metrics are nulled rather than left to mislead |
 
-The sign convention on `max_lag_ms` was wrong in an earlier version of the
-analyzer and produced exactly the wrong advice — it suggested adding latency when
-the fix was less damping. If you port this code, keep the convention and its test.
+The sign convention on `max_lag_ms` is easy to invert, and an inverted one gives
+exactly the wrong advice — adding latency when the fix is less damping. If you
+port this code, keep the convention (it is spelled
+out in `analyze_motion.py` next to the cross-correlation) and add a test for it.
 
 ### Evaluating a candidate gain set
 
@@ -207,68 +214,59 @@ the fix was less damping. If you port this code, keep the convention and its tes
 python tools/sysid/replay_motion_sim.py \
     --motion tools/sysid/motions/chirp_sweep.csv \
     --arm_kd 85,135,110,25,18,10,5 \
-    --output logs/sysid/chirp_sim_candidate.pkl
+    --output logs/sysid/chirp_sim_candidate.pkl --headless
 ```
 
 Re-analyse against the same real recording. The real arm does not need to move
 again — that is the point of recording it.
 
 You can also compare two *simulated* gain sets against each other, with no robot
-at all. Replaying the training gains against `ARM_KD_POLYMETIS_IT2` reproduces the
-relationship the real measurement found — the training set lags by 20 ms on j1 and
-30 ms on j4, i.e. it is the more damped of the two:
-
-```
-  joint       rmse_deg    corr   max_lag_ms
-  fr3_joint1    0.2042  0.9939       -20.0
-  fr3_joint4    0.3435  0.9777       -30.0
-  (others)     <0.11    >0.998         0.0
-```
+at all — for example the training gains against `ARM_KD_POLYMETIS_IT2`. Treat one
+replay as `--sim` and the other as `--real`: the more damped set shows up as a
+negative `max_lag_ms` on the joints where the two differ, and near-zero lag with
+high correlation elsewhere.
 
 That is a cheap way to sanity-check the toolchain before you book time on the
 hardware.
 
-### What the recorded runs say
+### The two named damping sets
 
-Two alignments are on file. The second is worth knowing about because **it was
-never adopted**.
+`src/dexx/robot_constants.py` carries two arm damping sets:
 
-*2026-04, under ROS2.* Single-joint sine showed sim lagging real by 40–50 ms on
-j1–j3 (sim ζ≈1.34, real ζ≈0.3). Damping cut 240/220/180 → **145/135/110**. Lag
-fell to 0–10 ms, correlation 0.993 → 0.996–0.999. That is the `ARM_TUNED_KD`
-this repository trains with.
+| joint | `ARM_TUNED_KD` (training) | `ARM_KD_POLYMETIS_IT2` |
+|---|---|---|
+| j1 | 145 | 85 |
+| j2 | 135 | 135 |
+| j3 | 110 | 110 |
+| j4 | 100 | 25 |
+| j5 | 50 | 18 |
+| j6 | 30 | 10 |
+| j7 | 15 | 5 |
 
-*2026-07, after moving to Polymetis.* The plant changed, and j4–j7 were found
-still lagging. A second realignment produced `ARM_KD_POLYMETIS_IT2`:
-
-| joint | training KD | it2 KD | lag before | lag after |
-|---|---|---|---|---|
-| j1 | 145 | 85 | −40 ms | **−20 ms** |
-| j2 | 135 | 135 | +10 ms | +10 ms |
-| j3 | 110 | 110 | +20 ms | +20 ms |
-| j4 | 100 | 25 | −90 ms | **−30 ms** |
-| j5 | 50 | 18 | −50 ms | **−20 ms** |
-| j6 | 30 | 10 | −60 ms | **−20 ms** |
-| j7 | 15 | 5 | −70 ms | **−30 ms** |
-
-RMSE was neutral to better (j4 .0161 → .0117; j5 and j7 slightly worse). It is a
-clear improvement on the metric the exercise targets, and it is **not** what
-training uses — adopting it invalidates every shipped checkpoint, because a
-policy is a function fitted to a plant. Both sets are named constants in
-`franka_sharpa_critic_horizon_cfg.py`; the choice is deliberate and reversible.
+`ARM_TUNED_KD` is what training uses and what every shipped checkpoint was fitted
+to. `ARM_KD_POLYMETIS_IT2` is a less damped alternative aimed at reducing the
+sim-lags-real `max_lag_ms` against a Polymetis-driven arm. A gain set that scores
+better on the chirp metrics is still **not** a drop-in change: adopting it
+invalidates every shipped checkpoint, because a policy is a function fitted to a
+plant. Both are named constants; the choice is deliberate and reversible.
 
 ### The residual that gain tuning cannot fix
 
-Multi-joint chirp kept +70 to +90 ms on j2/j3 after the single-axis tuning
-converged. That is inter-joint coupling, and no diagonal PD fixes it. It is why
+Multi-joint motions can keep a residual lag on some joints after single-axis
+tuning has converged. That is inter-joint coupling, and no diagonal PD fixes it. It is why
 the arm PD randomization band exists (§4) — the policy is made indifferent to the
 part that cannot be matched.
 
 ## How to actually align a new arm
 
 1. **Measure, do not guess.** Command a step on one joint at a time and record the
-   response. `tune_arm_gains.py` in the development repository sweeps Kq/Kqd on
-   hardware.
+   response: replay the `step_per_joint` motion on the arm
+   (`replay_motion_polymetis.py`) and in sim (`replay_motion_sim.py`), then diff
+   them with `analyze_motion.py`. For the sim side alone,
+   `step_response_sim.py --headless` followed by `analyze_step_response.py --sim
+   <pkl>` reports rise time and overshoot per joint. The release has no automated
+   gain sweep on hardware; iterate candidates with `replay_motion_sim.py
+   --arm_kp/--arm_kd` against one real recording.
 2. **Match rise time and overshoot**, in that order. Stiffness sets rise time;
    damping sets overshoot. Fit the simulator to the real response, not the other
    way around.

@@ -1,6 +1,6 @@
 """Validate the documented baseline without starting Isaac Sim."""
 import argparse
-from importlib.metadata import distribution, version
+from importlib.metadata import PackageNotFoundError, distribution, version
 import json
 from pathlib import Path
 import subprocess
@@ -9,6 +9,14 @@ import sys
 from packaging.requirements import Requirement
 
 LAB_SHA = "0f00ca2b4b2d54d5f90006a92abb1b00a72b2f20"
+
+
+def same_git_repo(a: str, b: str) -> bool:
+    """uv records a Git URL without its .git suffix; pip keeps it."""
+    def norm(url):
+        url = url.rstrip("/")
+        return url[:-4] if url.endswith(".git") else url
+    return norm(a) == norm(b)
 
 
 def check_raycaster_revision(root: Path) -> None:
@@ -20,7 +28,8 @@ def check_raycaster_revision(root: Path) -> None:
     expected_url, _, expected_sha = requirement.url.removeprefix("git+").rpartition("@")
     try:
         direct = json.loads(distribution(requirement.name).read_text("direct_url.json") or "null")
-        valid = (isinstance(direct, dict) and direct.get("url") == expected_url
+        valid = (isinstance(direct, dict) and isinstance(direct.get("url"), str)
+                 and same_git_repo(direct["url"], expected_url)
                  and isinstance(direct.get("vcs_info"), dict)
                  and direct["vcs_info"].get("vcs") == "git"
                  and direct["vcs_info"].get("commit_id") == expected_sha)
@@ -31,6 +40,20 @@ def check_raycaster_revision(root: Path) -> None:
             "simple-raycaster does not match the pinned Git revision. Reinstall with "
             f"python -m pip install --force-reinstall --no-deps '{requirement}'"
         )
+
+
+def isaac_sim_version(checkout: Path) -> str:
+    """Binary Sim linked as _isaac_sim (setup_env.sh), else the pip wheels (setup_uv.sh)."""
+    link = checkout / "_isaac_sim"
+    if link.exists():
+        return (link / "VERSION").read_text().strip()
+    try:
+        return version("isaacsim")
+    except PackageNotFoundError:
+        raise RuntimeError(
+            "Isaac Sim not found: link a binary Sim 4.5 as _isaac_sim in the Lab checkout "
+            "or install the isaacsim==4.5.0 wheels (tutorial/00_setup/setup_uv.sh)"
+        ) from None
 
 
 def main(argv=None) -> int:
@@ -67,7 +90,7 @@ def main(argv=None) -> int:
         ["git", "-C", str(checkout), "diff", "--exit-code", "HEAD", "--", "source", "isaaclab.sh"],
         check=True, stdout=subprocess.DEVNULL,
     )
-    sim_version = (checkout / "_isaac_sim" / "VERSION").read_text().strip()
+    sim_version = isaac_sim_version(checkout)
     if not sim_version.startswith("4.5."):
         raise RuntimeError(f"Expected Isaac Sim 4.5; found {sim_version}")
     if not torch.version.cuda:

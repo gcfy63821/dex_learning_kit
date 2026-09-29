@@ -1,107 +1,56 @@
-# Motion Files for Sim2Real Action Tracking
+# Arm motion files
 
-## Safety
-
-All default motions are guaranteed to stay within **70% of FR3 position /
-velocity / acceleration limits** (datasheet values hard-coded in
-`generate_motions.py:FR3_{VEL,ACC}_LIMIT`):
-
-- **Position**: each motion stays ≥ 20 mrad away from every joint's limit
-  (notably joint 4 is one-sided `[-3.04, -0.15]` and joint 6 is `[0.54, 4.52]`).
-- **Velocity**: peak < 0.7 × FR3 spec (j1-4: 2.175 rad/s, j5-7: 2.61 rad/s).
-- **Acceleration**: peak < 0.7 × datasheet accel limit (j2 is most restrictive
-  at 7.5 rad/s² spec → 5.25 usable).
-
-All segment transitions use **minimum-jerk** profiles (zero velocity AND
-zero acceleration at endpoints), sinusoids are wrapped with **min-jerk
-fade-in/out envelopes** so they start and stop at zero velocity.
-
-The generator runs `_safety_check()` on every motion and prints per-joint
-vel/acc peaks. Before sending to real hardware, `replay_motion_real.py`
-also runs `preflight_safety()` and refuses to publish unless the motion
-passes (override: `--force_unsafe`, dangerous).
-
-
-
-Canonical Franka FR3 joint-target trajectories used to calibrate the sim/real
-action-tracking gap. Ported from the
-[SAGE](https://github.com/NVIDIA-Isaac-Sim/sage) project (`motion_files/so101/custom/*`)
-and adapted to 7-DOF FR3.
+Franka FR3 joint-target trajectories for measuring the sim/real action-tracking
+gap. Ported from the [SAGE](https://github.com/NVIDIA-Isaac-Sim/sage) project
+(`motion_files/so101/custom/*`) and adapted to the 7-DOF FR3. The procedure that
+uses them — replay in sim and on the arm, diff, read the metrics — is
+[tutorial/07](../../../tutorial/07_dynamics_alignment/). The hand equivalents are
+in `../motions_hand/`.
 
 ## Format
 
 Each motion is two files:
 
-| File | Content |
-|------|---------|
-| `{name}.csv` | Header row = joint names (`fr3_joint1..7`); each subsequent row = one target sample (rad) |
-| `{name}.json` | Metadata — `control_freq_hz`, `duration_s`, `description`, `base_pose` |
+| file | content |
+|---|---|
+| `{name}.csv` | header row = joint names (`fr3_joint1..7`); each following row = one target sample (rad) |
+| `{name}.json` | metadata — `name`, `joint_names`, `control_freq_hz`, `duration_s`, `n_steps`, `base_pose`, `description`, `safety_checked` |
 
-Rows are at `control_freq_hz` (default 30 Hz, matching deploy). All motions
-start and end at the safe home pose `[0, 0, 0, -1.57, 0, 1.57, 0]` to allow
-chaining and safe re-entry.
-
-## Regenerating
-
-```bash
-python rl_isaaclab/scripts/system_id/generate_motions.py \
-    --output_dir rl_isaaclab/scripts/system_id/motions \
-    --control_freq 30
-```
-
-Edit `generate_motions.py` to tweak amplitudes, frequencies, durations. Safer
-to modify that script and regenerate than to hand-edit CSVs.
+Rows are at `control_freq_hz` (30 Hz, matching deploy). Every motion starts and
+ends at `base_pose` `[0, 0, 0, -1.57, 0, 1.57, 0]`, so motions chain and re-enter
+safely.
 
 ## Motions
 
-| Name | Purpose |
-|------|---------|
-| `step_per_joint` | Sequential step up/center/down/center per joint (replicates `step_response_real.py`) |
-| `chirp_sweep` | 0.2→3 Hz linear chirp, all joints phase-shifted. **Best single test** — full Bode from one run |
-| `sin_j4`, `sin_j6` | Pure sinusoid on one joint (elbow / wrist pitch). Clean single-joint Bode |
-| `circular_wrist` | Joints 5&6 circular motion. Detects wrist backlash/hysteresis |
-| `backlash_detection` | Small reversals per joint — exposes dead-band / stiction |
-| `diagonal_sweep` | All 7 joints in-phase sinusoid — coordinated motion stress test |
-| `coupled_joints` | Anti-phase pairs (j1,-j3), (j2,-j4), (j5,-j7) — cross-joint torque coupling |
+| name | purpose |
+|---|---|
+| `chirp_sweep` | 0.2 → 3 Hz linear chirp, all joints phase-shifted. The best single test — a full Bode sweep from one run |
+| `step_per_joint` | step up / centre / down / centre on each joint in turn — rise time and overshoot |
+| `sin_j1`, `sin_j2`, `sin_j3`, `sin_j4`, `sin_j6` | pure sinusoid on one joint — the cleanest single-joint signal |
+| `circular_wrist` | joints 5 and 6 in a circle — wrist backlash / hysteresis |
+| `backlash_detection` | small reversals per joint — dead-band and stiction |
+| `diagonal_sweep` | all 7 joints in-phase sinusoid — coordinated-motion stress test |
+| `coupled_joints` | anti-phase pairs (j1,-j3), (j2,-j4), (j5,-j7) — cross-joint coupling |
 
-## Usage Pipeline
+## Safety envelope
+
+`generate_motions.py` checks every motion against **70% of the FR3 position,
+velocity and acceleration limits** (datasheet values in `FR3_VEL_LIMIT` /
+`FR3_ACC_LIMIT`) and prints per-joint peaks:
+
+- **position:** at least 20 mrad from every joint limit (joint 4 is one-sided
+  `[-3.04, -0.15]`, joint 6 is `[0.54, 4.52]`);
+- **velocity:** peak < 0.7 × spec (j1–4: 2.175 rad/s, j5–7: 2.61 rad/s);
+- **acceleration:** peak < 0.7 × spec (j2 is the tightest: 7.5 rad/s² → 5.25 usable).
+
+Segment transitions use minimum-jerk profiles, and sinusoids are wrapped in
+minimum-jerk fade-in/out envelopes, so every motion starts and stops at zero
+velocity and acceleration. `replay_motion_polymetis.py` re-runs a preflight check
+and refuses to command a motion that fails it (`--force_unsafe` overrides; don't).
+
+Regenerate after editing amplitudes, frequencies or durations in
+`generate_motions.py` — safer than hand-editing CSVs:
 
 ```bash
-# 0. (once) Regenerate CSVs if you tweaked params
-python rl_isaaclab/scripts/system_id/generate_motions.py
-
-# 1. Real hardware — start controller first
-ros2 launch franka_bringup dexhand_joint_impedance_controller.launch.py
-python rl_isaaclab/scripts/system_id/replay_motion_real.py \
-    --motion rl_isaaclab/scripts/system_id/motions/chirp_sweep.csv \
-    --output logs/system_id/motion_replay/chirp_sweep_real.pkl
-
-# 2. Sim
-python rl_isaaclab/scripts/system_id/replay_motion_sim.py \
-    --motion rl_isaaclab/scripts/system_id/motions/chirp_sweep.csv \
-    --output logs/system_id/motion_replay/chirp_sweep_sim.pkl \
-    --headless
-
-# 3. Analyze
-python rl_isaaclab/scripts/system_id/analyze_motion.py \
-    --sim  logs/system_id/motion_replay/chirp_sweep_sim.pkl \
-    --real logs/system_id/motion_replay/chirp_sweep_real.pkl \
-    --out  logs/system_id/motion_replay/compare_chirp
+python tools/sysid/generate_motions.py --output_dir tools/sysid/motions --control_freq 30
 ```
-
-Output:
-
-- `metrics.csv` — per-joint RMSE, MAPE, corr, cos_sim, **max_lag_ms**, sim-tracking, real-tracking
-- `overlay_all_joints.png` — target / sim / real overlay per joint
-- `errors_per_joint.png` — residuals per joint
-- console: suggested `action_delay_steps` based on mean lag
-
-## Interpreting Key Metrics
-
-- **`max_lag_ms > 0`**: sim lags real. Probably too much damping / too small K in sim,
-  OR real has feed-forward velocity that sim lacks. Try ↑ sim K, ↓ sim D, or add vel-ff.
-- **`max_lag_ms < 0`**: sim leads real. Real's internal delay (controller + ROS2) is larger
-  than your `action_delay_steps`. Increase `action_delay_steps` by `round(|lag|/ctrl_dt)`.
-- **`corr < 0.95`**: waveforms shape-mismatch (overshoot / ringing differ). Gains problem, not just lag.
-- **`sim_trk ≫ real_trk`**: sim PD is too soft — increase K.
-- **`sim_trk ≪ real_trk`**: sim PD is stiffer than real — decrease K (and/or add vel filter to sim).

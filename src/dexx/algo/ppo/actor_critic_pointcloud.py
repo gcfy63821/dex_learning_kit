@@ -4,12 +4,10 @@ Drop-in for `ActorCriticAsymmetric` but the actor consumes proprio + 3-source
 point cloud through a `PointCloudEncoder`. Critic still uses proprio +
 priv_info (priv_info has GT object pose so no PC needed for value baseline).
 
-Lives outside `models.py` so we can add it without touching shared code; the
-PPOVisual wrapper (or a new PPOPointCloud) instantiates this class by name.
+Lives outside `models.py`; `ppo_pointcloud.PPOPointCloud` instantiates it.
 """
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 

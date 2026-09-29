@@ -1,8 +1,8 @@
 """dexx.deploy_config — SINGLE SOURCE OF TRUTH for sim2real / deploy constants.
 
-Everything that used to be hard-coded across the env cfgs, the deploy env, the
-depth subscribers and the retarget scripts is collected here so you only edit ONE
-file when your table height, camera, or NUC bridge changes.
+The constants shared by the env cfgs, the deploy env, the depth subscribers and
+the retarget scripts are collected here so you only edit ONE file when your table
+height, camera, or NUC bridge changes.
 
 This module imports NOTHING from `dexx` (leaf module) — safe to import anywhere
 without circular-import risk. Values below MUST match what the policy was trained
@@ -17,6 +17,7 @@ Edit here, then everything downstream picks it up:
 from __future__ import annotations
 
 import os
+import sys
 
 import numpy as np
 
@@ -28,26 +29,18 @@ import numpy as np
 TABLE_SURFACE_Z: float = 0.415
 
 # fr3_link0 (arm base) height in env-local. If your real base sits at a
-# different height above the table, change THIS.
-#
-# History: 0.415 -> 0.432 on 2026-07-16, to match a real base mounted 1.7 cm
-# above the table. Back to 0.415 on 2026-09-01 because the arm is being
-# remounted level with the table surface.
+# different height above the table, change THIS. 0.415 = base mounted level
+# with the table surface.
 #
 # This is not a free parameter. Demonstrations store joint angles, so moving the
-# base moves the hand by the same 17 mm against an object that has not moved --
-# 13-50% of the hand's 3.3-13.2 cm grasp aperture. Every retarget, every teacher
-# and every policy trained against the old value has to be redone, and the
-# camera extrinsic re-measured. Do not change it to make a number look right.
+# base moves the hand by the same amount against an object that has not moved --
+# 17 mm is 13-50% of the hand's 3.3-13.2 cm grasp aperture. Every retarget, every
+# teacher and every policy trained against another value has to be redone, and
+# the camera extrinsic re-measured. Do not change it to make a number look right.
 ARM_BASE_Z: float = 0.415
 ARM_BASE_POS: tuple = (-0.1, 0.0, ARM_BASE_Z)
 ARM_BASE_ROT: tuple = (1.0, 0.0, 0.0, 0.0)
 
-# Wrist-pose retarget offset — the table height, which since 2026-09-01 is also
-# the arm-base height. They were deliberately different while the base was
-# raised; keep this written as the table plane rather than aliased to
-# ARM_BASE_Z, so that raising the base again does not silently move it too.
-WRIST_POS_OFFSET: tuple = (-0.1, 0.0, TABLE_SURFACE_Z)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Camera intrinsics — 320x240 (the sim/deploy PC back-projection resolution)
@@ -58,11 +51,17 @@ DEPTH_H: int = 240
 DEPTH_W: int = 320
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PointCloud workspace crop — ENV-LOCAL frame, meters (drops table + curtain hits)
-# z_min is ~5mm above the table so the flat table plane is removed from scene_pc.
+# PointCloud workspace crop — ENV-LOCAL frame, meters. Recorded in every student
+# checkpoint (pc_env_meta) and restored at eval/deploy.
+#   z_min 0.417: 2 mm above the table top. At the table plane the table surface
+#                takes most of the 1024 points; a few mm higher and the object's
+#                base is cut off.
+#   z_max 0.70:  above it most of the points are the robot's own arm, whose pose
+#                the policy already has from forward kinematics.
+# (Checkpoints without a recorded crop assume 0.420 / 1.30.)
 # ─────────────────────────────────────────────────────────────────────────────
-PC_WORKSPACE_MIN: tuple = (0.00, -0.40, 0.420)
-PC_WORKSPACE_MAX: tuple = (0.80,  0.25, 1.30)
+PC_WORKSPACE_MIN: tuple = (0.00, -0.40, TABLE_SURFACE_Z + 0.002)
+PC_WORKSPACE_MAX: tuple = (0.80,  0.25, 0.70)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Deploy comm — Polymetis joint bridge (NUC) + camera depth publisher (ZMQ)
@@ -70,7 +69,7 @@ PC_WORKSPACE_MAX: tuple = (0.80,  0.25, 1.30)
 POLYMETIS_STATE_PORT: int = 5560   # bridge PUB (joint/ee state)
 POLYMETIS_CMD_PORT: int = 5561     # bridge PULL (joint targets)
 # Example camera-host depth publisher addr; override per-run with --depth_zmq_addr.
-CAMERA_ZMQ_ADDR_EXAMPLE: str = "tcp://101.6.90.122:5562"
+CAMERA_ZMQ_ADDR_EXAMPLE: str = "tcp://<CAM_HOST>:5562"
 
 
 def arm_base_pos_np() -> np.ndarray:
@@ -83,17 +82,10 @@ def arm_base_pos_np() -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 # The camera-in-armbase 4x4 is a property of how the camera is bolted down, so it
 # is calibrated per mount and lives in `calib/camera_align/`. It is deliberately
-# not a literal in this file.
+# not a literal in this file (tutorial/06 shows how to inspect and compare them).
 #
-# It used to be hard-coded in two places (the sim raycaster and the depth
-# subscriber). Both copies were a 2026-05-20 calibration; by the time anyone
-# noticed, the camera had moved 20 cm and policies had been trained against the
-# wrong viewpoint without a single warning. Loading the shipped file instead
-# means the number exists once, and it is the current one.
-#
-# Always pass --camera_extrinsic explicitly for a run you intend to reproduce.
-# This default exists so that forgetting is merely wrong-by-one-calibration
-# rather than wrong-by-four-months.
+# Always pass --camera_extrinsic explicitly for a run you intend to reproduce;
+# this default only covers forgetting it.
 CAMERA_EXTRINSIC_DEFAULT_FILE: str = "calib/camera_align/current.npy"
 
 
@@ -115,9 +107,32 @@ def default_camera_extrinsic(required: bool = True) -> "np.ndarray | None":
         raise FileNotFoundError(
             f"no camera extrinsic at {path}. Calibrate one (tutorial/06) or pass "
             f"--camera_extrinsic <file.npy>. There is deliberately no hard-coded "
-            f"fallback: a stale one cost this project a month of training on the "
-            f"wrong viewpoint.")
+            f"fallback.")
     T = np.load(path).astype(np.float32)
     if T.shape != (4, 4):
         raise ValueError(f"{path}: expected a 4x4 matrix, got {T.shape}")
     return T
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sharpa Wave hand SDK — installed on the inference host, not pip-installable
+# ─────────────────────────────────────────────────────────────────────────────
+SHARPA_SDK_ENV: str = "SHARPA_SDK_PYTHON"   # -> .../SharpaWaveSDK/python
+
+
+def import_sharpa_sdk():
+    """Import the Sharpa Wave SDK (`sharpa` package) for real-hand access.
+
+    Uses an importable `sharpa` if there is one, otherwise the directory in
+    $SHARPA_SDK_PYTHON. The package locates its own native libraries."""
+    sdk = os.environ.get(SHARPA_SDK_ENV)
+    if sdk and sdk not in sys.path:
+        sys.path.insert(0, sdk)
+    try:
+        import sharpa
+    except ImportError as exc:
+        raise ImportError(
+            f"Sharpa Wave SDK not importable. Set {SHARPA_SDK_ENV}=/path/to/SharpaWaveSDK/python "
+            f"(see docs/DEPLOY.md)."
+        ) from exc
+    return sharpa

@@ -1,30 +1,59 @@
 # Evaluation
 
-Two entry points:
+Four entry points:
 
-- `scripts/eval.py` — batched quantitative evaluation with strict success
-  post-processing. Auto-detects DAgger `PointCloudStudent` vs PPO
-  `ActorCriticPointCloud` from the checkpoint.
-- `scripts/play.py` — interactive / visual rollout of a checkpoint.
-- `scripts/record_videos.py` — render expert-rollout videos / snapshots.
+- `scripts/eval.py` — batched quantitative evaluation of a point-cloud student,
+  with strict success post-processing. **This is the protocol; quote its numbers.**
+- `scripts/play.py` — interactive / visual rollout of a student checkpoint.
+- `scripts/eval_teacher.py` — evaluation of a poseobs teacher checkpoint.
+- `scripts/record_videos.py` — render teacher-rollout videos / snapshots.
 
 ## eval.py
 
 ```bash
 python scripts/eval.py --task franka-sharpa-pointcloud \
-    --load_path <dagger_final.pth or ppo_final.pth> --side right \
+    --load_path checkpoints/student_lean_v6_L1.pth --side right \
     --data_idx '["rt/0416_grasp/cube_small_2"]' \
+    --camera_extrinsic calib/camera_align/current.npy \
     --num_envs 128 --out_dir logs/eval_cube --headless
 ```
+
+The checkpoint decides the env-side point-cloud settings — point counts, crop
+box, tactile representation, ablations (`pc_env_meta`) — and the lean student's
+proprio slicing. Flags override them only when passed.
+
+### What the default run does
+
+The defaults are the reference protocol:
+
+- **Every retarget augmentation variant** of each demo (`{demo}@{aug}`), reported
+  per variant. `--no-expand_aug` evaluates only the base demos, under their base
+  IDs (`DISABLE_AUG_EXPAND=1`).
+- **First-to-finish collection** (`--per_demo_quota 0`) until `--max_episodes`
+  (8000) or `--max_steps` (30000). It weights the aggregate toward demos whose
+  episodes end sooner, so read the per-demo rates too; `--per_demo_quota N` takes
+  N per demo, `-1` a balanced `ceil(max_episodes / n_demos)`
+  ([tutorial/08](../tutorial/08_evaluation/)).
+- **Physics DR on** (`--keep_physics_dr`): object mass, friction, centre of mass
+  and **hand** PD gains stay randomized; `--no-keep_physics_dr` holds them at
+  nominal. **Arm PD-gain randomisation and action-delay randomisation are always
+  on** — `eval.py` does not disable them — so repeated runs are not bit-identical.
+- **Deterministic `mu`**, `init_curriculum` off, resets uniform over the full demo.
+- **Noise off:** point-cloud jitter / dropout / hand noise, tactile force noise,
+  depth noise and object-pose noise are zeroed.
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--load_path` | required | DAgger or PPO ckpt (arch auto-detected). |
 | `--out_dir` | required | Output dir for `records.json`. |
 | `--data_idx` | `None` | Demo indices to evaluate. |
+| `--expand_aug` / `--no-expand_aug` | on | Evaluate every retarget augmentation variant (`{demo}@{aug}`); off = base demos only, under their base IDs (e.g. `rt/0416_grasp/cube_small_1`). |
+| `--per_demo_quota` | `0` | `0` = first-to-finish; `N` = N episodes per demo; `-1` = `ceil(max_episodes / n_demos)` per demo. |
+| `--keep_physics_dr` / `--no-keep_physics_dr` | on | Mass / friction / COM / hand-PD randomisation during eval. |
+| `--camera_extrinsic` | unset → `calib/camera_align/current.npy` | Must match what the student was trained with. |
 | `--num_envs` | `128` | Parallel envs. |
-| `--max_episodes` | `5000` | Stop after this many episode terminations. |
-| `--max_steps` | `12000` | Hard step ceiling (safety). |
+| `--max_episodes` | `8000` | Stop after this many episode terminations. |
+| `--max_steps` | `30000` | Hard step ceiling (safety). |
 | `--success_dist` | `0.05` | Closest-approach success threshold (`min_final_dist < this`). Post-hoc strict thresholds use `end_final_dist`, not this. |
 | `--save_traj` | off | Save per-frame tracking arrays in `records.json`. |
 | `--perturb_obj_xy` | `0.0` | Eval-time random XY perturbation of object init pos (m). |
@@ -53,27 +82,13 @@ reach-end success. Training's `Strict` is a separate conservative proxy: it
 requires trajectory completion without failures and keeps bad inits in its
 denominator as zeros (see [TRAINING.md](TRAINING.md)).
 
-The gap between endpoint accuracy and closest-approach success is not constant.
-For example, the previous evaluation breakdown was:
-
-```
-cube_small_1   closest 96.0%  |  strict3 86.0%
-cube_small_2   closest 92.0%  |  strict3 89.8%
-squeegee_1     closest 86.0%  |  strict3 84.0%
-squeegee_2     closest 98.0%  |  strict3 62.0%     <-- 36 points
-```
-
-Reaching within 5 cm at some point does not guarantee finishing within 3 cm
-without drift. Report strict3, and report it per demo. These historical numbers
-illustrate the distinction; rerun evaluation after metric fixes for release results.
-
-### Recommended eval settings (reproducibility)
-
-Deterministic `mu` inference, DR off, **`init_curriculum` off**,
-`random_state_init=True` (uniform over the full demo). The eval scripts set these
-by default. Keeping `init_curriculum` on would sample resets only from the last
-half of the demo, inflating success — see the gotcha in
-[DISTILLATION.md](DISTILLATION.md).
+The gap between endpoint accuracy and closest-approach success is not constant:
+it differs from demo to demo, and a demo can come within 5 cm almost every time
+yet often finish outside 3 cm or with the object drifting. Reaching within 5 cm
+at some point does not guarantee finishing within 3 cm without drift. Report
+strict3, and report it per demo. The expected numbers for the shipped
+checkpoints, with the exact commands, are in
+[checkpoints/README.md](../checkpoints/README.md#reference-numbers-in-this-releases-simulation).
 
 ### succeeded-vs-terminated caveat
 
@@ -101,16 +116,17 @@ Key flags: `--num_envs` (default 16), `--max_episodes` (default 200),
 
 ⚠️ **`play.py`'s success rate is a different metric from `eval.py`'s.** Here a
 success means the episode reached the end of the trajectory without a failure
-termination; in `eval.py` it means the object finished within `--success_dist`
-(5 cm) of its final target. A short `--max_steps` truncates episodes and drives
-`play.py`'s number down without the policy being any worse — on one checkpoint
-they read 6.2% and 95.5% respectively. Quote `eval.py`.
+termination; `eval.py`'s `success_rate_*` means the object came within
+`--success_dist` (5 cm) of its target at some point, and its headline is strict3.
+A short `--max_steps` truncates episodes and drives `play.py`'s number down
+without the policy being any worse, so the two can differ by an order of
+magnitude on the same checkpoint. Quote `eval.py`.
 
 ## record_videos.py
 
 Renders one video per demo of an expert (teacher) rollout via the
-`franka-sharpa-pointcloud-record` env (needs `--enable_cameras`; GPU-heavy, so use
-few envs):
+`franka-sharpa-pointcloud-record` env. The script turns on `--enable_cameras`
+itself; rendering is GPU-heavy, so keep `--num_envs` small:
 
 ```bash
 python scripts/record_videos.py --task franka-sharpa-pointcloud-record \
@@ -124,12 +140,10 @@ Notable flags: `--data_idx_list` (JSON list, one video per entry),
 `--cam_z_offset`, `--snapshot_frames` (save PNG snapshots), `--snapshot_only`,
 `--draw_force` (overlay per-fingertip contact-force arrows), `--save_per_env`.
 
----
+## eval_teacher.py
 
-## 评估 teacher（poseobs）用 `eval_teacher.py`
-
-`eval.py` / `play.py` 吃的是 **PointCloud student** 的 ckpt（需要 `ckpt["cfg"]`）。
-评估 **poseobs teacher** 请用 `scripts/eval_teacher.py`：
+`eval.py` and `play.py` take **point-cloud student** checkpoints. Evaluate a
+**poseobs teacher** with `scripts/eval_teacher.py`:
 
 ```bash
 python scripts/eval_teacher.py --task franka-sharpa-force-poseobs \
@@ -139,16 +153,22 @@ python scripts/eval_teacher.py --task franka-sharpa-force-poseobs \
     --num_envs 64 --episodes_per_mode 256 --out_dir logs/eval_teacher --headless
 ```
 
-输出 `eval_table.md` / `summary.json` / `records.json`。`records.json` 里每条含
-`init_frame`、`survival_len`、`min_final_dist`、`fail_causes`，排查失败模式时很有用。
+`--modes` chooses where episodes start: `early`, `pre_contact`, `random`,
+`per_stage` (default: all four). It writes `eval_table.md`, `summary.json` and
+`records.json`; each record carries `init_frame`, `survival_len`,
+`min_final_dist` and `fail_causes`, which is what you want when diagnosing a
+failure mode.
 
-**换资产后请务必跑一次这个**作为回归基准 —— 资产层面的等价性（增益、限位、惯量…）
-可以逐项相同而行为差几十个百分点，见 `assets/ASSETS.md` 的自碰撞过滤一节。
-参考值：shipped teacher + `cube_small_2` @5cm ≈ **93–95%**。
+**Run it after any asset change** as a behavioural regression. Two assets can be
+identical item by item — gains, limits, inertia — and still differ by tens of
+points; see the self-collision section of [ASSETS.md](../assets/ASSETS.md).
+Measure a baseline with the shipped teacher before the change (the expected value
+is in [checkpoints/README.md](../checkpoints/README.md#reference-numbers-in-this-releases-simulation))
+and compare against it afterwards.
 
-## 参考轨迹工具（内部用）
+## Reference-rollout tools (internal)
 
-- `scripts/collect_reference_rollouts.py` — 采集参考 rollout
-- `scripts/build_rollout_references.py` — 由 rollout 构建参考轨迹
+- `scripts/collect_reference_rollouts.py` — collect policy rollouts
+- `scripts/build_rollout_references.py` — build reference trajectories from them
 
-这两个是内部工具，不在主 pipeline 上，仅在需要重建参考轨迹时使用。
+These are off the main pipeline; use them only to rebuild reference trajectories.

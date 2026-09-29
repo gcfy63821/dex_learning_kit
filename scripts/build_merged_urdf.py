@@ -3,8 +3,7 @@
 The training env needs a **single** articulation carrying all 29 actuated joints
 (7 arm + 22 hand); this produces it. Both inputs are the public/clean models
 vendored under ``assets/`` — the hand comes from
-https://github.com/sharpa-robotics/sharpa-urdf-usd-xml, which has none of the
-confidential markings the older internal hand meshes carried.
+https://github.com/sharpa-robotics/sharpa-urdf-usd-xml.
 
     python scripts/build_merged_urdf.py --side right
     python scripts/build_merged_urdf.py --side left
@@ -15,12 +14,13 @@ after changing either input; the result is committed, so training needs no build
 step.
 
 The hand is attached to ``fr3_link8`` (the FR3 flange frame) by a fixed joint
-whose default offset is **calibrated against the legacy merged asset**, not
+whose default offset is **calibrated against the reference merged asset**
+(``Right_final.usda``, which the demos and extrinsics were made with), not
 chosen: ``xyz = 0 0 0.035`` and ``rpy = 0 0 3pi/4``. Together with this URDF's
-``fr3_link7 -> fr3_link8`` (z=0.107, no rotation) that reproduces the legacy
+``fr3_link7 -> fr3_link8`` (z=0.107, no rotation) that reproduces the reference
 ``fr3_link7 -> right_hand_C_MC`` transform of z=0.142 / yaw=135 deg exactly.
 
-Verified: with these defaults, all 42 link frames the legacy asset defines match
+Verified: with these defaults, all 42 link frames the reference asset defines match
 to <= 1e-4 mm and 0 deg at the home pose. Changing them moves the whole hand and
 invalidates every retargeted demo and every camera extrinsic, so don't — unless
 you re-retarget and re-calibrate.
@@ -48,15 +48,15 @@ FR3_END_LINK = "fr3_link7"
 # mass, so PhysX assigns a tiny isotropic inertia — and with self-collision on,
 # every proxy capsule collides with the very link it wraps. The result is an
 # articulation that explodes to ~1e7 rad within one step. `fr3_link8` is likewise
-# a massless flange frame. The legacy asset contained none of them: dropping
+# a massless flange frame. The reference asset contains none of them: dropping
 # these gives exactly its 42-body model.
 PRUNE_PATTERNS = (r".*_sc$", r".*_accelerometer_(top|bottom)$", r"^fr3_link8$")
 OUT_DIR = os.path.join(_ASSETS, "generated")
 
 # Calibrated fr3_link8 -> hand-root offset, per side. See the module docstring;
-# these are measured against the legacy asset, not tuning knobs.
+# these are measured against the reference asset, not tuning knobs.
 #
-# The legacy asset authored the yaw as literal 2.35619 / -0.785, i.e. a rounded
+# The reference asset authors the yaw as literal 2.35619 / -0.785, i.e. a rounded
 # pi/4. We use the exact analytic values instead: for the right hand that is a
 # 4.5e-6 rad correction (nothing), for the left hand 4.0e-4 rad = 0.023 deg,
 # which is 0.06 mm at the fingertip — an order of magnitude under the 1.6 mm

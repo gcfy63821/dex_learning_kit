@@ -36,7 +36,7 @@ HAND_JOINT_SUFFIXES = [
 ]
 assert len(HAND_JOINT_SUFFIXES) == 22
 
-# Measured reachable range (normal mode, 2026-04-19 probe)
+# Measured reachable range (normal mode, joint-limit probe)
 # Keep in sync with dexx/tasks/franka_sharpa/sim2real/real_hand_limits.py
 SHARPA_REAL_LIMITS = np.asarray([
     (-0.087,  1.833),   # 0  thumb_CMC_FE

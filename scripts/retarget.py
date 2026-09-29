@@ -1,21 +1,20 @@
 """
 Mano2Dexhand retargeting tool — 2-stage optimization WITH object-pose augmentation.
 
-This is retarget/retarget_arm_2stage.py's 2-stage Adam optimization (Stage 1:
-arm-only; Stage 2: hand+arm) wrapped with the object-pose augmentation pipeline
-of the legacy retarget_sharpa.py:
+A 2-stage Adam optimization (Stage 1: arm-only; Stage 2: hand+arm) wrapped with
+an object-pose augmentation pipeline:
 
   * For each demo, the original + N augmented variants are retargeted. Each
     variant perturbs the object (and the wrist/hand targets) by a yaw rotation
     around the arm base + an xy translation.
   * A reachability gate (--reachability_th) marks variants the arm cannot reach
     as reachable=False and saves a partial pkl (the training loader skips them).
-  * Joint 1 (the base yaw) is FIXED in Stage 1 (as in retarget_arm_2stage.py)
+  * Joint 1 (the base yaw) is FIXED in Stage 1
     but FREE in Stage 2 — giving the arm extra yaw reach for augmented poses.
 
 Usage:
     python scripts/retarget.py \\
-        --side right --headless --data_idx rt/0416_grasp/cube_small_4 --aug_num 5
+        --side right --headless --data_idx rt/0416_grasp/cube_small_2 --aug_num 5
 """
 
 import math
@@ -26,7 +25,6 @@ import logging
 
 import numpy as np
 import torch
-from termcolor import cprint
 
 from isaaclab.app import AppLauncher
 
@@ -51,7 +49,7 @@ SIDE_CONFIGS = {
     },
 }
 
-# Resolve project root (relative to this script: dexx/tasks/retarget/ -> project root)
+# Resolve project root
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # scripts/ lives directly under the repo root (dexx_release), so up 1 level.
 PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, ".."))
@@ -65,8 +63,6 @@ parser.add_argument("--task", type=str, default=None,
 parser.add_argument("--dexhand", type=str, default="sharpa", help="Dexhand type")
 parser.add_argument("--side", type=str, default="right", choices=["left", "right"], help="Hand side")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
-parser.add_argument("--num_threads", type=int, default=0, help="Number of threads")
-parser.add_argument("--use_gpu", action="store_true", default=True, help="Use GPU")
 parser.add_argument("--sim_device", type=str, default="cuda:0", help="Simulation device")
 parser.add_argument("--target_offset_xy", type=float, nargs=2, default=None,
                     help="Target XY offset (overrides side default). E.g. --target_offset_xy 0.3 0.1")
@@ -84,7 +80,8 @@ parser.add_argument("--debug_viz_stride", type=int, default=1,
                          "Default 1 = env 0 only (legacy). E.g. 10 = envs 0,10,20,... "
                          "Useful when running many parallel envs to visually compare frames.")
 parser.add_argument("--no_real_hand_clamp", action="store_true",
-                    help="Disable clamping opt_dof_pos to Sharpa HA4 real-hand reachable range. "
+                    help="Disable clamping opt_dof_pos to the real-hand reachable range (measured on the "
+                         "Sharpa HA4 hand). "
                          "By default (sharpa dexhand only) the clamp is applied so deploy and sim "
                          "see the same target distribution.")
 # ---- Augmentation (object-pose perturbation) ----
@@ -120,7 +117,7 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import isaaclab.sim as sim_utils
-from isaaclab.actuators import IdealPDActuatorCfg, ImplicitActuatorCfg
+from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import Articulation, RigidObject, ArticulationCfg, RigidObjectCfg, AssetBaseCfg
 from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
@@ -131,12 +128,8 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 import pytorch_kinematics as pk
 from dexx.tasks.hand_imitation.dataset.factory import ManipDataFactory
 from dexx.tasks.hand_imitation.dataset.transform import (
-    aa_to_quat,
     aa_to_rotmat,
-    rotmat_to_aa,
     rot6d_to_aa,
-    rot6d_to_quat,
-    rot6d_to_rotmat,
     rotmat_to_quat,
     rotmat_to_rot6d,
 )
@@ -145,7 +138,7 @@ from dexx.tasks.franka_sharpa.sim2real.real_hand_limits import (
     SHARPA_REAL_LIMITS_NP,
     clamp_to_real_limits_np,
 )
-import dexx.tasks.hand_imitation.envs.sharpa
+import dexx.tasks.hand_imitation.envs.sharpa  # noqa: F401  (registers the Sharpa hand)
 from dexx.utils.debug_draw import DebugDraw
 
 logging.getLogger("isaaclab").setLevel(logging.WARNING)
@@ -578,7 +571,7 @@ class Mano2Dexhand:
 
         # Transformation matrix
         table_half_height = 0.015
-        table_surface_z = 0.4 + table_half_height
+        table_surface_z = _dcfg.TABLE_SURFACE_Z  # table top; the box is table_half_height thick below it
 
         mujoco2gym_transf = torch.eye(4, dtype=torch.float32, device=self.sim_device)
         m1 = aa_to_rotmat(torch.tensor([0, 0, -np.pi / 2], dtype=torch.float32, device=self.sim_device))
@@ -1001,7 +994,8 @@ class Mano2Dexhand:
         else:
             hand_upper_limits = self.dexhand_dof_upper_limits
 
-        # Tighten hand joint limits to real Sharpa HA4 reachable range so IK
+        # Tighten hand joint limits to the real-hand reachable range (measured
+        # on the Sharpa HA4 hand) so IK
         # optimization searches inside the deployable set. Real limits are in
         # cfg order, which matches dexhand_dof_lower/upper_limits layout (built
         # from hand_joint_indices which follow _build_hand_joint_names order).
@@ -1016,7 +1010,7 @@ class Mano2Dexhand:
             hand_lower_limits = torch.maximum(hand_lower_limits, _real_lower)
             hand_upper_limits = torch.minimum(hand_upper_limits, _real_upper)
             print(f"[retarget_2stage] Tightened optimization-loop hand limits to real "
-                  f"Sharpa HA4 reachable range (cfg order).")
+                  f"real-hand reachable range (measured on the Sharpa HA4 hand, cfg order).")
 
         while iter < max_iter:
             iter += 1
@@ -1269,8 +1263,8 @@ class Mano2Dexhand:
             + rot_loss_weight * final_arm_ee_rot_loss_per_env
         )
 
-        # opt_dof_pos is in cfg (Sharpa) order. For the Sharpa HA4 real hand,
-        # the URDF clamp above is looser than what the motors can actually reach
+        # opt_dof_pos is in cfg (Sharpa) order. On the real hand (range measured
+        # on the Sharpa HA4 hand), the URDF clamp above is looser than what the motors can actually reach
         # (esp. ring/pinky MCP_AA due to inter-finger coupling). Apply a second
         # clamp based on empirically measured real-hand range so sim and deploy
         # see the same target distribution.
@@ -1316,7 +1310,6 @@ class Mano2Dexhand:
             "obj_scale": self.obj_scale,
             # NOTE: do NOT dump 'obj_traj' — the training data loader rebuilds
             # obj_trajectory from the source data and conflicts with a saved one.
-            # replay_retarget_variants.py will fall back to parking the object.
         }
 
         return to_dump
@@ -1335,9 +1328,8 @@ class Mano2Dexhand:
         bone_links = getattr(self.dexhand, "gym_bone_links", None)
 
         # Visualize env 0 plus every `debug_viz_stride`-th env after that.
-        # debug_viz_stride=1 (default) → env 0 only (legacy behaviour, since
-        # range(0, num_envs, 1) starts at 0 but the legacy code stopped at 1).
-        # We special-case stride=1 to keep the "env 0 only" default.
+        # debug_viz_stride=1 (default) → env 0 only: special-cased, since
+        # range(0, num_envs, 1) would draw every env.
         if self.debug_viz_stride <= 1:
             viz_env_ids = [0] if self.num_envs > 0 else []
         else:
@@ -1426,8 +1418,7 @@ if __name__ == "__main__":
         # Augmentation only targets the robotool_batch pipeline.
         if dataset_type != "robotool_batch":
             raise ValueError(
-                f"retarget_arm_2stage_aug only supports robotool_batch (got '{dataset_type}'). "
-                f"For un-augmented retarget use retarget/retarget_arm_2stage.py.")
+                f"retarget.py only supports robotool_batch (got '{dataset_type}').")
         parts = idx.split("/")
         rt_task, rt_exp = parts[1], parts[2].split("@")[0]
         base_result = idx.split("@", 1)[1] if "@" in idx else "0"
@@ -1503,9 +1494,9 @@ if __name__ == "__main__":
             os.makedirs(os.path.dirname(dump_path), exist_ok=True)
 
             # Never let an unreachable partial clobber a converged result. A short
-            # --iter run does not converge, so the naive quickstart invocation
-            # would otherwise destroy the shipped example demo (93 kB -> 0.5 kB)
-            # with no warning. Reachable results still overwrite as before.
+            # --iter run does not converge, so a quickstart invocation would
+            # otherwise overwrite the shipped example demo with a partial.
+            # Reachable results always overwrite.
             if not to_dump.get("reachable", True) and os.path.exists(dump_path):
                 try:
                     with open(dump_path, "rb") as f:
@@ -1545,4 +1536,11 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         run(args_cli, idx)
 
+    # Release the simulation context before the app, as env.close() does for
+    # the gym scripts: without it simulation_app.close() hangs after the
+    # results are already on disk.
+    _sim = sim_utils.SimulationContext.instance()
+    if _sim is not None:
+        _sim.clear_all_callbacks()
+        _sim.clear_instance()
     simulation_app.close()

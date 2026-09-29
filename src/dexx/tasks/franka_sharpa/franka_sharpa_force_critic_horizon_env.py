@@ -6,8 +6,8 @@ Actor obs (550d in both asymmetric and non-asymmetric paths) adds the
 deployable signals
     + target_obj_pos[next]        (3)
     + target_obj_quat[next]       (4)
-    + tips_distance[next]         (5)   ← moved back from privileged
-    + obj_bps (object shape)      (128) ← moved back from privileged
+    + tips_distance[next]         (5)   ← privileged in the parent under asymmetric_ac
+    + obj_bps (object shape)      (128) ← privileged in the parent under asymmetric_ac
 All four are available at deploy time (demo pkl / static mesh encoding).
 
 Critic priv_info (148d, for K=5) packs, in addition to the existing 40d
@@ -20,7 +20,7 @@ Critic priv_info (148d, for K=5) packs, in addition to the existing 40d
     + delta_obj current frame      (13)   pos 3 + quat 4 + vel 3 + ang_vel 3
     + obj_to_fingertips            (5)
 
-Kept completely separate from `FrankaSharpaForceEnv`: rollback = task-id swap.
+Kept completely separate from `FrankaSharpaForceEnv`.
 """
 from __future__ import annotations
 
@@ -51,9 +51,9 @@ class FrankaSharpaForceCriticHorizonEnv(FrankaSharpaForceEnv):
         bps_dim = self.obj_bps.shape[-1] if (self.obj_bps is not None and _enable_bps) else 0
 
         # Additions to actor obs vs parent (parent obs-dim already reflects enable_bps):
-        #   +7   for target_obj_pos (3) + target_obj_quat (4)     [new]
-        #   +5   for tips_distance  (restored; asymmetric path only)
-        #   +bps_dim for obj_bps    (restored; asymmetric path only, if enabled)
+        #   +7   for target_obj_pos (3) + target_obj_quat (4)
+        #   +5   for tips_distance  (asymmetric path only)
+        #   +bps_dim for obj_bps    (asymmetric path only, if enabled)
         #
         # Expected obs_dim matrix (for obj_bps=128):
         #   asymmetric=T, enable_bps=T: parent=410, add 12+128 = 550
@@ -165,18 +165,11 @@ class FrankaSharpaForceCriticHorizonEnv(FrankaSharpaForceEnv):
             return torch.gather(data, 1, expanded_idx)
 
         # ---- Wrist target: use resolved reference source (retarget/MANO) ----
-        # Planner-override hook (same as ForceEnv.compute_observations): if
-        # self._planner_targets is set, use planner output for K=1 actor targets.
-        _plt = getattr(self, "_planner_targets", None)
         target_wrist_pos = indicing(self.demo_data["target_wrist_pos"], actor_future_indices)
-        if _plt is not None and "wrist_pos" in _plt:
-            target_wrist_pos = _plt["wrist_pos"].reshape(nE, nF, 3)
         cur_wrist_pos = self.base_pos
         delta_wrist_pos = (target_wrist_pos - cur_wrist_pos[:, None]).reshape(nE, -1)
 
         target_wrist_vel = indicing(self.demo_data["target_wrist_velocity"], actor_future_indices)
-        if _plt is not None and "wrist_vel" in _plt:
-            target_wrist_vel = _plt["wrist_vel"].reshape(nE, nF, 3)
         cur_wrist_vel = self.base_lin_vel
         wrist_vel = target_wrist_vel.reshape(nE, -1)
         delta_wrist_vel = (target_wrist_vel - cur_wrist_vel[:, None]).reshape(nE, -1)
@@ -184,8 +177,6 @@ class FrankaSharpaForceCriticHorizonEnv(FrankaSharpaForceEnv):
         target_wrist_rot_raw = indicing(self.demo_data["target_wrist_rot"], actor_future_indices)
         if target_wrist_rot_raw.ndim > 3:
             target_wrist_rot_raw = target_wrist_rot_raw[:, :, 0, :]
-        if _plt is not None and "wrist_rot" in _plt:
-            target_wrist_rot_raw = _plt["wrist_rot"].reshape(nE, nF, 3)
         target_wrist_quat = aa_to_quat(target_wrist_rot_raw.reshape(nE * nF, -1))
         delta_wrist_quat = quat_mul(
             self.base_quat[:, None].repeat(1, nF, 1).reshape(nE * nF, -1),
@@ -196,22 +187,15 @@ class FrankaSharpaForceCriticHorizonEnv(FrankaSharpaForceEnv):
         target_wrist_ang_vel_raw = indicing(self.demo_data["target_wrist_angular_velocity"], actor_future_indices)
         if target_wrist_ang_vel_raw.ndim > 3:
             target_wrist_ang_vel_raw = target_wrist_ang_vel_raw[:, :, 0, :]
-        if _plt is not None and "wrist_ang_vel" in _plt:
-            target_wrist_ang_vel_raw = _plt["wrist_ang_vel"].reshape(nE, nF, 3)
         wrist_ang_vel = target_wrist_ang_vel_raw.reshape(nE, -1)
         delta_wrist_ang_vel = (target_wrist_ang_vel_raw - self.base_ang_vel[:, None]).reshape(nE, -1)
 
         # ---- Hand joints target: use resolved reference source (retarget/MANO) ----
         target_joints_pos = indicing(self.demo_data["target_joints_pos"], actor_future_indices).reshape(nE, nF, -1, 3)
-        n_joints = target_joints_pos.shape[2]
-        if _plt is not None and "joints_pos" in _plt:
-            target_joints_pos = _plt["joints_pos"].reshape(nE, nF, n_joints, 3)
         cur_joint_pos = self.hand.data.body_pos_w[:, self.hand_body_indices[1:]] - self.scene.env_origins.unsqueeze(1)
         delta_joints_pos = (target_joints_pos - cur_joint_pos[:, None]).reshape(self.num_envs, -1)
 
         target_joints_vel = indicing(self.demo_data["target_joints_velocity"], actor_future_indices).reshape(nE, nF, -1, 3)
-        if _plt is not None and "joints_vel" in _plt:
-            target_joints_vel = _plt["joints_vel"].reshape(nE, nF, n_joints, 3)
         cur_joint_vel = self.hand.data.body_lin_vel_w[:, self.hand_body_indices[1:]]
         joints_vel = target_joints_vel.reshape(self.num_envs, -1)
         delta_joints_vel = (target_joints_vel - cur_joint_vel[:, None]).reshape(self.num_envs, -1)
@@ -237,7 +221,7 @@ class FrankaSharpaForceCriticHorizonEnv(FrankaSharpaForceEnv):
         _asymmetric_ac = getattr(self.cfg, 'asymmetric_ac', False)
         has_object = hasattr(self, 'object') and self.object is not None
 
-        # ---- (A) NEW: target_obj_pos / target_obj_quat next-frame — deployable ----
+        # ---- (A) target_obj_pos / target_obj_quat next-frame — deployable ----
         if has_object:
             target_obj_transf_actor = indicing(self.demo_data["obj_trajectory"], actor_future_indices)  # [B,K,4,4]
             target_obj_pos_actor = target_obj_transf_actor[:, :, :3, 3].reshape(nE, -1)  # [B, K*3]

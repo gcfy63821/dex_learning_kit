@@ -18,6 +18,8 @@ import argparse
 import numpy as np
 from scipy.spatial import cKDTree
 
+from dexx import deploy_config as _dcfg
+
 
 def crop(P, box):
     m = ((P[:, 0] >= box[0]) & (P[:, 0] <= box[1]) &
@@ -93,7 +95,7 @@ def main():
     p.add_argument("--max_corr", type=float, default=0.05, help="ICP correspondence reject dist (m)")
     p.add_argument("--sim_table", action="store_true",
                    help="add a sim table plane to the target so ICP also fixes vertical/tilt")
-    p.add_argument("--table_z", type=float, default=0.415, help="table z in env-local")
+    p.add_argument("--table_z", type=float, default=_dcfg.TABLE_SURFACE_Z, help="table z in env-local")
     p.add_argument("--table_density", type=float, default=40000.0, help="table pts/m^2")
     p.add_argument("--out", required=True)
     p.add_argument("--dump_dir", default="logs/icp_align")

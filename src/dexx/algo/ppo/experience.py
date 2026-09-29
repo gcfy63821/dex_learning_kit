@@ -11,7 +11,6 @@
 # --------------------------------------------------------
 
 # import gym
-import gymnasium as gym
 import torch
 from torch.utils.data import Dataset
 
@@ -20,8 +19,7 @@ def transform_op(arr):
     """Flatten axes 0 and 1.
 
     Storage is laid out as [num_envs, horizon, ...] so a plain reshape on a
-    contiguous tensor is a zero-copy view. Element ordering is identical to
-    the previous transpose+reshape path:
+    contiguous tensor is a zero-copy view. Element ordering:
         [env0_t0..env0_tH-1, env1_t0, ..., envN_tH-1].
     """
     if arr is None:
@@ -41,9 +39,8 @@ class ExperienceBuffer(Dataset):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.priv_dim = priv_dim
-        # Layout [num_envs, horizon, ...] so transform_op is a zero-copy reshape.
-        # Previously [horizon, num_envs, ...] → transform_op did transpose+reshape
-        # which forced one extra full-buffer allocation each minibatch prep.
+        # Layout [num_envs, horizon, ...] so transform_op is a zero-copy reshape
+        # (no extra full-buffer allocation per minibatch prep).
         self.storage_dict = {
             'obses': torch.zeros((self.num_envs, self.transitions_per_env, self.obs_dim), dtype=torch.float32, device=self.device),
             'priv_info': torch.zeros((self.num_envs, self.transitions_per_env, self.priv_dim), dtype=torch.float32, device=self.device),

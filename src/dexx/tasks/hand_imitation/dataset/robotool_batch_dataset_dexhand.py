@@ -18,12 +18,10 @@ import json
 import os
 import pickle
 from functools import lru_cache
-from typing import Optional
 
 import numpy as np
 import torch
 import trimesh
-from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.structures import Meshes
 from termcolor import cprint
 
@@ -40,7 +38,7 @@ from .factory import register_manipdata
 def _is_failed_retarget(opt_params: dict) -> bool:
     """Return True if a retargeted pkl is a failure/partial sentinel.
 
-    retarget_arm_2stage_aug.py writes a "partial" pkl (via make_partial_result)
+    scripts/retarget.py writes a "partial" pkl (via make_partial_result)
     when a variant fails the reachability gate: reachable=False and the opt_*
     trajectory fields are stored as `False` instead of arrays. Such a pkl must be
     treated like a missing result (fall back to placeholders); using it directly
@@ -155,11 +153,12 @@ def _clamp_rotation_steps(rot_seq: torch.Tensor, max_step_deg: float = 25.0) -> 
 
 def expand_rt_indices(indices: list, data_dir: str = "data/robotool_batch",
                       dataset=None) -> list:
-    """展开索引，支持aug条目展开。
-    
-    如果传入 dataset 实例，会自动展开成所有 aug 条目。
+    """Expand rt/ indices into per-experiment keys.
+
+    If a dataset instance is given, each key is further expanded into all of its
+    retarget-augmentation entries.
     """
-    # 先做原有的路径展开
+    # Expand task / wildcard / legacy indices into per-experiment keys.
     expanded = []
     for idx in indices:
         if not (idx.startswith("rt/") or idx.startswith("rt_")):
@@ -203,7 +202,7 @@ def expand_rt_indices(indices: list, data_dir: str = "data/robotool_batch",
         else:
             cprint(f"[WARN] Task dir not found: {task_dir}", "yellow")
 
-    # 如果有 dataset 实例，再展开成 aug 条目
+    # With a dataset instance, also expand into augmentation entries.
     if dataset is not None:
         expanded = dataset.expand_with_all_aug(expanded)
 
@@ -223,7 +222,7 @@ class RobotoolBatchDatasetRH(ManipData):
         mujoco2gym_transf=None,
         max_seq_len=int(1e10),
         dexhand=None,
-        source_fps: float = 30.0,  # was 25.0, actual camera capture rate is 30fps
+        source_fps: float = 30.0,  # RoboTool camera capture rate
         retarget_root: str | None = None,
         verbose=True,
         **kwargs,
@@ -262,9 +261,9 @@ class RobotoolBatchDatasetRH(ManipData):
                     self.data_pathes.append(mano_path)
                     self._seq_map[key] = (task, exp, exp_dir)
 
-        # 新增：枚举所有扩增文件，生成扩增索引
-        # key格式: "rt/{task}/{exp}@{aug_tag}"
-        # aug_tag是pkl文件名中@0后面的部分，如"" 或 "_dxp3.9cm_dyn8.1cm"
+        # Enumerate all augmentation pkls and build augmentation indices.
+        # Key format: "rt/{task}/{exp}@{aug_tag}", where aug_tag is everything
+        # after "@" in the pkl name, e.g. "0" or "0_dxp3.9cm_dyn8.1cm".
         self._aug_map = {}  # "rt/{task}/{exp}@{aug_tag}" -> (task, exp, exp_dir, pkl_path)
         self._base_to_aug_map = {}
         if self.dexhand is not None:
@@ -278,16 +277,14 @@ class RobotoolBatchDatasetRH(ManipData):
                         if pkl_file.endswith("_hand.pkl"):
                             continue
                         basename = os.path.basename(pkl_file)  # e.g. "blue_cup_1@0.pkl" or "blue_cup_1@0_dxp3.9cm.pkl"
-                        # 解析exp和aug_tag
-                        # basename格式: {exp}@0{aug_tag}.pkl
-                        name_no_ext = basename[:-4]  # 去掉.pkl
+                        # Parse exp and aug_tag; basename format: {exp}@0{suffix}.pkl
+                        name_no_ext = basename[:-4]  # strip .pkl
                         if "@" not in name_no_ext:
                             continue
                         at_idx = name_no_ext.index("@")
                         exp = name_no_ext[:at_idx]
-                        after_at = name_no_ext[at_idx+1:]  # "0" 或 "0_dxp3.9cm_dyn8.1cm"
-                        # aug_tag = after_at中去掉开头数字的部分
-                        aug_tag = after_at  # 保留完整，如"0"或"0_dxp3.9cm"
+                        after_at = name_no_ext[at_idx+1:]  # "0" or "0_dxp3.9cm_dyn8.1cm"
+                        aug_tag = after_at  # kept in full, e.g. "0" or "0_dxp3.9cm"
 
                         base_key = f"rt/{task}/{exp}"
                         if base_key not in self._seq_map:
@@ -320,17 +317,17 @@ class RobotoolBatchDatasetRH(ManipData):
                 task, exp = _parse_rt_index(idx)
                 idx = f"rt/{task}/{exp}"
 
-            # 如果本身就是某个增强条目，直接保留
+            # Already an augmentation entry: keep as is.
             if isinstance(idx, str) and idx in self._aug_map:
                 expanded.append(idx)
                 continue
 
-            # 如果是 base key，则展开成该 exp 下所有增强 pkl
+            # Base key: expand into every augmentation pkl of that experiment.
             if isinstance(idx, str) and idx in self._base_to_aug_map:
                 expanded.extend(sorted(self._base_to_aug_map[idx]))
                 continue
 
-            # 否则原样保留
+            # Otherwise keep unchanged.
             expanded.append(idx)
 
         return expanded
@@ -341,7 +338,7 @@ class RobotoolBatchDatasetRH(ManipData):
         aug_pkl_path = None
         if isinstance(index, str) and "@" in index and index in self._aug_map:
             task, exp, seq_dir, aug_pkl_path = self._aug_map[index]
-            # 继续正常加载mano数据，只是retarget pkl用aug_pkl_path
+            # Load MANO data as usual; only the retarget pkl comes from aug_pkl_path.
         elif isinstance(index, str) and (index.startswith("rt/") or index.startswith("rt_")):
             # Normalize legacy "rt_blue_cup_1" -> "rt/blue_cup/blue_cup_1"
             if index.startswith("rt_"):
@@ -454,8 +451,6 @@ class RobotoolBatchDatasetRH(ManipData):
                 dtype=torch.float32,
             )
         elif tool_object_pose.ndim == 2 and tool_object_pose.shape[1] == 7:
-            from scipy.spatial.transform import Rotation as R
-
             tool_pos = tool_object_pose[frame_indices, 4:7]
             tool_quat = tool_object_pose[frame_indices, :4]
             quat_norm = np.linalg.norm(tool_quat, axis=1, keepdims=True)
@@ -480,8 +475,7 @@ class RobotoolBatchDatasetRH(ManipData):
             raise ValueError(f"Unexpected tool_object_pose shape: {tool_object_pose.shape}")
 
         # Coordinate rotation: convert from camera frame to z-up frame
-        # Old rot_x_90 was Rx(-90°) which gives cup upside-down.
-        # Fix: use Rx(+90°) so z-forward -> z maps to +y (up).
+        # Rx(+90°) maps camera z-forward to +y (up); Rx(-90°) would flip the object upside-down.
         # After Rx(+90°), new_y = -raw_z, so to zero frame-0 origin:
         # offset_z = raw_z_0 (positive, since new_y = -raw_z + offset_z = 0)
         offset_z = obj_trajectory[0, 2, 3].item()
@@ -748,7 +742,7 @@ class RobotoolBatchDatasetRH(ManipData):
         if self.dexhand is None:
             return
 
-        # 解析 base index（去掉 @aug_tag 部分）
+        # Base index (strip the @aug_tag part).
         base_index = index.split("@")[0] if "@" in index else index
         task, exp = _parse_rt_index(base_index)
 
@@ -762,7 +756,7 @@ class RobotoolBatchDatasetRH(ManipData):
         else:
             retargeted_dir = os.path.join(self.retarget_root, task)
 
-        # 优先用传入的 aug_pkl_path
+        # Prefer the given aug_pkl_path.
         if aug_pkl_path and os.path.exists(aug_pkl_path):
             retargeted_path = aug_pkl_path
             hand_retargeted_path = aug_pkl_path.replace(".pkl", "_hand.pkl")
@@ -783,8 +777,8 @@ class RobotoolBatchDatasetRH(ManipData):
         if os.path.exists(retargeted_path):
             opt_params = pickle.load(open(retargeted_path, "rb"))
             print(f"[PKL TOP][{self.hand_side}] keys={list(opt_params.keys())[:20]}")
-            # 最小改动：双手 retarget 的 pkl 是 {"meta": ..., "right": ..., "left": ...}
-            # 单手 pkl 不进这个分支，原逻辑完全不变
+            # Bimanual retarget pkls are {"meta": ..., "right": ..., "left": ...};
+            # single-hand pkls skip this branch.
             if (
                 getattr(self, "use_bimanual_retarget", False)
                 and isinstance(opt_params, dict)
@@ -797,7 +791,7 @@ class RobotoolBatchDatasetRH(ManipData):
                 if side_params is None:
                     raise KeyError(f"Bimanual retarget pkl missing side '{side_key}': {retargeted_path}")
 
-                # 如果 reachable=False 但里面有核心字段，也允许继续用
+                # reachable=False is still usable if the core fields are present.
                 if (not side_params.get("reachable", True)) and ("opt_arm_joint_pos" not in side_params):
                     raise KeyError(f"Bimanual retarget side '{side_key}' unreachable and no opt_arm_joint_pos: {retargeted_path}")
 
@@ -807,7 +801,7 @@ class RobotoolBatchDatasetRH(ManipData):
                 print(f"[RT BM][{self.hand_side}] opt_dof_pos={np.array(opt_params['opt_dof_pos']).shape}")
                 print(f"[RT BM][{self.hand_side}] opt_arm_joint_pos={np.array(opt_params['opt_arm_joint_pos']).shape}")
                 print(f"[RT BM][{self.hand_side}] has opt_joints_pos={'opt_joints_pos' in opt_params}")
-            # Failure-sentinel guard: retarget_arm_2stage_aug.py writes a "partial"
+            # Failure-sentinel guard: scripts/retarget.py writes a "partial"
             # pkl when a variant fails the reachability gate. In it the opt_*
             # trajectories are stored as `False` (a 0-d value) and reachable=False.
             # torch.tensor(False) yields a 0-d tensor and later `[:, None]` indexing

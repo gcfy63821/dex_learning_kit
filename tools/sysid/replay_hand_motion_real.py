@@ -2,8 +2,7 @@
 """Replay a canonical HAND motion CSV on the real Sharpa Wave hand and record
 target/actual joint angles for sim-vs-real comparison.
 
-Uses Sharpa SDK directly (no ROS2). Reuses the connect/init pattern from
-`probe_hand_limits.py`.
+Uses Sharpa SDK directly (no ROS2).
 
 Usage:
     python tools/sysid/replay_hand_motion_real.py \
@@ -15,20 +14,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import pickle
-import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-# Add SharpaWaveSDK python path (same pattern as probe_hand_limits.py)
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "..", "Sharpa", "SharpaWaveSDK", "python"))
+from dexx.deploy_config import import_sharpa_sdk
 
-from sharpa import SharpaWaveManager, ControlMode, ControlSource
+_sharpa = import_sharpa_sdk()
+SharpaWaveManager = _sharpa.SharpaWaveManager
+ControlMode = _sharpa.ControlMode
+ControlSource = _sharpa.ControlSource
 
 HAND_JOINT_SUFFIXES = [
     "thumb_CMC_FE", "thumb_CMC_AA", "thumb_MCP_FE", "thumb_MCP_AA", "thumb_IP",

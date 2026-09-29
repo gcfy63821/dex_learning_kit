@@ -37,7 +37,7 @@ def fmt(v):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--ip", required=True, help="NUC bridge IP (e.g. 192.168.1.100)")
+    ap.add_argument("--ip", required=True, help="NUC bridge IP (e.g. 192.168.1.10)")
     ap.add_argument("--state_port", type=int, default=_dcfg.POLYMETIS_STATE_PORT)
     ap.add_argument("--cmd_port", type=int, default=_dcfg.POLYMETIS_CMD_PORT)
     ap.add_argument("--seconds", type=float, default=5.0, help="read-only streaming duration")
@@ -67,7 +67,7 @@ def main():
             last = time.time()
             print(f"  q  = {fmt(client.arm_joint_positions)}")
             print(f"  qd = {fmt(client.arm_joint_velocities)}")
-            print(f"  ee_pos = {fmt(client.wrist_position)}  ee_quat(wxyz) = {fmt(client.wrist_quaternion)}"
+            print(f"  flange_pos = {fmt(client.flange_position)}  wrist(C_MC)_pos = {fmt(client.wrist_position)}"
                   f"  msgs={client.wrist_msg_count}")
         time.sleep(0.05)
     if not client.arm_data_received:

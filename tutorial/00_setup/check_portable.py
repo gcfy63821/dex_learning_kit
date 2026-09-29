@@ -5,10 +5,6 @@ still work? The failure modes are all silent — a symlink into a repository tha
 is not shipped, an absolute path baked into a config, a mesh referenced by a
 demonstration but never committed.
 
-This found four external symlinks and eleven absolute paths the first time it
-was run, including three demonstrations that only resolved on the author's
-machine.
-
     python tutorial/00_setup/check_portable.py
 """
 from __future__ import annotations

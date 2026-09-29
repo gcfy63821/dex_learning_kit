@@ -3,8 +3,7 @@
 
 Bridges the local Polymetis server to a remote deploy client over ZMQ, so the
 training PC (py310 / isaaclab, no polymetis) can drive the FR3 with joint
-impedance without installing polymetis. Mirrors the pattern of the existing
-~/controller/polymetis_bridge.py (which was Cartesian); this one is JOINT.
+impedance without installing polymetis. Joint-space control.
 
 Run on the NUC:
     conda activate polymetis-local
@@ -30,6 +29,23 @@ m.patch()
 
 from polymetis import RobotInterface
 
+# FR3 joint position limits (rad), from the Franka FR3 datasheet.
+FR3_Q_MIN = np.array([-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159], np.float32)
+FR3_Q_MAX = np.array([2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159], np.float32)
+
+
+def check_target(q, reference, max_step):
+    """Reason to reject a joint target, or None. The bridge is the last hop
+    before the robot, so it checks every target whatever client sent it."""
+    if q.shape != (7,) or not np.isfinite(q).all():
+        return f"not 7 finite values: {q}"
+    if (q < FR3_Q_MIN).any() or (q > FR3_Q_MAX).any():
+        return f"outside the FR3 joint limits: {np.round(q, 3)}"
+    step = float(np.abs(q - reference).max())
+    if step > max_step:
+        return f"{step:.3f} rad from the previous target (limit {max_step})"
+    return None
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -42,6 +58,9 @@ def main():
     ap.add_argument("--state_port", type=int, default=5560)
     ap.add_argument("--cmd_port", type=int, default=5561)
     ap.add_argument("--state_hz", type=float, default=200.0)
+    ap.add_argument("--max_target_step", type=float, default=0.5,
+                    help="Reject a joint target further than this (rad, any joint) from the "
+                         "previous one, or from the measured pose for the first one.")
     args = ap.parse_args()
 
     print(f"[bridge] connecting to Polymetis {args.robot_ip}:{args.robot_port} ...")
@@ -55,14 +74,34 @@ def main():
     pull.bind(f"tcp://*:{args.cmd_port}")
     print(f"[bridge] state PUB tcp://*:{args.state_port}   cmd PULL tcp://*:{args.cmd_port}")
 
+    last_target = [None]  # previous accepted target; reset when the arm moves on its own
+
+    def drain():
+        """Drop commands queued while a blocking call ran: they are stale."""
+        n = 0
+        while True:
+            try:
+                pull.recv(flags=zmq.NOBLOCK)
+                n += 1
+            except zmq.Again:
+                return n
+
     def cmd_loop():
         while True:
             try:
                 msg = msgpack.unpackb(pull.recv(), raw=False)
                 cmd = msg.get("cmd")
                 if cmd == "joint_target":
-                    q = torch.as_tensor(np.asarray(msg["q"], dtype=np.float32))
-                    robot.update_desired_joint_positions(q)
+                    q = np.asarray(msg["q"], dtype=np.float32).reshape(-1)
+                    ref = last_target[0]
+                    if ref is None:
+                        ref = robot.get_joint_positions().detach().cpu().numpy().astype(np.float32)
+                    reason = check_target(q, ref, args.max_target_step)
+                    if reason is not None:
+                        print(f"[bridge] REJECTED joint target: {reason}")
+                        continue
+                    robot.update_desired_joint_positions(torch.as_tensor(q))
+                    last_target[0] = q
                 elif cmd == "start_impedance":
                     kq, kqd = msg.get("kq"), msg.get("kqd")
                     if kq is not None and kqd is not None:
@@ -74,12 +113,15 @@ def main():
                     else:
                         robot.start_joint_impedance()
                         print("[bridge] started joint impedance (default gains)")
+                    last_target[0] = None
                 elif cmd == "terminate":
                     robot.terminate_current_policy()
+                    last_target[0] = None
                     print("[bridge] terminated current policy")
                 elif cmd == "go_home":
                     robot.go_home()
-                    print("[bridge] go_home done")
+                    last_target[0] = None
+                    print(f"[bridge] go_home done (dropped {drain()} queued commands)")
                 else:
                     print(f"[bridge] unknown cmd: {cmd}")
             except Exception as exc:  # noqa: BLE001
