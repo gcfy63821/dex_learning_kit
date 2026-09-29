@@ -23,6 +23,10 @@ real table sits a few mm higher in the measured cloud than in sim
 
 ## Reference numbers in this release's simulation
 
+> The additional data augmentation used in our experiments is not included in
+> this release. These results are provided to help confirm that the tutorial
+> version of the code runs correctly.
+
 Use these to check an install: a correct setup lands within a few points of
 them, while a wrong extrinsic, crop box or asset lands far off. Both runs use the
 four shipped demos and `calib/camera_align/current.npy`.

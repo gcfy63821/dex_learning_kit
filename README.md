@@ -7,6 +7,9 @@ manipulation demos, with a sim-to-real deployment path.
 A privileged **PPO teacher** is distilled into a deployable **point-cloud + tactile
 student** with DAgger, and the student runs on the real robot.
 
+> **This is the tutorial version of the Dex-X code.** It walks through the full
+> pipeline, and we provide four sample demonstrations to run it on.
+
 ```
 retarget              PPO teacher                 DAgger student                 deploy
 MANO → Sharpa     →   franka-sharpa-          →   franka-sharpa-            →   franka-sharpa-pointcloud-
